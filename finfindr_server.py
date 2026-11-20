@@ -61,17 +61,10 @@ HTML = """
   <p>Upload a photo · Get the species</p>
 </header>
 
-<div class="upload-zone" id="dropZone" style="padding:1.5rem;">
-  <h2>Upload a photo</h2>
-  <label style="display:block; margin:1rem 0 0.5rem;">Location</label>
-  <select id="locationSelect" style="padding:0.6rem; border-radius:8px; border:none; background:#134e4a; color:white; font-size:1rem; width:100%; max-width:320px;">
-    <option value="La Paz, Sea of Cortez, Mexico" selected>La Paz, Sea of Cortez, Mexico</option>
-  </select>
-  <br><br>
-  <label for="fileInput" style="display:inline-block; background:var(--teal); color:white; padding:0.85rem 1.8rem; border-radius:12px; font-weight:600; cursor:pointer; font-size:1.1rem;">
-    Choose Photo
-  </label>
-  <input type="file" id="fileInput" accept="image/*" style="display:none;">
+<div class="upload-zone" id="dropZone">
+  <h2>Choose a photo</h2>
+  <p>Use the button below</p>
+  <input type="file" id="fileInput" accept="image/*" style="display:block; margin:1rem auto; font-size:1.1rem;">
 </div>
 
 <div id="results"></div>
@@ -88,56 +81,13 @@ const fileInput = document.getElementById("fileInput");
 const results = document.getElementById("results");
 const actions = document.getElementById("actions");
 
-fileInput.onchange = function() {
-  if (this.files && this.files[0]) {
-    const file = this.files[0];
-    const reader = new FileReader();
-    reader.onload = function(e) {
-      results.innerHTML = '<img src="' + e.target.result + '" style="max-width:100%; border-radius:12px; margin:1rem 0;">' +
-                          '<p style="margin:1rem 0;">Photo loaded. Identifying…</p>';
-      // Now send to server
-      const formData = new FormData();
-      formData.append("image", file);
-      formData.append("location", document.getElementById("locationSelect").value);
-      fetch("/identify", { method: "POST", body: formData })
-        .then(r => r.json())
-        .then(data => {
-          results.innerHTML += '<pre style="white-space:pre-wrap; margin-top:1rem;">' + 
-            (data.result_text || data.error || "No response") + '</pre>';
-        })
-        .catch(err => {
-          results.innerHTML += '<p style="color:#fb7185;">Error: ' + err.message + '</p>';
-        });
-    };
-    reader.readAsDataURL(file);
-  }
-};
-
-async function handleFile(file, card) {
-  const formData = new FormData();
-  formData.append("image", file);
-  formData.append("location", document.getElementById("locationSelect").value);
-
-  try {
-    card.querySelector("h3").textContent = "Identifying…";
-    const resp = await fetch("/identify", { method: "POST", body: formData });
-    if (!resp.ok) throw new Error("Server error " + resp.status);
-    const data = await resp.json();
-    if (data.error) throw new Error(data.error);
-
-    card.querySelector("h3").textContent = "Result";
-    card.querySelector(".sci").innerHTML = (data.result_text || "No response").replace(/\n/g, "<br>");
-  } catch (err) {
-    card.querySelector("h3").textContent = "Error";
-    card.querySelector(".error").textContent = err.message;
-  }
-}
+// Direct file input - no click proxy needed
+fileInput.addEventListener("change", () => {
+  if (fileInput.files.length) handleFile(fileInput.files[0]);
+});
 
 async function handleFile(file) {
-  if (!file || !file.type.startsWith("image/")) {
-    alert("Please select an image file.");
-    return;
-  }
+  if (!file.type.startsWith("image/")) return alert("Please upload an image.");
 
   dropZone.style.display = "none";
   actions.style.display = "block";
@@ -151,7 +101,7 @@ async function handleFile(file) {
       <h3 class="identifying">Identifying…</h3>
       <div class="sci"></div>
       <div class="confidence"></div>
-      <div class="error" style="color:#fb7185; margin-top:0.5rem;"></div>
+      <div class="error"></div>
     </div>
   `;
   results.appendChild(card);
@@ -162,46 +112,30 @@ async function handleFile(file) {
 
   const formData = new FormData();
   formData.append("image", file);
-  formData.append("location", document.getElementById("locationSelect").value);
 
   try {
-    card.querySelector("h3").textContent = "Sending to server…";
     const resp = await fetch("/identify", { method: "POST", body: formData });
-    
     if (!resp.ok) {
       const errText = await resp.text();
-      throw new Error("Server returned " + resp.status + ": " + errText.slice(0, 300));
+      throw new Error("Server error " + resp.status + ": " + errText.slice(0, 200));
     }
-    
     const data = await resp.json();
 
     if (data.error) {
-      throw new Error(data.error);
+      card.querySelector("h3").textContent = "Identification failed";
+      card.querySelector("h3").classList.remove("identifying");
+      card.querySelector(".error").textContent = data.error;
+      return;
     }
 
     const text = data.result_text || "No response from model";
     card.querySelector("h3").textContent = "Result";
     card.querySelector("h3").classList.remove("identifying");
-    card.querySelector(".sci").innerHTML = text.replace(/\n/g, "<br>");
-
-    // Illustrative chart
-    const chart = document.createElement("div");
-    chart.style.marginTop = "1rem";
-    chart.innerHTML = `
-      <div style="font-size:0.9rem; margin-bottom:0.4rem;">Typical sightings (illustrative):</div>
-      <div style="display:flex; align-items:flex-end; height:60px; gap:4px;">
-        ${["J","F","M","A","M","J","J","A","S","O","N","D"].map((m,i) => {
-          const h = [20,25,40,55,70,80,75,60,45,35,25,20][i];
-          return `<div style="flex:1; background:var(--teal); height:${h}%; border-radius:3px 3px 0 0;"></div>`;
-        }).join("")}
-      </div>
-    `;
-    card.querySelector(".result-body").appendChild(chart);
-
+    card.querySelector(".sci").textContent = text;
   } catch (err) {
     card.querySelector("h3").textContent = "Error";
     card.querySelector("h3").classList.remove("identifying");
-    card.querySelector(".error").textContent = err.message || "Something went wrong.";
+    card.querySelector(".error").textContent = err.message || "Could not reach the server.";
     const retryBtn = document.createElement("button");
     retryBtn.textContent = "Retry";
     retryBtn.style.marginTop = "0.75rem";
@@ -250,10 +184,8 @@ def identify():
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:{content_type};base64,{b64}"
 
-    location = request.form.get("location", "La Paz, Sea of Cortez, Mexico")
-
     prompt = (
-        f"This underwater photo was taken near {location}. "
+        "This underwater photo was taken in the Sea of Cortez near La Paz, Mexico. "
         "Carefully identify the main marine animal. "
         "Pay close attention to overall body structure, not just spines or texture. "
         "Look at symmetry (radial vs bilateral), number and shape of arms/rays, "
@@ -264,8 +196,6 @@ def identify():
         "Common name: <name>\n"
         "Scientific name: <name>\n"
         "Group: <group or family>\n"
-        "Rarity: <common / uncommon / rare in this area>\n"
-        "Typical sightings: <months or seasons when most often seen>\n"
         "Confidence: <low/medium/high>\n"
         "Notes: <one short sentence about key features you used>\n"
         "If you are unsure, say so clearly and mention the closest alternatives."
