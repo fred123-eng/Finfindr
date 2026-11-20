@@ -186,19 +186,19 @@ def identify():
 
     prompt = (
         "This underwater photo was taken in the Sea of Cortez near La Paz, Mexico. "
-        "Carefully identify the main marine animal. "
-        "Pay close attention to overall body structure, not just spines or texture. "
-        "Look at symmetry (radial vs bilateral), number and shape of arms/rays, "
-        "central disc, surface pattern, and whether it has a rigid shell or flexible body. "
-        "Do not assume an animal is a sea urchin just because it has spines — "
-        "starfish and other echinoderms can also have spines. "
+        "Carefully identify the main marine animal by examining its overall body plan. "
+        "Key distinctions:\n"
+        "- Starfish (sea stars) usually have a central disc with distinct arms/rays that are often flattened or tapering, and they show pentaradial symmetry. They may have small spines but the arms are the dominant feature.\n"
+        "- Sea urchins are more globular or hemispherical with a rigid test (shell) covered in long movable spines, and they lack distinct arms.\n"
+        "Do not call it a sea urchin unless you clearly see a rounded body with no arms. "
+        "If you see arms or rays coming from a central disc, it is a starfish. "
         "Reply in this exact format:\n"
         "Common name: <name>\n"
         "Scientific name: <name>\n"
         "Group: <group or family>\n"
         "Confidence: <low/medium/high>\n"
-        "Notes: <one short sentence about key features you used>\n"
-        "If you are unsure, say so clearly and mention the closest alternatives."
+        "Notes: <mention whether you see arms/rays or a rounded spiny body>\n"
+        "If unsure, list the closest alternatives."
     )
 
     payload = {
