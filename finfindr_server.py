@@ -115,6 +115,10 @@ async function handleFile(file) {
 
   try {
     const resp = await fetch("/identify", { method: "POST", body: formData });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error("Server error " + resp.status + ": " + errText.slice(0, 200));
+    }
     const data = await resp.json();
 
     if (data.error) {
@@ -124,48 +128,14 @@ async function handleFile(file) {
       return;
     }
 
-    const text = data.result_text || "No response";
-    // Simple parse of the expected format
-    const lines = text.split("\n");
-    let common = "", scientific = "", group = "", confidence = "", notes = "";
-    lines.forEach(line => {
-      if (line.toLowerCase().startsWith("common name:")) common = line.split(":").slice(1).join(":").trim();
-      else if (line.toLowerCase().startsWith("scientific name:")) scientific = line.split(":").slice(1).join(":").trim();
-      else if (line.toLowerCase().startsWith("group:")) group = line.split(":").slice(1).join(":").trim();
-      else if (line.toLowerCase().startsWith("confidence:")) confidence = line.split(":").slice(1).join(":").trim();
-      else if (line.toLowerCase().startsWith("notes:")) notes = line.split(":").slice(1).join(":").trim();
-    });
-
-    card.querySelector("h3").textContent = common || scientific || "See notes";
+    const text = data.result_text || "No response from model";
+    card.querySelector("h3").textContent = "Result";
     card.querySelector("h3").classList.remove("identifying");
-    card.querySelector(".sci").textContent = scientific || "";
-
-    if (group) {
-      const g = document.createElement("div");
-      g.style.opacity = "0.85";
-      g.style.margin = "0.25rem 0";
-      g.textContent = "Group: " + group;
-      card.querySelector(".result-body").insertBefore(g, card.querySelector(".confidence"));
-    }
-    if (confidence) {
-      card.querySelector(".confidence").textContent = confidence + " confidence";
-    }
-    if (notes) {
-      const n = document.createElement("div");
-      n.style.marginTop = "0.5rem";
-      n.style.fontSize = "0.9rem";
-      n.textContent = notes;
-      card.querySelector(".result-body").appendChild(n);
-    }
-    // Fallback: if parsing failed, show raw text
-    if (!common && !scientific) {
-      card.querySelector("h3").textContent = "Result";
-      card.querySelector(".sci").textContent = text;
-    }
+    card.querySelector(".sci").textContent = text;
   } catch (err) {
     card.querySelector("h3").textContent = "Error";
     card.querySelector("h3").classList.remove("identifying");
-    card.querySelector(".error").textContent = "Could not reach the server.";
+    card.querySelector(".error").textContent = err.message || "Could not reach the server.";
   }
 }
 
