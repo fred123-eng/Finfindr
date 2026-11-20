@@ -142,42 +142,27 @@ async function handleFile(file) {
     }
 
     const top = fish.species[0];
-    // Try many possible field names for common name
-    const common = top.common_name || top.commonName || top.name || top.vernacular_name || 
-                   top.vernacularName || top.preferred_common_name || top.english_name || "";
-    const scientific = top.scientific_name || top.scientificName || top.binomial || "";
-    const accuracy = top.accuracy || top.confidence || top.score || top.probability;
-    const group = top.group || top.family || top.taxonomy?.family || top.class || top.order || "";
-
-    card.querySelector("h3").textContent = common || scientific || "Unknown species";
+    const scientific = top.scientific_name || top.scientificName || top.binomial || "Unknown";
+    
+    // Show scientific name as main title for now
+    card.querySelector("h3").textContent = scientific;
     card.querySelector("h3").classList.remove("identifying");
-    card.querySelector(".sci").textContent = scientific || "";
+    card.querySelector(".sci").textContent = "";
 
-    // Group line
-    let groupText = "";
-    if (group) groupText = "Group: " + group;
-    else if (top.family) groupText = "Family: " + top.family;
-    if (groupText) {
-      const g = document.createElement("div");
-      g.style.opacity = "0.85";
-      g.style.margin = "0.25rem 0";
-      g.textContent = groupText;
-      card.querySelector(".result-body").insertBefore(g, card.querySelector(".confidence"));
-    }
+    // Dump the full species object so we can see every field
+    const debug = document.createElement("pre");
+    debug.style.fontSize = "0.7rem";
+    debug.style.opacity = "0.75";
+    debug.style.marginTop = "0.75rem";
+    debug.style.whiteSpace = "pre-wrap";
+    debug.style.wordBreak = "break-all";
+    debug.textContent = JSON.stringify(top, null, 2);
+    card.querySelector(".result-body").appendChild(debug);
 
+    const accuracy = top.accuracy || top.confidence || top.score || top.probability;
     if (accuracy) {
       const pct = Math.round(accuracy > 1 ? accuracy : accuracy * 100);
       card.querySelector(".confidence").textContent = pct + "% confidence";
-    }
-
-    // Debug: show available keys if no common name
-    if (!common) {
-      const debug = document.createElement("div");
-      debug.style.fontSize = "0.75rem";
-      debug.style.opacity = "0.6";
-      debug.style.marginTop = "0.5rem";
-      debug.textContent = "Available fields: " + Object.keys(top).join(", ");
-      card.querySelector(".result-body").appendChild(debug);
     }
   } catch (err) {
     card.querySelector("h3").textContent = "Error";
