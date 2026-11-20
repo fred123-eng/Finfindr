@@ -61,15 +61,17 @@ HTML = """
   <p>Upload a photo · Get the species</p>
 </header>
 
-<div class="upload-zone" id="dropZone">
-  <h2>Choose a photo</h2>
-  <p>Use the button below</p>
-  <label style="display:block; margin:1rem 0 0.5rem; font-size:0.95rem;">Location</label>
-  <select id="locationSelect" style="padding:0.5rem; border-radius:8px; border:none; background:#134e4a; color:white; font-size:1rem;">
+<div class="upload-zone" id="dropZone" style="padding:1.5rem;">
+  <h2>Upload a photo</h2>
+  <label style="display:block; margin:1rem 0 0.5rem;">Location</label>
+  <select id="locationSelect" style="padding:0.6rem; border-radius:8px; border:none; background:#134e4a; color:white; font-size:1rem; width:100%; max-width:320px;">
     <option value="La Paz, Sea of Cortez, Mexico" selected>La Paz, Sea of Cortez, Mexico</option>
   </select>
+  <br><br>
+  <label for="fileInput" style="display:inline-block; background:var(--teal); color:white; padding:0.85rem 1.8rem; border-radius:12px; font-weight:600; cursor:pointer; font-size:1.1rem;">
+    Choose Photo
+  </label>
   <input type="file" id="fileInput" accept="image/*" style="display:none;">
-  <button type="button" id="chooseBtn" style="margin-top:1rem; background:var(--aqua); color:var(--deep); font-size:1.1rem; padding:0.8rem 1.5rem;">Choose Photo</button>
 </div>
 
 <div id="results"></div>
@@ -83,13 +85,13 @@ HTML = """
 <script>
 const dropZone = document.getElementById("dropZone");
 const fileInput = document.getElementById("fileInput");
-const chooseBtn = document.getElementById("chooseBtn");
 const results = document.getElementById("results");
 const actions = document.getElementById("actions");
 
-chooseBtn.addEventListener("click", () => fileInput.click());
 fileInput.addEventListener("change", () => {
-  if (fileInput.files.length) handleFile(fileInput.files[0]);
+  if (fileInput.files && fileInput.files.length > 0) {
+    handleFile(fileInput.files[0]);
+  }
 });
 
 async function handleFile(file) {
