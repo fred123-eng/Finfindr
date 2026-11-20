@@ -40,7 +40,7 @@ HTML = """
   header p { opacity: 0.8; margin-top: 0.3rem; }
   .upload-zone { width: 100%; max-width: 560px; margin: 0 auto 1.5rem; border: 2px dashed rgba(255,255,255,0.3); border-radius: 20px; padding: 2.5rem 2rem; text-align: center; background: rgba(255,255,255,0.05); cursor: pointer; }
   .upload-zone:hover, .upload-zone.dragover { border-color: var(--aqua); background: rgba(34,211,238,0.08); }
-  #fileInput { display: none; }
+  #fileInput { display: block; margin: 1rem auto; }
   #results { max-width: 800px; margin: 0 auto; }
   .result-card { background: rgba(0,0,0,0.35); border-radius: 16px; margin-bottom: 1.25rem; border: 1px solid rgba(255,255,255,0.1); overflow: hidden; }
   .result-card img { width: 100%; max-height: 280px; object-fit: cover; }
@@ -62,9 +62,9 @@ HTML = """
 </header>
 
 <div class="upload-zone" id="dropZone">
-  <h2>Drop a photo here</h2>
-  <p>or click to choose an image</p>
-  <input type="file" id="fileInput" accept="image/*">
+  <h2>Choose a photo</h2>
+  <p>Use the button below</p>
+  <input type="file" id="fileInput" accept="image/*" style="display:block; margin:1rem auto; font-size:1.1rem;">
 </div>
 
 <div id="results"></div>
@@ -73,7 +73,7 @@ HTML = """
   <button onclick="reset()">Identify another photo</button>
 </div>
 
-<footer>FinFindr · Powered by Fishial.ai</footer>
+<footer>FinFindr · Powered by Grok</footer>
 
 <script>
 const dropZone = document.getElementById("dropZone");
@@ -81,21 +81,7 @@ const fileInput = document.getElementById("fileInput");
 const results = document.getElementById("results");
 const actions = document.getElementById("actions");
 
-dropZone.addEventListener("click", (e) => {
-  e.preventDefault();
-  fileInput.click();
-});
-dropZone.addEventListener("touchend", (e) => {
-  e.preventDefault();
-  fileInput.click();
-});
-dropZone.addEventListener("dragover", (e) => { e.preventDefault(); dropZone.classList.add("dragover"); });
-dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragover"));
-dropZone.addEventListener("drop", (e) => {
-  e.preventDefault();
-  dropZone.classList.remove("dragover");
-  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
-});
+// Direct file input - no click proxy needed
 fileInput.addEventListener("change", () => {
   if (fileInput.files.length) handleFile(fileInput.files[0]);
 });
@@ -112,7 +98,7 @@ async function handleFile(file) {
   card.innerHTML = `
     <img class="upload-preview" alt="Uploaded photo">
     <div class="result-body">
-      <h3 class="identifying">Identifying with Fishial…</h3>
+      <h3 class="identifying">Identifying…</h3>
       <div class="sci"></div>
       <div class="confidence"></div>
       <div class="error"></div>
