@@ -131,28 +131,19 @@ async function handleFile(file) {
       return;
     }
 
-    const fish = data.results && data.results[0];
-    if (!fish || !fish.species || !fish.species.length) {
-      card.querySelector("h3").textContent = "No clear match";
-      card.querySelector("h3").classList.remove("identifying");
-      card.querySelector(".error").textContent = "Fishial did not return a species. Try a clearer photo of a single fish.";
-      // Show raw response for debugging
-      card.querySelector(".sci").textContent = JSON.stringify(data).slice(0, 300);
-      return;
-    }
+    const text = data.result_text || "No response";
+    // Simple parse of the expected format
+    const lines = text.split("\n");
+    let common = "", scientific = "", group = "", confidence = "", notes = "";
+    lines.forEach(line => {
+      if (line.toLowerCase().startsWith("common name:")) common = line.split(":").slice(1).join(":").trim();
+      else if (line.toLowerCase().startsWith("scientific name:")) scientific = line.split(":").slice(1).join(":").trim();
+      else if (line.toLowerCase().startsWith("group:")) group = line.split(":").slice(1).join(":").trim();
+      else if (line.toLowerCase().startsWith("confidence:")) confidence = line.split(":").slice(1).join(":").trim();
+      else if (line.toLowerCase().startsWith("notes:")) notes = line.split(":").slice(1).join(":").trim();
+    });
 
-    const top = fish.species[0];
-    const fh = top["fishangler-data"] || {};
-
-    // Common name: prefer title, then first commonNames entry
-    const common = fh.title || (fh.commonNames && fh.commonNames[0]) || "";
-    // Scientific name
-    const scientific = top.name || fh.scientificName || top.scientificName || "";
-    // Group / family
-    const group = fh.groupFamily || fh.family || fh.order || "";
-    const accuracy = top.accuracy || top.confidence || top.score;
-
-    card.querySelector("h3").textContent = common || scientific || "Unknown species";
+    card.querySelector("h3").textContent = common || scientific || "See notes";
     card.querySelector("h3").classList.remove("identifying");
     card.querySelector(".sci").textContent = scientific || "";
 
@@ -163,10 +154,20 @@ async function handleFile(file) {
       g.textContent = "Group: " + group;
       card.querySelector(".result-body").insertBefore(g, card.querySelector(".confidence"));
     }
-
-    if (accuracy) {
-      const pct = Math.round(accuracy > 1 ? accuracy : accuracy * 100);
-      card.querySelector(".confidence").textContent = pct + "% confidence";
+    if (confidence) {
+      card.querySelector(".confidence").textContent = confidence + " confidence";
+    }
+    if (notes) {
+      const n = document.createElement("div");
+      n.style.marginTop = "0.5rem";
+      n.style.fontSize = "0.9rem";
+      n.textContent = notes;
+      card.querySelector(".result-body").appendChild(n);
+    }
+    // Fallback: if parsing failed, show raw text
+    if (!common && !scientific) {
+      card.querySelector("h3").textContent = "Result";
+      card.querySelector(".sci").textContent = text;
     }
   } catch (err) {
     card.querySelector("h3").textContent = "Error";
@@ -187,16 +188,12 @@ function reset() {
 """
 
 def get_access_token():
-    resp = requests.post(AUTH_URL, json={
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET
-    })
-    resp.raise_for_status()
-    return resp.json()["access_token"]
+    # no longer needed
+    pass
 
 def get_checksum(data: bytes) -> str:
-    md5 = hashlib.md5(data).digest()
-    return base64.b64encode(md5).decode("utf-8")
+    # no longer needed
+    pass
 
 @app.route("/")
 def index():
@@ -209,55 +206,66 @@ def identify():
 
     file = request.files["image"]
     image_bytes = file.read()
-    filename = file.filename or "photo.jpg"
     content_type = file.content_type or "image/jpeg"
 
-    try:
-        token = get_access_token()
-        checksum = get_checksum(image_bytes)
+    xai_key = os.environ.get("XAI_API_KEY")
+    if not xai_key:
+        return jsonify({"error": "XAI_API_KEY not set on the server"}), 500
 
-        # 1. Request upload URL
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        }
-        upload_payload = {
-            "blob": {
-                "filename": filename,
-                "content_type": content_type,
-                "byte_size": len(image_bytes),
-                "checksum": checksum
+    # Encode image as base64 data URL
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    data_url = f"data:{content_type};base64,{b64}"
+
+    prompt = (
+        "This underwater photo was taken in the Sea of Cortez near La Paz, Mexico. "
+        "Identify the main fish or marine animal. "
+        "Reply in this exact format:\n"
+        "Common name: <name>\n"
+        "Scientific name: <name>\n"
+        "Group: <group or family>\n"
+        "Confidence: <low/medium/high>\n"
+        "Notes: <one short sentence>\n"
+        "If you are unsure, say so clearly."
+    )
+
+    payload = {
+        "model": "grok-4",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": data_url, "detail": "high"},
+                    {"type": "input_text", "text": prompt}
+                ]
             }
-        }
-        resp = requests.post(UPLOAD_URL, json=upload_payload, headers=headers)
+        ]
+    }
+
+    try:
+        resp = requests.post(
+            "https://api.x.ai/v1/responses",
+            headers={
+                "Authorization": f"Bearer {xai_key}",
+                "Content-Type": "application/json"
+            },
+            json=payload,
+            timeout=60
+        )
         resp.raise_for_status()
         data = resp.json()
 
-        signed_id = data.get("signed-id")
-        direct = data.get("direct-upload", {})
-        upload_url = direct.get("url")
-        content_disposition = direct.get("headers", {}).get("Content-Disposition", "")
+        # Extract the text response
+        text = ""
+        if "output" in data and data["output"]:
+            for item in data["output"]:
+                if item.get("type") == "message":
+                    for c in item.get("content", []):
+                        if c.get("type") == "output_text":
+                            text += c.get("text", "")
+        if not text and "choices" in data:
+            text = data["choices"][0].get("message", {}).get("content", "")
 
-        if not signed_id or not upload_url:
-            return jsonify({"error": "Failed to get upload URL from Fishial"}), 500
-
-        # 2. Upload the image
-        put_headers = {
-            "Content-Disposition": content_disposition,
-            "Content-Md5": checksum,
-            "Content-Type": ""
-        }
-        put_resp = requests.put(upload_url, data=image_bytes, headers=put_headers)
-        put_resp.raise_for_status()
-
-        # 3. Request recognition
-        rec_url = f"{RECOGNITION_URL}?q={signed_id}"
-        rec_resp = requests.get(rec_url, headers={"Authorization": f"Bearer {token}"})
-        rec_resp.raise_for_status()
-        result = rec_resp.json()
-
-        return jsonify(result)
+        return jsonify({"result_text": text or "No response from model"})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
