@@ -90,7 +90,17 @@ const actions = document.getElementById("actions");
 
 fileInput.addEventListener("change", () => {
   if (fileInput.files && fileInput.files.length > 0) {
+    const selectedName = fileInput.files[0].name;
+    // Show immediate feedback
+    const status = document.createElement("p");
+    status.id = "statusMsg";
+    status.style.marginTop = "1rem";
+    status.style.color = "var(--aqua)";
+    status.textContent = "Selected: " + selectedName + " — identifying…";
+    dropZone.appendChild(status);
     handleFile(fileInput.files[0]);
+  } else {
+    alert("No file was selected.");
   }
 });
 
