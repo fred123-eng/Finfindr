@@ -142,33 +142,42 @@ async function handleFile(file) {
     }
 
     const top = fish.species[0];
-    const common = top.common_name || top.name || top.commonName || "";
-    const scientific = top.scientific_name || top.scientificName || "";
-    const accuracy = top.accuracy || top.confidence || top.score;
-    const group = top.group || top.family || top.taxonomy?.family || top.class || "";
+    // Try many possible field names for common name
+    const common = top.common_name || top.commonName || top.name || top.vernacular_name || 
+                   top.vernacularName || top.preferred_common_name || top.english_name || "";
+    const scientific = top.scientific_name || top.scientificName || top.binomial || "";
+    const accuracy = top.accuracy || top.confidence || top.score || top.probability;
+    const group = top.group || top.family || top.taxonomy?.family || top.class || top.order || "";
 
-    // Main title: prefer common name
     card.querySelector("h3").textContent = common || scientific || "Unknown species";
     card.querySelector("h3").classList.remove("identifying");
-
-    // Scientific name
     card.querySelector(".sci").textContent = scientific || "";
 
-    // Group / family
-    const groupEl = document.createElement("div");
-    groupEl.className = "spanish";
-    groupEl.style.opacity = "0.85";
-    groupEl.style.margin = "0.3rem 0";
-    if (group) {
-      groupEl.textContent = "Group: " + group;
-    } else if (top.family) {
-      groupEl.textContent = "Family: " + top.family;
+    // Group line
+    let groupText = "";
+    if (group) groupText = "Group: " + group;
+    else if (top.family) groupText = "Family: " + top.family;
+    if (groupText) {
+      const g = document.createElement("div");
+      g.style.opacity = "0.85";
+      g.style.margin = "0.25rem 0";
+      g.textContent = groupText;
+      card.querySelector(".result-body").insertBefore(g, card.querySelector(".confidence"));
     }
-    card.querySelector(".result-body").insertBefore(groupEl, card.querySelector(".confidence"));
 
     if (accuracy) {
-      const pct = Math.round((accuracy > 1 ? accuracy : accuracy * 100));
+      const pct = Math.round(accuracy > 1 ? accuracy : accuracy * 100);
       card.querySelector(".confidence").textContent = pct + "% confidence";
+    }
+
+    // Debug: show available keys if no common name
+    if (!common) {
+      const debug = document.createElement("div");
+      debug.style.fontSize = "0.75rem";
+      debug.style.opacity = "0.6";
+      debug.style.marginTop = "0.5rem";
+      debug.textContent = "Available fields: " + Object.keys(top).join(", ");
+      card.querySelector(".result-body").appendChild(debug);
     }
   } catch (err) {
     card.querySelector("h3").textContent = "Error";
