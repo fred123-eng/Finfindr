@@ -58,7 +58,7 @@ HTML = """
 <body>
 <header>
   <h1>FinFindr</h1>
-  <p>Upload a photo · Get the species from Fishial.ai</p>
+  <p>Upload a photo · Get the species</p>
 </header>
 
 <div class="upload-zone" id="dropZone">
@@ -81,7 +81,14 @@ const fileInput = document.getElementById("fileInput");
 const results = document.getElementById("results");
 const actions = document.getElementById("actions");
 
-dropZone.addEventListener("click", () => fileInput.click());
+dropZone.addEventListener("click", (e) => {
+  e.preventDefault();
+  fileInput.click();
+});
+dropZone.addEventListener("touchend", (e) => {
+  e.preventDefault();
+  fileInput.click();
+});
 dropZone.addEventListener("dragover", (e) => { e.preventDefault(); dropZone.classList.add("dragover"); });
 dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragover"));
 dropZone.addEventListener("drop", (e) => {
