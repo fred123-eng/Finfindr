@@ -142,24 +142,28 @@ async function handleFile(file) {
     }
 
     const top = fish.species[0];
-    const scientific = top.scientific_name || top.scientificName || top.binomial || "Unknown";
-    
-    // Show scientific name as main title for now
-    card.querySelector("h3").textContent = scientific;
+    const fh = top["fishangler-data"] || {};
+
+    // Common name: prefer title, then first commonNames entry
+    const common = fh.title || (fh.commonNames && fh.commonNames[0]) || "";
+    // Scientific name
+    const scientific = top.name || fh.scientificName || top.scientificName || "";
+    // Group / family
+    const group = fh.groupFamily || fh.family || fh.order || "";
+    const accuracy = top.accuracy || top.confidence || top.score;
+
+    card.querySelector("h3").textContent = common || scientific || "Unknown species";
     card.querySelector("h3").classList.remove("identifying");
-    card.querySelector(".sci").textContent = "";
+    card.querySelector(".sci").textContent = scientific || "";
 
-    // Dump the full species object so we can see every field
-    const debug = document.createElement("pre");
-    debug.style.fontSize = "0.7rem";
-    debug.style.opacity = "0.75";
-    debug.style.marginTop = "0.75rem";
-    debug.style.whiteSpace = "pre-wrap";
-    debug.style.wordBreak = "break-all";
-    debug.textContent = JSON.stringify(top, null, 2);
-    card.querySelector(".result-body").appendChild(debug);
+    if (group) {
+      const g = document.createElement("div");
+      g.style.opacity = "0.85";
+      g.style.margin = "0.25rem 0";
+      g.textContent = "Group: " + group;
+      card.querySelector(".result-body").insertBefore(g, card.querySelector(".confidence"));
+    }
 
-    const accuracy = top.accuracy || top.confidence || top.score || top.probability;
     if (accuracy) {
       const pct = Math.round(accuracy > 1 ? accuracy : accuracy * 100);
       card.querySelector(".confidence").textContent = pct + "% confidence";
