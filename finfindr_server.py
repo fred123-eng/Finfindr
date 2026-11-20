@@ -73,7 +73,7 @@ HTML = """
   <button onclick="reset()">Identify another photo</button>
 </div>
 
-<footer>FinFindr · Powered by Grok</footer>
+<footer>FinFindr</footer>
 
 <script>
 const dropZone = document.getElementById("dropZone");
@@ -136,6 +136,11 @@ async function handleFile(file) {
     card.querySelector("h3").textContent = "Error";
     card.querySelector("h3").classList.remove("identifying");
     card.querySelector(".error").textContent = err.message || "Could not reach the server.";
+    const retryBtn = document.createElement("button");
+    retryBtn.textContent = "Retry";
+    retryBtn.style.marginTop = "0.75rem";
+    retryBtn.onclick = () => handleFile(file);
+    card.querySelector(".result-body").appendChild(retryBtn);
   }
 }
 
