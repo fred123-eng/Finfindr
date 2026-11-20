@@ -68,7 +68,8 @@ HTML = """
   <select id="locationSelect" style="padding:0.5rem; border-radius:8px; border:none; background:#134e4a; color:white; font-size:1rem;">
     <option value="La Paz, Sea of Cortez, Mexico" selected>La Paz, Sea of Cortez, Mexico</option>
   </select>
-  <input type="file" id="fileInput" accept="image/*" style="display:block; margin:1rem auto; font-size:1.1rem;">
+  <input type="file" id="fileInput" accept="image/*" style="display:none;">
+  <button type="button" id="chooseBtn" style="margin-top:1rem; background:var(--aqua); color:var(--deep); font-size:1.1rem; padding:0.8rem 1.5rem;">Choose Photo</button>
 </div>
 
 <div id="results"></div>
@@ -82,16 +83,20 @@ HTML = """
 <script>
 const dropZone = document.getElementById("dropZone");
 const fileInput = document.getElementById("fileInput");
+const chooseBtn = document.getElementById("chooseBtn");
 const results = document.getElementById("results");
 const actions = document.getElementById("actions");
 
-// Direct file input - no click proxy needed
+chooseBtn.addEventListener("click", () => fileInput.click());
 fileInput.addEventListener("change", () => {
   if (fileInput.files.length) handleFile(fileInput.files[0]);
 });
 
 async function handleFile(file) {
-  if (!file.type.startsWith("image/")) return alert("Please upload an image.");
+  if (!file || !file.type.startsWith("image/")) {
+    alert("Please select an image file.");
+    return;
+  }
 
   dropZone.style.display = "none";
   actions.style.display = "block";
@@ -105,7 +110,7 @@ async function handleFile(file) {
       <h3 class="identifying">Identifying…</h3>
       <div class="sci"></div>
       <div class="confidence"></div>
-      <div class="error"></div>
+      <div class="error" style="color:#fb7185; margin-top:0.5rem;"></div>
     </div>
   `;
   results.appendChild(card);
@@ -119,18 +124,18 @@ async function handleFile(file) {
   formData.append("location", document.getElementById("locationSelect").value);
 
   try {
+    card.querySelector("h3").textContent = "Sending to server…";
     const resp = await fetch("/identify", { method: "POST", body: formData });
+    
     if (!resp.ok) {
       const errText = await resp.text();
-      throw new Error("Server error " + resp.status + ": " + errText.slice(0, 200));
+      throw new Error("Server returned " + resp.status + ": " + errText.slice(0, 300));
     }
+    
     const data = await resp.json();
 
     if (data.error) {
-      card.querySelector("h3").textContent = "Identification failed";
-      card.querySelector("h3").classList.remove("identifying");
-      card.querySelector(".error").textContent = data.error;
-      return;
+      throw new Error(data.error);
     }
 
     const text = data.result_text || "No response from model";
@@ -138,26 +143,24 @@ async function handleFile(file) {
     card.querySelector("h3").classList.remove("identifying");
     card.querySelector(".sci").innerHTML = text.replace(/\n/g, "<br>");
 
-    // Simple illustrative sightings chart (placeholder)
+    // Illustrative chart
     const chart = document.createElement("div");
     chart.style.marginTop = "1rem";
     chart.innerHTML = `
-      <div style="font-size:0.9rem; margin-bottom:0.4rem;">Typical sightings (illustrative for La Paz):</div>
+      <div style="font-size:0.9rem; margin-bottom:0.4rem;">Typical sightings (illustrative):</div>
       <div style="display:flex; align-items:flex-end; height:60px; gap:4px;">
         ${["J","F","M","A","M","J","J","A","S","O","N","D"].map((m,i) => {
           const h = [20,25,40,55,70,80,75,60,45,35,25,20][i];
-          return `<div style="flex:1; background:var(--teal); height:${h}%; border-radius:3px 3px 0 0;" title="${m}"></div>`;
+          return `<div style="flex:1; background:var(--teal); height:${h}%; border-radius:3px 3px 0 0;"></div>`;
         }).join("")}
-      </div>
-      <div style="display:flex; justify-content:space-between; font-size:0.65rem; opacity:0.7; margin-top:2px;">
-        <span>J</span><span>F</span><span>M</span><span>A</span><span>M</span><span>J</span><span>J</span><span>A</span><span>S</span><span>O</span><span>N</span><span>D</span>
       </div>
     `;
     card.querySelector(".result-body").appendChild(chart);
+
   } catch (err) {
     card.querySelector("h3").textContent = "Error";
     card.querySelector("h3").classList.remove("identifying");
-    card.querySelector(".error").textContent = err.message || "Could not reach the server.";
+    card.querySelector(".error").textContent = err.message || "Something went wrong.";
     const retryBtn = document.createElement("button");
     retryBtn.textContent = "Retry";
     retryBtn.style.marginTop = "0.75rem";
