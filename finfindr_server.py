@@ -142,15 +142,32 @@ async function handleFile(file) {
     }
 
     const top = fish.species[0];
-    const common = top.common_name || top.name || "";
+    const common = top.common_name || top.name || top.commonName || "";
     const scientific = top.scientific_name || top.scientificName || "";
     const accuracy = top.accuracy || top.confidence || top.score;
+    const group = top.group || top.family || top.taxonomy?.family || top.class || "";
 
+    // Main title: prefer common name
     card.querySelector("h3").textContent = common || scientific || "Unknown species";
     card.querySelector("h3").classList.remove("identifying");
+
+    // Scientific name
     card.querySelector(".sci").textContent = scientific || "";
+
+    // Group / family
+    const groupEl = document.createElement("div");
+    groupEl.className = "spanish";
+    groupEl.style.opacity = "0.85";
+    groupEl.style.margin = "0.3rem 0";
+    if (group) {
+      groupEl.textContent = "Group: " + group;
+    } else if (top.family) {
+      groupEl.textContent = "Family: " + top.family;
+    }
+    card.querySelector(".result-body").insertBefore(groupEl, card.querySelector(".confidence"));
+
     if (accuracy) {
-      const pct = Math.round(accuracy * 100);
+      const pct = Math.round((accuracy > 1 ? accuracy : accuracy * 100));
       card.querySelector(".confidence").textContent = pct + "% confidence";
     }
   } catch (err) {
