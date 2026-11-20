@@ -133,17 +133,25 @@ async function handleFile(file) {
 
     const fish = data.results && data.results[0];
     if (!fish || !fish.species || !fish.species.length) {
-      card.querySelector("h3").textContent = "No fish detected";
+      card.querySelector("h3").textContent = "No clear match";
       card.querySelector("h3").classList.remove("identifying");
+      card.querySelector(".error").textContent = "Fishial did not return a species. Try a clearer photo of a single fish.";
+      // Show raw response for debugging
+      card.querySelector(".sci").textContent = JSON.stringify(data).slice(0, 300);
       return;
     }
 
     const top = fish.species[0];
-    card.querySelector("h3").textContent = top.common_name || top.scientific_name || "Unknown";
+    const common = top.common_name || top.name || "";
+    const scientific = top.scientific_name || top.scientificName || "";
+    const accuracy = top.accuracy || top.confidence || top.score;
+
+    card.querySelector("h3").textContent = common || scientific || "Unknown species";
     card.querySelector("h3").classList.remove("identifying");
-    card.querySelector(".sci").textContent = top.scientific_name || "";
-    if (top.accuracy) {
-      card.querySelector(".confidence").textContent = Math.round(top.accuracy * 100) + "% confidence";
+    card.querySelector(".sci").textContent = scientific || "";
+    if (accuracy) {
+      const pct = Math.round(accuracy * 100);
+      card.querySelector(".confidence").textContent = pct + "% confidence";
     }
   } catch (err) {
     card.querySelector("h3").textContent = "Error";
