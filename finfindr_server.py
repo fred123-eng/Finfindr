@@ -195,7 +195,7 @@ def identify():
         "Common name: <name>\\n"
         "Scientific name: <name>\\n"
         "Group: <group>\\n"
-        "Alternative group considered: <other possible group or \\"none\\">\\n"
+        "Alternative group considered: <other possible group or none>\\n"
         "Confidence: <high / medium / low>\\n"
         "Notes: <one cool fact about the species>\\n"
         "If still unsure, list the closest alternatives."
