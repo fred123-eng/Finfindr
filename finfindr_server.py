@@ -111,12 +111,13 @@ async function handleFile(file) {
 
     const text = data.result_text || "No response";
     const lines = text.split("\\n").map(l => l.trim()).filter(Boolean);
-    let common = "", scientific = "", group = "", confidence = "", notes = "";
+    let common = "", scientific = "", group = "", altGroup = "", confidence = "", notes = "";
     lines.forEach(line => {
       const lower = line.toLowerCase();
       if (lower.startsWith("common name:")) common = line.split(":").slice(1).join(":").trim();
       else if (lower.startsWith("scientific name:")) scientific = line.split(":").slice(1).join(":").trim();
       else if (lower.startsWith("group:")) group = line.split(":").slice(1).join(":").trim();
+      else if (lower.startsWith("alternative group considered:")) altGroup = line.split(":").slice(1).join(":").trim();
       else if (lower.startsWith("confidence:")) confidence = line.split(":").slice(1).join(":").trim();
       else if (lower.startsWith("notes:")) notes = line.split(":").slice(1).join(":").trim();
     });
@@ -128,6 +129,14 @@ async function handleFile(file) {
       g.style.margin = "0.3rem 0";
       g.textContent = "Group: " + group;
       card.querySelector(".result-body").appendChild(g);
+    }
+    if (altGroup && altGroup.toLowerCase() !== "none") {
+      const a = document.createElement("div");
+      a.style.margin = "0.2rem 0";
+      a.style.opacity = "0.75";
+      a.style.fontSize = "0.9rem";
+      a.textContent = "Also considered: " + altGroup;
+      card.querySelector(".result-body").appendChild(a);
     }
     if (confidence) card.querySelector(".confidence").textContent = confidence + " confidence";
     if (notes) {
@@ -171,20 +180,25 @@ def identify():
     prompt = (
         "You are a marine biologist specializing in the Sea of Cortez. "
         "This photo was taken near La Paz, Mexico.\\n\\n"
-        "Step 1: Describe the overall body shape and symmetry you see.\\n"
-        "Step 2: Note whether there are distinct arms/rays, fins, a rounded spiny body, a hard shell, or a soft body.\\n"
-        "Step 3: Based on those features (not just color or spines), decide the group.\\n\\n"
+        "Examine the animal carefully. First note the overall body plan "
+        "(arms/rays, fins, rounded spiny body, elongated form, hard shell, soft body, etc.).\\n\\n"
+        "Then consider the two most likely groups this could belong to. "
+        "Do not lock in the first group — if features could fit either, weigh both.\\n"
+        "Example: an elongated animal could be an eel or a sea snake; "
+        "a spiny animal could be a starfish or a sea urchin. "
+        "Choose the species that best matches the visible features, even if it is not in the first group you thought of.\\n\\n"
         "Key rules:\\n"
-        "- If you see arms or rays coming from a central disc → starfish, even if small spines are present.\\n"
-        "- Only call it a sea urchin if the body is clearly rounded/globular with no arms.\\n"
-        "- Prefer species known from the Sea of Cortez when features are ambiguous.\\n\\n"
+        "- Arms or rays from a central disc → starfish (not sea urchin).\\n"
+        "- Clearly rounded/globular body with long spines and no arms → sea urchin.\\n"
+        "- Prefer Sea of Cortez species when ambiguous.\\n\\n"
         "Reply in this exact format:\\n"
         "Common name: <name>\\n"
         "Scientific name: <name>\\n"
         "Group: <group>\\n"
-        "Confidence: <high only if multiple clear features match; medium if one strong feature; low if unclear>\\n"
+        "Alternative group considered: <other possible group or \\"none\\">\\n"
+        "Confidence: <high / medium / low>\\n"
         "Notes: <one cool fact about the species>\\n"
-        "If unsure, list the closest alternatives."
+        "If still unsure, list the closest alternatives."
     )
 
     payload = {
