@@ -129,9 +129,43 @@ async function handleFile(file) {
     }
 
     const text = data.result_text || "No response from model";
-    card.querySelector("h3").textContent = "Result";
+    // Parse the structured response for cleaner display
+    const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+    let common = "", scientific = "", group = "", confidence = "", notes = "";
+    lines.forEach(line => {
+      const lower = line.toLowerCase();
+      if (lower.startsWith("common name:")) common = line.split(":").slice(1).join(":").trim();
+      else if (lower.startsWith("scientific name:")) scientific = line.split(":").slice(1).join(":").trim();
+      else if (lower.startsWith("group:")) group = line.split(":").slice(1).join(":").trim();
+      else if (lower.startsWith("confidence:")) confidence = line.split(":").slice(1).join(":").trim();
+      else if (lower.startsWith("notes:")) notes = line.split(":").slice(1).join(":").trim();
+    });
+
+    card.querySelector("h3").textContent = common || "Result";
     card.querySelector("h3").classList.remove("identifying");
-    card.querySelector(".sci").textContent = text;
+    card.querySelector(".sci").textContent = scientific || "";
+    if (group) {
+      const g = document.createElement("div");
+      g.style.opacity = "0.85";
+      g.style.margin = "0.3rem 0";
+      g.textContent = "Group: " + group;
+      card.querySelector(".result-body").insertBefore(g, card.querySelector(".confidence"));
+    }
+    if (confidence) {
+      card.querySelector(".confidence").textContent = confidence + " confidence";
+    }
+    if (notes) {
+      const n = document.createElement("div");
+      n.style.marginTop = "0.6rem";
+      n.style.fontSize = "0.95rem";
+      n.textContent = notes;
+      card.querySelector(".result-body").appendChild(n);
+    }
+    // Fallback if parsing failed
+    if (!common && !scientific) {
+      card.querySelector("h3").textContent = "Result";
+      card.querySelector(".sci").textContent = text;
+    }
   } catch (err) {
     card.querySelector("h3").textContent = "Error";
     card.querySelector("h3").classList.remove("identifying");
@@ -201,7 +235,7 @@ def identify():
         "Scientific name: <name>\n"
         "Group: <group or family>\n"
         "Confidence: <low/medium/high>\n"
-        "Notes: <mention the main body features you used>\n"
+        "Notes: <one interesting or cool fact about this species>\n"
         "If unsure, list the closest alternatives."
     )
 
