@@ -1,28 +1,14 @@
 #!/usr/bin/env python3
 """
-FinFindr – Fishial.ai Identification App
-Upload photos → get real species identification via Fishial API.
-Ready for local use or deployment on Render.
+FinFindr – Marine species identification
 """
 
 from flask import Flask, request, jsonify, render_template_string
 import requests
-import hashlib
 import base64
 import os
 
 app = Flask(__name__)
-
-# ============================================================
-# FISHIAL CREDENTIALS (set as environment variables for production)
-# ============================================================
-CLIENT_ID = os.environ.get("FISHIAL_CLIENT_ID", "34920f6556702d993e17d75d")
-CLIENT_SECRET = os.environ.get("FISHIAL_CLIENT_SECRET", "163052c6e9dc46123cf64316d67fd05e")
-# ============================================================
-
-AUTH_URL = "https://api-users.fishial.ai/v1/auth/token"
-UPLOAD_URL = "https://api.fishial.ai/v1/recognition/upload"
-RECOGNITION_URL = "https://api.fishial.ai/v1/recognition/image"
 
 HTML = """
 <!DOCTYPE html>
@@ -38,9 +24,7 @@ HTML = """
   header { text-align: center; margin-bottom: 1.5rem; }
   header h1 { font-size: 2.6rem; background: linear-gradient(90deg, var(--aqua), #67e8f9); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
   header p { opacity: 0.8; margin-top: 0.3rem; }
-  .upload-zone { width: 100%; max-width: 560px; margin: 0 auto 1.5rem; border: 2px dashed rgba(255,255,255,0.3); border-radius: 20px; padding: 2.5rem 2rem; text-align: center; background: rgba(255,255,255,0.05); cursor: pointer; }
-  .upload-zone:hover, .upload-zone.dragover { border-color: var(--aqua); background: rgba(34,211,238,0.08); }
-  #fileInput { display: block; margin: 1rem auto; }
+  .upload-zone { width: 100%; max-width: 560px; margin: 0 auto 1.5rem; border: 2px dashed rgba(255,255,255,0.3); border-radius: 20px; padding: 2rem; text-align: center; background: rgba(255,255,255,0.05); }
   #results { max-width: 800px; margin: 0 auto; }
   .result-card { background: rgba(0,0,0,0.35); border-radius: 16px; margin-bottom: 1.25rem; border: 1px solid rgba(255,255,255,0.1); overflow: hidden; }
   .result-card img { width: 100%; max-height: 280px; object-fit: cover; }
@@ -49,9 +33,7 @@ HTML = """
   .sci { opacity: 0.7; font-style: italic; margin-bottom: 0.4rem; }
   .confidence { display: inline-block; background: var(--teal); padding: 0.25rem 0.7rem; border-radius: 999px; font-size: 0.8rem; font-weight: 600; margin: 0.4rem 0; }
   .error { color: #fb7185; }
-  .identifying { opacity: 0.6; font-style: italic; }
-  .actions { text-align: center; margin-top: 1.5rem; }
-  button { background: var(--teal); color: white; border: none; padding: 0.7rem 1.5rem; border-radius: 12px; cursor: pointer; font-weight: 600; }
+  button { background: var(--teal); color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 12px; cursor: pointer; font-weight: 600; font-size: 1rem; }
   footer { text-align: center; margin-top: 2.5rem; opacity: 0.5; font-size: 0.8rem; }
 </style>
 </head>
@@ -61,55 +43,48 @@ HTML = """
   <p>Upload a photo · Get the species</p>
 </header>
 
-<div class="upload-zone" id="dropZone">
+<div class="upload-zone" id="uploadZone">
   <h2>Choose a photo</h2>
-  <p>Use the button below</p>
-  <input type="file" id="fileInput" accept="image/*" style="display:block; margin:1rem auto; font-size:1.1rem;">
-  <button type="button" id="goBtn" style="margin-top:0.5rem; display:none;">Identify this photo</button>
+  <input type="file" id="fileInput" accept="image/*" style="margin:1rem 0; font-size:1rem;">
+  <br>
+  <button type="button" id="identifyBtn" disabled>Identify Photo</button>
 </div>
 
 <div id="results"></div>
 
-<div class="actions" id="actions" style="display:none;">
-  <button onclick="reset()">Identify another photo</button>
-</div>
-
 <footer>FinFindr</footer>
 
 <script>
-const dropZone = document.getElementById("dropZone");
-const fileInput = document.getElementById("fileInput");
-const results = document.getElementById("results");
-const actions = document.getElementById("actions");
-
-// Direct file input - no click proxy needed
 const fileInput = document.getElementById("fileInput");
 const identifyBtn = document.getElementById("identifyBtn");
-const fileNameDiv = document.getElementById("fileName");
 const results = document.getElementById("results");
-const actions = document.getElementById("actions");
+const uploadZone = document.getElementById("uploadZone");
 
 fileInput.addEventListener("change", function() {
   if (this.files && this.files[0]) {
-    fileNameDiv.textContent = "Selected: " + this.files[0].name;
-    identifyBtn.style.display = "inline-block";
-    identifyBtn.onclick = () => handleFile(this.files[0]);
+    identifyBtn.disabled = false;
+    identifyBtn.textContent = "Identify: " + this.files[0].name;
+  } else {
+    identifyBtn.disabled = true;
+    identifyBtn.textContent = "Identify Photo";
   }
 });
 
-async function handleFile(file) {
-  if (!file.type.startsWith("image/")) return alert("Please upload an image.");
+identifyBtn.addEventListener("click", function() {
+  if (!fileInput.files || !fileInput.files[0]) return;
+  handleFile(fileInput.files[0]);
+});
 
-  dropZone.style.display = "none";
-  actions.style.display = "block";
+async function handleFile(file) {
+  uploadZone.style.display = "none";
   results.innerHTML = "";
 
   const card = document.createElement("div");
   card.className = "result-card";
   card.innerHTML = `
-    <img class="upload-preview" alt="Uploaded photo">
+    <img class="preview" alt="Photo" style="width:100%; max-height:280px; object-fit:cover;">
     <div class="result-body">
-      <h3 class="identifying">Identifying…</h3>
+      <h3>Identifying…</h3>
       <div class="sci"></div>
       <div class="confidence"></div>
       <div class="error"></div>
@@ -118,7 +93,7 @@ async function handleFile(file) {
   results.appendChild(card);
 
   const reader = new FileReader();
-  reader.onload = (e) => card.querySelector(".upload-preview").src = e.target.result;
+  reader.onload = (e) => card.querySelector(".preview").src = e.target.result;
   reader.readAsDataURL(file);
 
   const formData = new FormData();
@@ -126,22 +101,16 @@ async function handleFile(file) {
 
   try {
     const resp = await fetch("/identify", { method: "POST", body: formData });
-    if (!resp.ok) {
-      const errText = await resp.text();
-      throw new Error("Server error " + resp.status + ": " + errText.slice(0, 200));
-    }
     const data = await resp.json();
 
     if (data.error) {
-      card.querySelector("h3").textContent = "Identification failed";
-      card.querySelector("h3").classList.remove("identifying");
+      card.querySelector("h3").textContent = "Error";
       card.querySelector(".error").textContent = data.error;
       return;
     }
 
-    const text = data.result_text || "No response from model";
-    // Parse the structured response for cleaner display
-    const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+    const text = data.result_text || "No response";
+    const lines = text.split("\\n").map(l => l.trim()).filter(Boolean);
     let common = "", scientific = "", group = "", confidence = "", notes = "";
     lines.forEach(line => {
       const lower = line.toLowerCase();
@@ -153,60 +122,31 @@ async function handleFile(file) {
     });
 
     card.querySelector("h3").textContent = common || "Result";
-    card.querySelector("h3").classList.remove("identifying");
-    card.querySelector(".sci").textContent = scientific || "";
+    card.querySelector(".sci").textContent = scientific;
     if (group) {
       const g = document.createElement("div");
-      g.style.opacity = "0.85";
       g.style.margin = "0.3rem 0";
       g.textContent = "Group: " + group;
-      card.querySelector(".result-body").insertBefore(g, card.querySelector(".confidence"));
+      card.querySelector(".result-body").appendChild(g);
     }
-    if (confidence) {
-      card.querySelector(".confidence").textContent = confidence + " confidence";
-    }
+    if (confidence) card.querySelector(".confidence").textContent = confidence + " confidence";
     if (notes) {
       const n = document.createElement("div");
-      n.style.marginTop = "0.6rem";
-      n.style.fontSize = "0.95rem";
+      n.style.marginTop = "0.5rem";
       n.textContent = notes;
       card.querySelector(".result-body").appendChild(n);
     }
-    // Fallback if parsing failed
-    if (!common && !scientific) {
-      card.querySelector("h3").textContent = "Result";
-      card.querySelector(".sci").textContent = text;
-    }
+    if (!common && !scientific) card.querySelector(".sci").textContent = text;
+
   } catch (err) {
     card.querySelector("h3").textContent = "Error";
-    card.querySelector("h3").classList.remove("identifying");
-    card.querySelector(".error").textContent = err.message || "Could not reach the server.";
-    const retryBtn = document.createElement("button");
-    retryBtn.textContent = "Retry";
-    retryBtn.style.marginTop = "0.75rem";
-    retryBtn.onclick = () => handleFile(file);
-    card.querySelector(".result-body").appendChild(retryBtn);
+    card.querySelector(".error").textContent = err.message || "Something went wrong";
   }
-}
-
-function reset() {
-  results.innerHTML = "";
-  actions.style.display = "none";
-  dropZone.style.display = "block";
-  fileInput.value = "";
 }
 </script>
 </body>
 </html>
 """
-
-def get_access_token():
-    # no longer needed
-    pass
-
-def get_checksum(data: bytes) -> str:
-    # no longer needed
-    pass
 
 @app.route("/")
 def index():
@@ -223,31 +163,29 @@ def identify():
 
     xai_key = os.environ.get("XAI_API_KEY")
     if not xai_key:
-        return jsonify({"error": "XAI_API_KEY not set on the server"}), 500
+        return jsonify({"error": "XAI_API_KEY not set"}), 500
 
-    # Encode image as base64 data URL
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:{content_type};base64,{b64}"
 
     prompt = (
         "This underwater photo was taken in the Sea of Cortez near La Paz, Mexico. "
         "Carefully identify the main marine animal by examining its overall body plan. "
-        "Key distinctions:\n"
-        "- Starfish (sea stars): central disc with distinct arms/rays (often flattened or tapering), pentaradial symmetry. Small spines may be present but arms are the main feature. Do not call it a sea urchin if you see arms.\n"
-        "- Sea urchins: globular or hemispherical rigid body covered in long movable spines, no distinct arms.\n"
-        "- Fish: bilateral symmetry, fins, clear head and tail, scales or smooth skin.\n"
-        "- Rays/skates: flattened body, pectoral fins form wings, eyes on top.\n"
-        "- Eels/morays: elongated body, continuous fin, no distinct tail fin.\n"
-        "- Crustaceans: segmented body, jointed legs, hard shell, antennae.\n"
-        "- Mollusks/nudibranchs/octopus: soft body; may have a shell or be shell-less. Octopus has 8 arms; nudibranchs are often brightly colored with external gills.\n"
-        "Also note color patterns, bars, body depth, and whether the body is rigid or flexible. "
-        "Reply in this exact format:\n"
-        "Common name: <name>\n"
-        "Scientific name: <name>\n"
-        "Group: <group or family>\n"
-        "Confidence: <low/medium/high>\n"
-        "Notes: <one interesting or cool fact about this species>\n"
-        "If unsure, list the closest alternatives."
+        "Key distinctions:\\n"
+        "- Starfish (sea stars): central disc with distinct arms/rays. Do not call it a sea urchin if you see arms.\\n"
+        "- Sea urchins: globular body with long spines, no arms.\\n"
+        "- Fish: bilateral symmetry, fins, clear head and tail.\\n"
+        "- Rays: flattened body, wing-like pectoral fins.\\n"
+        "- Eels: elongated body, continuous fin.\\n"
+        "- Crustaceans: segmented body, jointed legs, hard shell.\\n"
+        "- Mollusks/octopus/nudibranchs: soft body, may be shell-less.\\n"
+        "Reply in this exact format:\\n"
+        "Common name: <name>\\n"
+        "Scientific name: <name>\\n"
+        "Group: <group>\\n"
+        "Confidence: <low/medium/high>\\n"
+        "Notes: <one cool fact about this species>\\n"
+        "If unsure, list alternatives."
     )
 
     payload = {
@@ -266,17 +204,13 @@ def identify():
     try:
         resp = requests.post(
             "https://api.x.ai/v1/responses",
-            headers={
-                "Authorization": f"Bearer {xai_key}",
-                "Content-Type": "application/json"
-            },
+            headers={"Authorization": f"Bearer {xai_key}", "Content-Type": "application/json"},
             json=payload,
             timeout=60
         )
         resp.raise_for_status()
         data = resp.json()
 
-        # Extract the text response
         text = ""
         if "output" in data and data["output"]:
             for item in data["output"]:
@@ -287,14 +221,10 @@ def identify():
         if not text and "choices" in data:
             text = data["choices"][0].get("message", {}).get("content", "")
 
-        return jsonify({"result_text": text or "No response from model"})
-
+        return jsonify({"result_text": text or "No response"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"\nFinFindr is running on port {port}")
-    print(f"Local:  http://localhost:{port}")
-    print("Press Ctrl+C to stop.\n")
     app.run(host="0.0.0.0", port=port, debug=False)
