@@ -65,6 +65,7 @@ HTML = """
   <h2>Choose a photo</h2>
   <p>Use the button below</p>
   <input type="file" id="fileInput" accept="image/*" style="display:block; margin:1rem auto; font-size:1.1rem;">
+  <button type="button" id="goBtn" style="margin-top:0.5rem; display:none;">Identify this photo</button>
 </div>
 
 <div id="results"></div>
@@ -83,7 +84,13 @@ const actions = document.getElementById("actions");
 
 // Direct file input - no click proxy needed
 fileInput.addEventListener("change", () => {
-  if (fileInput.files.length) handleFile(fileInput.files[0]);
+  const goBtn = document.getElementById("goBtn");
+  if (fileInput.files.length) {
+    goBtn.style.display = "inline-block";
+    goBtn.onclick = () => handleFile(fileInput.files[0]);
+    // Also try to start automatically
+    handleFile(fileInput.files[0]);
+  }
 });
 
 async function handleFile(file) {
