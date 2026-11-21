@@ -83,13 +83,17 @@ const results = document.getElementById("results");
 const actions = document.getElementById("actions");
 
 // Direct file input - no click proxy needed
-fileInput.addEventListener("change", () => {
-  const goBtn = document.getElementById("goBtn");
-  if (fileInput.files.length) {
-    goBtn.style.display = "inline-block";
-    goBtn.onclick = () => handleFile(fileInput.files[0]);
-    // Also try to start automatically
-    handleFile(fileInput.files[0]);
+const fileInput = document.getElementById("fileInput");
+const identifyBtn = document.getElementById("identifyBtn");
+const fileNameDiv = document.getElementById("fileName");
+const results = document.getElementById("results");
+const actions = document.getElementById("actions");
+
+fileInput.addEventListener("change", function() {
+  if (this.files && this.files[0]) {
+    fileNameDiv.textContent = "Selected: " + this.files[0].name;
+    identifyBtn.style.display = "inline-block";
+    identifyBtn.onclick = () => handleFile(this.files[0]);
   }
 });
 
