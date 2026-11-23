@@ -4,6 +4,7 @@ import io
 import json
 import os
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -126,6 +127,8 @@ class IdentifyTests(unittest.TestCase):
     def setUp(self):
         os.environ["XAI_API_KEY"] = "test-key"
         os.environ.pop("SPECIES_LIST_MODE", None)
+        os.environ.pop("XAI_MODEL", None)
+        os.environ.pop("MAX_IMAGE_PX", None)
         finfindr_server._SPECIES_CACHE.clear()
         finfindr_server._SPECIES_INFLIGHT.clear()
         finfindr_server._inat_cache.clear()
@@ -133,8 +136,8 @@ class IdentifyTests(unittest.TestCase):
         self.captured = {}
         self.species_calls = []
         self._calls_lock = threading.Lock()
-        self.get_patch = patch("finfindr_server.requests.get", side_effect=self.fake_get)
-        self.post_patch = patch("finfindr_server.requests.post", side_effect=self.fake_post)
+        self.get_patch = patch("finfindr_server.http.get", side_effect=self.fake_get)
+        self.post_patch = patch("finfindr_server.http.post", side_effect=self.fake_post)
         self.get_patch.start()
         self.post_patch.start()
 
@@ -192,6 +195,7 @@ class IdentifyTests(unittest.TestCase):
         self.assertIn('id="speciesListOptions"', page)
         self.assertIn('class="test-options" hidden', page)
         self.assertIn('params.get("debug") === "1"', page)
+        self.assertIn('id="modelInput"', page)
 
     def test_missing_and_invalid_photos_stay_json(self):
         missing = self.client.post("/identify", data={})
@@ -229,7 +233,9 @@ class IdentifyTests(unittest.TestCase):
         self.assertIn("thick inflated body", prompt)
         self.assertIn("hint, not a menu", prompt)
         self.assertEqual(self.captured["json"]["temperature"], 0)
-        self.assertEqual(self.captured["json"]["model"], "grok-4")
+        self.assertEqual(self.captured["json"]["model"], "grok-4.7")
+        self.assertEqual(body["meta"]["model"], "grok-4.7")
+        self.assertEqual(body["meta"]["image_px"], "80x60")
         self.assertEqual(body["region_label"], "Sea of Cortez / La Paz")
         self.assertIn("Cortez Rainbow Wrasse", body["result_text"])
         self.assertNotIn("Wrong", body["result_text"])
@@ -335,7 +341,7 @@ class IdentifyTests(unittest.TestCase):
 
     def test_inaturalist_failure_falls_back_without_blocking_identification(self):
         self.get_patch.stop()
-        with patch("finfindr_server.requests.get", side_effect=requests.ConnectionError("down")):
+        with patch("finfindr_server.http.get", side_effect=requests.ConnectionError("down")):
             cortez = self.post_photo(region="sea-of-cortez")
             cortez_prompt = self.prompt()
             caribbean = self.post_photo(region="caribbean")
@@ -370,7 +376,7 @@ class IdentifyTests(unittest.TestCase):
             )
 
         self.post_patch.stop()
-        with patch("finfindr_server.requests.post", side_effect=post_without_usage):
+        with patch("finfindr_server.http.post", side_effect=post_without_usage):
             response = self.post_photo(region="red-sea")
         self.post_patch.start()
         meta = response.get_json()["meta"]
@@ -436,6 +442,114 @@ class IdentifyTests(unittest.TestCase):
         self.assertIn("Hydrophis platurus", prompt)
         self.assertIn("Cirrhitus rivulatus", prompt)
         self.assertTrue(any(call.get("place_id") == 122897 for call in self.species_calls))
+
+    def test_model_and_image_size_are_configurable(self):
+        wide = jpeg_bytes(2000, 1000)
+        response = self.client.post(
+            "/identify",
+            data={"image": (io.BytesIO(wide), "wide.jpg")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.get_json()["meta"]["image_px"], "1536x768")
+        self.assertEqual(self.captured["json"]["model"], "grok-4.7")
+
+        os.environ["MAX_IMAGE_PX"] = "800"
+        os.environ["XAI_MODEL"] = "grok-4.5"
+        try:
+            ignored = self.post_photo(model="grok-4.3")
+            self.assertEqual(self.captured["json"]["model"], "grok-4.5")
+            self.assertEqual(ignored.get_json()["meta"]["model"], "grok-4.5")
+            chosen = self.post_photo(model="grok-4.3", debug="1")
+            self.assertEqual(self.captured["json"]["model"], "grok-4.3")
+            self.assertEqual(chosen.get_json()["meta"]["model"], "grok-4.3")
+            rejected = self.post_photo(model="not a model", debug="1")
+            self.assertEqual(self.captured["json"]["model"], "grok-4.5")
+            sized = self.client.post(
+                "/identify",
+                data={"image": (io.BytesIO(wide), "wide.jpg")},
+                content_type="multipart/form-data",
+            )
+            self.assertEqual(sized.get_json()["meta"]["image_px"], "800x400")
+        finally:
+            os.environ.pop("MAX_IMAGE_PX", None)
+            os.environ.pop("XAI_MODEL", None)
+
+        os.environ["XAI_MODEL"] = "bad model"
+        try:
+            fallback = self.post_photo()
+            self.assertEqual(fallback.get_json()["meta"]["model"], "grok-4.7")
+        finally:
+            os.environ.pop("XAI_MODEL", None)
+
+    def test_common_names_fetch_together_and_cache(self):
+        calls = []
+
+        def slow_get(url, params=None, **kwargs):
+            calls.append(params["q"])
+            time.sleep(0.25)
+            name = params["q"]
+            epithet = name.split()[-1]
+            return FakeResponse({
+                "results": [{
+                    "name": name,
+                    "rank": "species",
+                    "preferred_common_name": "Common " + epithet,
+                }]
+            })
+
+        self.get_patch.stop()
+        finfindr_server._inat_cache.clear()
+        try:
+            with patch("finfindr_server.http.get", side_effect=slow_get):
+                started = time.perf_counter()
+                found = finfindr_server.resolve_common_names([
+                    "Thalassoma lucasanum",
+                    "Zanclus imaginatus",
+                    "Abudefduf fictus",
+                ])
+                elapsed = time.perf_counter() - started
+        finally:
+            self.get_patch.start()
+        self.assertLess(elapsed, 0.45)
+        self.assertEqual(found["Thalassoma lucasanum"], "Cortez Rainbow Wrasse")
+        self.assertEqual(found["Zanclus imaginatus"], "Common imaginatus")
+        self.assertEqual(found["Abudefduf fictus"], "Common fictus")
+        self.assertNotIn("Thalassoma lucasanum", calls)
+        listed = finfindr_server.resolve_common_names(
+            ["Fishus alpha"],
+            species=[{"scientific": "Fishus alpha", "common": "Alpha Fish"}],
+        )
+        self.assertEqual(listed["Fishus alpha"], "Alpha Fish")
+        started = time.perf_counter()
+        cached = finfindr_server.resolve_common_names(["Zanclus imaginatus"])
+        self.assertLess(time.perf_counter() - started, 0.1)
+        self.assertEqual(cached["Zanclus imaginatus"], "Common imaginatus")
+
+    def test_prefetch_warms_short_lists_and_survives_errors(self):
+        finfindr_server._SPECIES_CACHE.clear()
+        finfindr_server._prefetch_species_lists()
+        warmed = finfindr_server._species_cache_get(("short", "place:122897"))
+        self.assertTrue(warmed and warmed.get("species"))
+        self.assertIsNone(finfindr_server._species_cache_get(("full", "place:122897")))
+
+        self.get_patch.stop()
+        try:
+            with patch("finfindr_server.http.get", side_effect=requests.ConnectionError("down")):
+                finfindr_server._prefetch_species_lists()
+        finally:
+            self.get_patch.start()
+
+    def test_prefetch_starts_once_per_process(self):
+        os.environ["FINFINDR_PREFETCH"] = "1"
+        finfindr_server._prefetch_pid = None
+        try:
+            with patch("finfindr_server.threading.Thread") as thread_cls:
+                self.assertTrue(finfindr_server._start_species_prefetch())
+                self.assertFalse(finfindr_server._start_species_prefetch())
+                self.assertEqual(thread_cls.call_count, 1)
+        finally:
+            os.environ["FINFINDR_PREFETCH"] = "0"
+            finfindr_server._prefetch_pid = None
 
     def test_missing_api_key_is_json(self):
         os.environ.pop("XAI_API_KEY", None)
