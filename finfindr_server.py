@@ -4,7 +4,9 @@ FinFindr – Marine species identification
 """
 
 import base64
+import contextvars
 import fcntl
+import json
 import logging
 import math
 import os
@@ -16,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 
 import requests
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, g, jsonify, render_template_string, request
 from requests.adapters import HTTPAdapter
 from PIL import Image, ImageOps
 from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
@@ -196,6 +198,7 @@ const excludeObservation = document.getElementById("excludeObservation");
 const locationStatus = document.getElementById("locationStatus");
 const MIN_DIMENSION = 32;
 const MAX_BYTES = 20 * 1024 * 1024;
+const NOT_MARINE_MESSAGE = "FinFindr focuses on marine animal identification only. Please upload a photo of a marine animal.";
 const REGION_KEY = "finfindr.region";
 const LOCATION_KEY = "finfindr.location";
 const LIST_KEY = "finfindr.speciesList";
@@ -321,7 +324,7 @@ function safeHttpUrl(url) {
   }
 }
 
-function showCandidates(card, candidates) {
+function showCandidates(card, candidates, allowHigh) {
   const list = document.createElement("div");
   list.className = "candidates";
   candidates.slice(0, 3).forEach(function (item) {
@@ -356,6 +359,11 @@ function showCandidates(card, candidates) {
       const conf = document.createElement("div");
       conf.className = "confidence";
       conf.textContent = item.confidence + " confidence";
+      cap.appendChild(conf);
+    } else if (allowHigh && item.confidence === "high") {
+      const conf = document.createElement("div");
+      conf.className = "confidence";
+      conf.textContent = "high confidence";
       cap.appendChild(conf);
     }
     if (item.trait) {
@@ -502,6 +510,18 @@ function appendNearestRecord(box, discovery) {
   const source = discovery.nearest_known_record_source || "iNaturalist";
   line.textContent = "Nearest known record: " + discovery.nearest_known_record_km + " km (" + source + ")";
   box.appendChild(line);
+}
+
+function showNotMarine(card) {
+  card.querySelector("h3").textContent = "Marine animals only";
+  const sciWrap = card.querySelector(".scientific");
+  if (sciWrap) sciWrap.hidden = true;
+  const conf = card.querySelector(".confidence");
+  if (conf) conf.textContent = "";
+  const note = document.createElement("p");
+  note.className = "not-marine";
+  note.textContent = NOT_MARINE_MESSAGE;
+  card.querySelector(".result-body").appendChild(note);
 }
 
 function showPhotoRejection(card, data) {
@@ -787,6 +807,11 @@ async function handleFile(file) {
     const spinner = card.querySelector(".spinner");
     if (spinner) spinner.remove();
 
+    if (data.reason === "not_marine") {
+      showNotMarine(card);
+      addRetry(card);
+      return;
+    }
     if (data.photo_quality === "poor" || data.photo_quality === "invalid") {
       showPhotoRejection(card, data);
       addRetry(card);
@@ -794,6 +819,27 @@ async function handleFile(file) {
     }
     if (data.discovery && (data.discovery.type === "possible_range_extension" || data.discovery.type === "no_match")) {
       showDiscovery(card, data);
+      addRetry(card);
+      return;
+    }
+    if (data.certainty !== "confident") {
+      if (data.candidates && data.candidates.length) {
+        card.querySelector("h3").textContent = data.certainty === "unsure" ? "Not sure yet" : "Likely — check these";
+        card.querySelector("h3").classList.add("unsure-title");
+        const sciWrapEarly = card.querySelector(".scientific");
+        if (sciWrapEarly) sciWrapEarly.hidden = true;
+        const confEarly = card.querySelector(".confidence");
+        if (confEarly) confEarly.textContent = "";
+        showCandidates(card, data.candidates, false);
+        if (data.notable_note) {
+          const note = document.createElement("p");
+          note.className = "quiet-note";
+          note.textContent = data.notable_note;
+          card.querySelector(".result-body").appendChild(note);
+        }
+      } else {
+        showPhotoRejection(card, data);
+      }
       addRetry(card);
       return;
     }
@@ -810,48 +856,32 @@ async function handleFile(file) {
       else if (lower.startsWith("notes:")) notes = line.split(":").slice(1).join(":").trim();
     });
 
-    const uncertain = (data.certainty === "likely" || data.certainty === "unsure")
-      && data.candidates && data.candidates.length;
-    if (uncertain) {
-      card.querySelector("h3").textContent = data.certainty === "unsure" ? "Not sure yet" : "Likely — check these";
-      card.querySelector("h3").classList.add("unsure-title");
-      const sciWrapEarly = card.querySelector(".scientific");
-      if (sciWrapEarly) sciWrapEarly.hidden = true;
-      const conf = card.querySelector(".confidence");
-      if (conf) conf.textContent = "";
-      showCandidates(card, data.candidates);
-      if (data.notable_note) {
-        const note = document.createElement("p");
-        note.className = "quiet-note";
-        note.textContent = data.notable_note;
-        card.querySelector(".result-body").appendChild(note);
-      }
-    } else {
-      card.querySelector("h3").textContent = common || "Result";
-      card.querySelector(".sci").textContent = scientific;
-      if (group) {
-        const g = document.createElement("div");
-        g.style.margin = "0.3rem 0";
-        g.textContent = "Group: " + group;
-        card.querySelector(".result-body").appendChild(g);
-      }
-      if (altGroup && altGroup.toLowerCase() !== "none") {
-        const a = document.createElement("div");
-        a.style.margin = "0.2rem 0";
-        a.style.opacity = "0.75";
-        a.style.fontSize = "0.9rem";
-        a.textContent = "Also considered: " + altGroup;
-        card.querySelector(".result-body").appendChild(a);
-      }
-      if (confidence) card.querySelector(".confidence").textContent = confidence + " confidence";
-      if (notes) {
-        const n = document.createElement("div");
-        n.style.marginTop = "0.5rem";
-        n.textContent = notes;
-        card.querySelector(".result-body").appendChild(n);
-      }
-      if (!common && !scientific) card.querySelector(".sci").textContent = text;
+    card.querySelector("h3").textContent = common || "Result";
+    card.querySelector(".sci").textContent = scientific;
+    if (group) {
+      const g = document.createElement("div");
+      g.style.margin = "0.3rem 0";
+      g.textContent = "Group: " + group;
+      card.querySelector(".result-body").appendChild(g);
     }
+    if (altGroup && altGroup.toLowerCase() !== "none") {
+      const a = document.createElement("div");
+      a.style.margin = "0.2rem 0";
+      a.style.opacity = "0.75";
+      a.style.fontSize = "0.9rem";
+      a.textContent = "Also considered: " + altGroup;
+      card.querySelector(".result-body").appendChild(a);
+    }
+    if (confidence && confidence.toLowerCase() === "high") {
+      card.querySelector(".confidence").textContent = "high confidence";
+    }
+    if (notes) {
+      const n = document.createElement("div");
+      n.style.marginTop = "0.5rem";
+      n.textContent = notes;
+      card.querySelector(".result-body").appendChild(n);
+    }
+    if (!common && !scientific) card.querySelector(".sci").textContent = text;
 
     const sciWrap = card.querySelector(".scientific");
     const sciLabel = card.querySelector(".sci-label");
@@ -1249,7 +1279,7 @@ def resolve_common_names(scientific_names, species=None):
         return found
     workers = min(8, len(pending))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_fetch_inat_common_name_uncached, name) for name in pending]
+        futures = [_submit(pool, _fetch_inat_common_name_uncached, name) for name in pending]
         for name, future in zip(pending, futures):
             try:
                 found[name] = future.result()
@@ -1434,7 +1464,88 @@ LOCATION_RADIUS_KM = 100
 # higher-priced band that starts at 128k tokens.
 MAX_PROMPT_TEXT_TOKENS = 100000
 XAI_TEMPERATURE = 0
+XAI_SEED = 0
+NOT_MARINE_MESSAGE = (
+    "FinFindr focuses on marine animal identification only. "
+    "Please upload a photo of a marine animal."
+)
+# FINFINDR_SCOPE=marine is the default. The names below are the one list a
+# marine identification may name. FINFINDR_SCOPE=all turns the gate off.
+# Any other value is a comma-separated ancestry list that replaces this one,
+# so the scope can widen later without touching the identification pipeline.
+MARINE_SCOPE_ANCESTORS = frozenset({
+    "actinopterygii",
+    "chondrichthyes",
+    "elasmobranchii",
+    "holocephali",
+    "myxini",
+    "petromyzontida",
+    "mollusca",
+    "echinodermata",
+    "cnidaria",
+    "porifera",
+    "ctenophora",
+    "crustacea",
+    "cetacea",
+    "odontoceti",
+    "mysticeti",
+    "sirenia",
+    "pinnipedia",
+    "otariidae",
+    "phocidae",
+    "odobenidae",
+    "enhydra",
+    "cheloniidae",
+    "dermochelyidae",
+    "hydrophiinae",
+    "laticaudinae",
+    "hydrophiidae",
+    "hydrophis",
+    "laticauda",
+    "aipysurus",
+    "emydocephalus",
+    "pelamis",
+    "spheniscidae",
+    "diomedeidae",
+    "procellariidae",
+    "hydrobatidae",
+    "pelecanidae",
+    "sulidae",
+    "fregatidae",
+    "phaethontidae",
+    "alcidae",
+    "laridae",
+    "stercorariidae",
+    "phalacrocoracidae",
+})
+# Groups that sit inside an otherwise marine phylum but are not marine.
+TERRESTRIAL_SCOPE_EXCEPTIONS = frozenset({
+    "stylommatophora",
+    "helicidae",
+    "coenobitidae",
+    "gecarcinidae",
+})
+LAND_ICONIC_TAXA = frozenset({
+    "mammalia",
+    "aves",
+    "insecta",
+    "arachnida",
+    "amphibia",
+    "reptilia",
+    "plantae",
+    "fungi",
+})
+# Traits the photo description is compared with. A color, shape, or pattern
+# that cannot belong to the species blocks a confident identification.
+SPECIES_TRAITS = {
+    "mithrodia bradleyi": "tan or brown mottled cylindrical arms with a fine irregular network, not a red tile lattice",
+    "phataria unifascialis": "small disc and long slender cylindrical arms colored tan, orange, or blue, not a red lattice and not a thick knobby cushion",
+    "fromia monilis": "red or orange arms covered by a cream lattice of raised plates",
+    "pentaceraster cumingi": "thick inflated body with short broad arms and large conical knobs",
+    "nidorellia armata": "pale thick body with very short arms and dark brown spines",
+}
 NL = chr(10)
+_REQUEST_STATS = contextvars.ContextVar("finfindr_request_stats", default=None)
 _SPECIES_LOCK = threading.Lock()
 _SPECIES_CACHE = {}
 _SPECIES_WAIT_RESULT = {}
@@ -1673,19 +1784,20 @@ def _parse_coord(value, limit):
     return number
 
 
-def _form_coordinates():
-    lat = _parse_coord(request.form.get("lat"), 90)
-    lng = _parse_coord(request.form.get("lng"), 180)
+def _form_coordinates(fields=None):
+    source = request.form if fields is None else fields
+    lat = _parse_coord(source.get("lat"), 90)
+    lng = _parse_coord(source.get("lng"), 180)
     if lat is None or lng is None:
         return None, None
     return lat, lng
 
 
-def _choose_coordinates(image_bytes):
+def _choose_coordinates(image_bytes, fields=None):
     exif_lat, exif_lng = extract_gps(image_bytes)
     if exif_lat is not None and exif_lng is not None:
         return exif_lat, exif_lng, "exif"
-    form_lat, form_lng = _form_coordinates()
+    form_lat, form_lng = _form_coordinates(fields)
     if form_lat is not None and form_lng is not None:
         return form_lat, form_lng, "browser"
     return None, None, None
@@ -1782,22 +1894,135 @@ def prompt_for_species(locality, species, lookalikes, lat, lng):
     return assemble_prompt(locality, trimmed, lookalikes, lat, lng), len(trimmed), True
 
 
-def _species_cache_get(key):
-    now = time.monotonic()
+def cache_dir():
+    return os.environ.get("FINFINDR_CACHE_DIR", "/tmp/finfindr-cache")
+
+
+def _cache_key_text(key):
+    if isinstance(key, str):
+        return key
+    try:
+        return json.dumps(key, sort_keys=True, default=str)
+    except TypeError:
+        return str(key)
+
+
+def _disk_cache_path(name):
+    directory = cache_dir()
+    os.makedirs(directory, exist_ok=True)
+    return os.path.join(directory, name + ".json")
+
+
+def _disk_lock(path):
+    lock_path = path + ".lock"
+    handle = open(lock_path, "a")
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    return handle
+
+
+def _disk_read(name):
+    path = _disk_cache_path(name)
+    if not os.path.isfile(path):
+        return {}
+    lock = _disk_lock(path)
+    try:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            return {}
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+    if not isinstance(data, dict):
+        return {}
+    now = time.time()
+    fresh = {}
+    for key, item in data.items():
+        if isinstance(item, dict) and float(item.get("expires") or 0) > now and "value" in item:
+            fresh[key] = item
+    return fresh
+
+
+def _disk_write(name, data):
+    path = _disk_cache_path(name)
+    lock = _disk_lock(path)
+    try:
+        temporary = path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        os.replace(temporary, path)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+
+def _disk_cache_get(name, key):
+    item = _disk_read(name).get(_cache_key_text(key))
+    if not item:
+        return None
+    return item.get("value")
+
+
+def _disk_cache_put(name, key, value, ttl):
+    try:
+        json.dumps(value)
+    except TypeError:
+        return
+    path_name = name
+    data = _disk_read(path_name)
+    data[_cache_key_text(key)] = {"expires": time.time() + max(1.0, float(ttl)), "value": value}
+    if len(data) > 512:
+        ordered = sorted(data, key=lambda item: data[item].get("expires") or 0)
+        for old in ordered[: len(data) - 512]:
+            data.pop(old, None)
+    try:
+        _disk_write(path_name, data)
+    except OSError:
+        app.logger.warning("could not persist %s cache", name, exc_info=True)
+
+
+def clear_persisted_caches():
+    """Drop in-memory and on-disk species and taxon caches. Tests use this."""
     with _SPECIES_LOCK:
-        hit = _SPECIES_CACHE.get(key)
-        if not hit or hit[0] <= now:
-            _SPECIES_CACHE.pop(key, None)
-            return None
-        return hit[1]
+        _SPECIES_CACHE.clear()
+    with _INAT_JSON_LOCK:
+        _INAT_JSON_CACHE.clear()
+    directory = cache_dir()
+    try:
+        for name in ("species", "taxa"):
+            path = os.path.join(directory, name + ".json")
+            if os.path.isfile(path):
+                os.remove(path)
+    except OSError:
+        app.logger.warning("could not clear the disk cache", exc_info=True)
 
 
-def _species_cache_put(key, payload, ttl):
+def _species_memory_put(key, payload, ttl):
     with _SPECIES_LOCK:
         if len(_SPECIES_CACHE) >= 64 and key not in _SPECIES_CACHE:
             oldest = min(_SPECIES_CACHE, key=lambda item: _SPECIES_CACHE[item][0])
             _SPECIES_CACHE.pop(oldest, None)
         _SPECIES_CACHE[key] = (time.monotonic() + ttl, payload)
+
+
+def _species_cache_get(key):
+    now = time.monotonic()
+    with _SPECIES_LOCK:
+        hit = _SPECIES_CACHE.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+        _SPECIES_CACHE.pop(key, None)
+    persisted = _disk_cache_get("species", key)
+    if persisted is None:
+        return None
+    _species_memory_put(key, persisted, 60)
+    return persisted
+
+
+def _species_cache_put(key, payload, ttl):
+    _species_memory_put(key, payload, ttl)
+    _disk_cache_put("species", key, payload, ttl)
 
 
 def _empty_species():
@@ -1898,23 +2123,50 @@ def _inat_cache_key(url, params):
     return (url, items)
 
 
+def _inat_memory_put(key, payload, ttl):
+    with _INAT_JSON_LOCK:
+        if len(_INAT_JSON_CACHE) > 512 and key not in _INAT_JSON_CACHE:
+            _INAT_JSON_CACHE.clear()
+        _INAT_JSON_CACHE[key] = (time.monotonic() + ttl, payload)
+
+
+def _persist_taxon_response(url):
+    return "/taxa" in (url or "")
+
+
 def _inat_cache_get(url, params):
     key = _inat_cache_key(url, params)
     now = time.monotonic()
     with _INAT_JSON_LOCK:
         hit = _INAT_JSON_CACHE.get(key)
-        if not hit or hit[0] <= now:
-            _INAT_JSON_CACHE.pop(key, None)
-            return None
-        return hit[1]
+        if hit and hit[0] > now:
+            return hit[1]
+        _INAT_JSON_CACHE.pop(key, None)
+    if not _persist_taxon_response(url):
+        return None
+    persisted = _disk_cache_get("taxa", key)
+    if persisted is None:
+        return None
+    _inat_memory_put(key, persisted, 60)
+    return persisted
+
+
+def _taxon_payload_worth_keeping(payload):
+    if isinstance(payload, dict):
+        results = payload.get("results")
+        if isinstance(results, list):
+            return bool(results)
+        return bool(payload.get("name") or payload.get("ancestors") or payload.get("iconic_taxon_name"))
+    if isinstance(payload, list):
+        return bool(payload)
+    return False
 
 
 def _inat_cache_put(url, params, payload):
     key = _inat_cache_key(url, params)
-    with _INAT_JSON_LOCK:
-        if len(_INAT_JSON_CACHE) > 512:
-            _INAT_JSON_CACHE.clear()
-        _INAT_JSON_CACHE[key] = (time.monotonic() + INAT_CACHE_TTL, payload)
+    _inat_memory_put(key, payload, INAT_CACHE_TTL)
+    if _persist_taxon_response(url) and _taxon_payload_worth_keeping(payload):
+        _disk_cache_put("taxa", key, payload, INAT_CACHE_TTL)
 
 
 def _retry_after_seconds(response, attempt):
@@ -1947,6 +2199,48 @@ def call_time_left():
     return deadline - time.monotonic()
 
 
+def begin_request_stats():
+    stats = {"external_calls": 0, "inat_throttled": 0, "lock": threading.Lock()}
+    _REQUEST_STATS.set(stats)
+    return stats
+
+
+def _bump_stat(name):
+    stats = _REQUEST_STATS.get()
+    if not stats:
+        return
+    with stats["lock"]:
+        stats[name] = int(stats.get(name) or 0) + 1
+
+
+def request_stat(name):
+    stats = _REQUEST_STATS.get()
+    if not stats:
+        return 0
+    with stats["lock"]:
+        return int(stats.get(name) or 0)
+
+
+def _run_in_worker(fn, *args):
+    """Run fn in the current context so request counters survive a worker thread."""
+    ctx = contextvars.copy_context()
+
+    def run(fn=fn, args=args, ctx=ctx):
+        return ctx.run(fn, *args)
+
+    return run
+
+
+def _start_thread(target, name):
+    worker = threading.Thread(target=_run_in_worker(target), name=name, daemon=True)
+    worker.start()
+    return worker
+
+
+def _submit(pool, fn, *args):
+    return pool.submit(_run_in_worker(fn, *args))
+
+
 def _cap_timeout(timeout):
     """Fit a requests timeout inside the request's hard budget."""
     left = call_time_left()
@@ -1974,8 +2268,7 @@ def _http_get_bounded(url, params, headers, timeout):
         except Exception as exc:
             holder["error"] = exc
 
-    worker = threading.Thread(target=run, name="finfindr-http", daemon=True)
-    worker.start()
+    worker = _start_thread(run, "finfindr-http")
     worker.join(read_cap + 0.5)
     if worker.is_alive():
         app.logger.warning("outbound wall-clock timeout %s", url)
@@ -1995,6 +2288,7 @@ def _inat_get(url, params, timeout, headers):
         if call_time_left() is not None and call_time_left() < 0.4:
             return None
         _inat_wait()
+        _bump_stat("external_calls")
         try:
             resp = _http_get_bounded(url, params, headers, timeout)
         except requests.Timeout as exc:
@@ -2005,6 +2299,8 @@ def _inat_get(url, params, timeout, headers):
             return None
         if resp is None:
             return None
+        if resp.status_code == 429 and "inaturalist.org" in host:
+            _bump_stat("inat_throttled")
         if resp.status_code == 429 and attempt < 3:
             delay = _retry_after_seconds(resp, attempt)
             app.logger.warning("%s 429; retrying in %ss", host, delay)
@@ -2023,7 +2319,7 @@ def _inat_get(url, params, timeout, headers):
         except (requests.RequestException, ValueError) as exc:
             app.logger.warning("%s request failed: %s", host, exc)
             return None
-        if isinstance(payload, dict):
+        if isinstance(payload, (dict, list)):
             _inat_cache_put(url, params, payload)
             return payload
         return None
@@ -2129,7 +2425,7 @@ def _fetch_short_species_list(query, deadline):
             break
         still_pending = []
         with ThreadPoolExecutor(max_workers=1) as pool:
-            futures = [pool.submit(fetch_taxon, group, taxon_id) for group, taxon_id in pending]
+            futures = [_submit(pool, fetch_taxon, group, taxon_id) for group, taxon_id in pending]
             for (group, taxon_id), future in zip(pending, futures):
                 try:
                     label, rows, total, done = future.result()
@@ -2409,8 +2705,20 @@ def _vision_payload(jpeg_bytes, prompt, model, extra_images=None, extra_detail="
     return {
         "model": model,
         "temperature": XAI_TEMPERATURE,
+        "seed": resolve_seed(),
         "input": [{"role": "user", "content": content}],
     }
+
+
+def resolve_seed():
+    """XAI_SEED overrides 0. The responses API accepts seed for best-effort determinism."""
+    raw = (os.environ.get("XAI_SEED") or "").strip()
+    if not raw:
+        return XAI_SEED
+    try:
+        return int(raw)
+    except ValueError:
+        return XAI_SEED
 
 
 def _extract_text(data):
@@ -2526,6 +2834,7 @@ def _call_vision_model_once(jpeg_bytes, prompt, model, timeout, api_key, extra_i
     """One HTTP attempt. The socket timeout matches the caller's wall-clock budget."""
     started = time.perf_counter()
     payload = _vision_payload(jpeg_bytes, prompt, model, extra_images, extra_detail=extra_detail)
+    _bump_stat("external_calls")
     try:
         resp = http.post(
             "https://api.x.ai/v1/responses",
@@ -2566,8 +2875,7 @@ def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key, extra_images
             jpeg_bytes, prompt, model, timeout, api_key, extra_images, extra_detail
         )
 
-    worker = threading.Thread(target=run, name="finfindr-model", daemon=True)
-    worker.start()
+    worker = _start_thread(run, "finfindr-model")
     worker.join(max(0.2, timeout))
     if worker.is_alive():
         elapsed = int(round((time.perf_counter() - started) * 1000))
@@ -2581,28 +2889,48 @@ def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key, extra_images
 
 
 def plan_model_timeouts(remaining, primary_cap, fallback_cap, verify_reserve, fallback_enabled):
-    """Keep primary + fallback + verification inside the time still left."""
-    slack = 5.0
-    verify_reserve = max(0.0, verify_reserve)
-    fallback_hold = fallback_cap if fallback_enabled else 0.0
-    primary = min(primary_cap, remaining - verify_reserve - fallback_hold - slack)
-    if primary < 12.0 and fallback_enabled:
-        fallback_hold = 0.0
-        primary = min(primary_cap, remaining - verify_reserve - slack)
-    primary = max(0.0, primary)
-    left = remaining - primary
-    fallback_timeout = 0.0
-    if fallback_hold > 0 and left >= fallback_cap + verify_reserve:
-        fallback_timeout = min(fallback_cap, left - verify_reserve - 1.0)
-    return primary, max(0.0, fallback_timeout)
+    """Give the primary model its full cap. Do not reserve a fallback up front.
+
+    verify_reserve is unused on purpose: the reference check is trimmed after
+    the primary call, and a fallback is started only after a real fast failure.
+    fallback_timeout is how long one could run if the primary failed immediately.
+    """
+    del verify_reserve, fallback_enabled
+    slack = 3.0
+    primary = min(float(primary_cap), max(0.0, float(remaining) - slack))
+    spare = max(0.0, float(remaining) - slack)
+    fallback_timeout = min(float(fallback_cap), spare) if spare >= 8.0 else 0.0
+    return max(0.0, primary), max(0.0, fallback_timeout)
+
+
+def should_fallback(result, remaining, fallback_cap):
+    """Fall back only after a connection error, 5xx, or an early timeout.
+
+    A timeout counts only when the fallback can still finish. A short clock is
+    not itself a reason to switch models.
+    """
+    if not isinstance(result, dict) or result.get("ok") or not result.get("retryable"):
+        return False
+    error = str(result.get("error") or "")
+    if remaining < 8.0:
+        return False
+    if error == "connection" or error == "invalid_json" or error.startswith("http_5"):
+        return True
+    if error == "timeout":
+        return remaining >= min(float(fallback_cap), 12.0) + 2.0
+    return False
 
 
 def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, extra_reserve=0, extra_images=None):
-    """Primary model gets most of the budget. Fallback runs only when it still fits.
+    """Primary model gets about XAI_PRIMARY_TIMEOUT (default 80s).
 
-    Wall time stays under FINFINDR_TIME_BUDGET (default 110s) so a 120s worker
-    can still return JSON.
+    grok-4 runs only after a connection error, a 5xx, or a timeout that still
+    leaves room for it. Wall time stays under FINFINDR_TIME_BUDGET (default
+    110s) so a 120s worker can return JSON instead of an HTML 504.
+    extra_reserve is ignored: verification is trimmed later, not held against
+    the primary call.
     """
+    del extra_reserve
     worker_budget = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
     primary_cap = _env_seconds("XAI_PRIMARY_TIMEOUT", 80, 5, 100)
     fallback_cap = _env_seconds("XAI_FALLBACK_TIMEOUT", 25, 5, 60)
@@ -2613,21 +2941,23 @@ def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, ext
         return deadline - time.monotonic()
 
     fallback_model = resolve_fallback_model(model)
-    primary_timeout, fallback_timeout = plan_model_timeouts(
-        remaining(), primary_cap, fallback_cap, max(0.0, extra_reserve), bool(fallback_model)
+    primary_timeout, _fallback_timeout = plan_model_timeouts(
+        remaining(), primary_cap, fallback_cap, 0, bool(fallback_model)
     )
-    primary_timeout = max(1.0, primary_timeout) if remaining() > 2 else max(0.5, remaining() - 0.2)
+    primary_timeout = min(primary_timeout, max(0.5, remaining() - 2.0))
+    primary_timeout = max(0.5, primary_timeout)
     result = _call_vision_model(jpeg_bytes, prompt, model, primary_timeout, api_key, extra_images)
     attempts.append(_attempt_record(model, result["ms"], result["ok"], None if result["ok"] else result.get("error")))
-    if result["ok"] or not result["retryable"]:
+    if result["ok"] or not should_fallback(result, remaining(), fallback_cap) or not fallback_model:
         return result, attempts
 
-    if fallback_model and fallback_timeout >= 5 and remaining() >= fallback_timeout + max(0.0, extra_reserve):
-        result = _call_vision_model(
-            jpeg_bytes, prompt, fallback_model, min(fallback_timeout, remaining() - max(0.0, extra_reserve) - 1.0),
-            api_key, extra_images,
-        )
-        attempts.append(_attempt_record(fallback_model, result["ms"], result["ok"], None if result["ok"] else result.get("error")))
+    fallback_timeout = min(fallback_cap, max(1.0, remaining() - 2.0))
+    if fallback_timeout < 5.0:
+        return result, attempts
+    result = _call_vision_model(
+        jpeg_bytes, prompt, fallback_model, fallback_timeout, api_key, extra_images,
+    )
+    attempts.append(_attempt_record(fallback_model, result["ms"], result["ok"], None if result["ok"] else result.get("error")))
     return result, attempts
 
 
@@ -2763,13 +3093,16 @@ def load_species_for_request(region, lat, lng, mode, exclude_observation_id=None
         query["key"] = f"{query['key']}:not:{exclude_observation_id}"
     left = call_time_left()
     budget = 20.0 if mode == "short" else 30.0
+    reserve = _env_seconds("XAI_PRIMARY_TIMEOUT", 80, 5, 100) + 4.0
     if left is not None:
-        budget = min(budget, max(2.0, left - 75.0))
+        budget = min(budget, max(2.0, left - reserve))
     payload = load_species_list(query, mode, budget)
     if not query or not query.get("radius"):
         return payload
     count = len(payload.get("species") or [])
     if count >= SPARSE_SPECIES_MIN or query["radius"] >= WIDE_RADIUS_KM:
+        return payload
+    if call_time_left() is not None and call_time_left() < reserve:
         return payload
     wider = species_query_for(region, lat, lng, radius=WIDE_RADIUS_KM)
     if exclude_observation_id:
@@ -3054,7 +3387,7 @@ def _attach_reference_photos(candidates, lat, lng, exclude_observation_id, deadl
     if not candidates:
         return candidates
     with ThreadPoolExecutor(max_workers=min(3, len(candidates))) as pool:
-        futures = [pool.submit(one, candidate) for candidate in candidates]
+        futures = [_submit(pool, one, candidate) for candidate in candidates]
         attached = []
         for future, candidate in zip(futures, candidates):
             try:
@@ -3070,8 +3403,10 @@ def _verification_prompt(candidates):
         "The first image is the animal to identify.",
         "Each later image is a research-grade reference photo of one candidate. Compare diagnostic traits you can see. Do not pick a candidate just because it was listed first.",
         "If the photos do not separate the candidates, say you cannot decide.",
-        "If the animal matches none of the reference photos, the decision is NO_MATCH. Do not force the closest name.",
-        "If a clear trait such as the main color disagrees with every reference photo, the decision is NO_MATCH.",
+        "Compare the leading candidate with the runner-up. Choose the leading one only when a visible diagnostic trait supports it over the other.",
+        "If the animal matches none of the reference photos, the decision is NONE_OF_THESE. Do not force the closest name.",
+        "NONE_OF_THESE is a valid answer. It means none of these species.",
+        "If a clear trait such as color, shape, or pattern disagrees with every reference photo, the decision is NONE_OF_THESE.",
         "",
     ]
     for index, candidate in enumerate(candidates, start=1):
@@ -3086,7 +3421,7 @@ def _verification_prompt(candidates):
     lines.extend([
         "",
         "Reply in this exact format:",
-        "Decision: <scientific name of the matching candidate, UNSURE, or NO_MATCH>",
+        "Decision: <scientific name of the matching candidate, UNSURE, or NONE_OF_THESE>",
         "Certainty: <confident / likely / unsure>",
         "Trait: <the visible trait that separates the choice, or what is missing>",
     ])
@@ -3100,9 +3435,9 @@ def _parse_verification(text, candidates):
     trait = _field_value(normalized, "Trait")
     if certainty not in ("confident", "likely", "unsure"):
         certainty = "unsure"
-    normalized_decision = (decision or "").upper().replace(" ", "_")
-    if normalized_decision in ("", "UNSURE", "NO_MATCH"):
-        kind = "NO_MATCH" if normalized_decision == "NO_MATCH" else "UNSURE"
+    normalized_decision = (decision or "").upper().replace(" ", "_").replace("-", "_")
+    if normalized_decision in ("", "UNSURE", "NO_MATCH", "NONE", "NONE_OF_THESE", "NEITHER"):
+        kind = "NO_MATCH" if normalized_decision in ("NO_MATCH", "NONE_OF_THESE", "NONE", "NEITHER") else "UNSURE"
         return {"decision": kind, "certainty": "unsure", "trait": trait, "scientific_name": ""}
     scientific = exact_scientific_name(decision)
     if not scientific:
@@ -3134,6 +3469,35 @@ def candidates_far_apart(candidates):
     return candidates[1].get("confidence") == "low"
 
 
+_DIAGNOSTIC_TRAIT = re.compile(
+    r"\b(?:bars?|barred|stripes?|striped|spots?|spotted|bands?|banded|spines?|"
+    r"arms?|fins?|rays?|tails?|snouts?|discs?|knobs?|lattices?|mesh|tiles?|"
+    r"scales?|tentacles?|shells?|eyes?|dorsal|pectoral|saddle|hump|cirri|"
+    r"prickles?|oval|reticulat\w*|cylindrical|inflated|slender|globular)\b",
+    re.IGNORECASE,
+)
+
+
+def explicit_diagnostic_trait(trait):
+    """A visible feature that separates species. Vague similarity does not count.
+
+    A short phrase such as "5 bars" is explicit. "similar" is not. The old
+    8-character cutoff treated "5 bars" as a failed check and then lowered
+    every candidate, so a correct rank-1 fish came back all-low.
+    """
+    text = (trait or "").strip()
+    lowered = text.lower().strip(" .")
+    if len(lowered) < 4:
+        return False
+    if re.fullmatch(r"(very |quite |just |looks )?(similar|the same|same|matches|match|alike)( looking| species)?", lowered):
+        return False
+    if "similar" in lowered and not any(word in lowered for word in ("unlike", "differs", "different", "not ", "instead", "distinct", "rather")):
+        return False
+    if len(text) >= 8:
+        return True
+    return bool(_DIAGNOSTIC_TRAIT.search(lowered))
+
+
 def passing_verification(verification):
     """True only when the reference check names a candidate, is confident, and cites a real trait."""
     if not isinstance(verification, dict):
@@ -3142,17 +3506,19 @@ def passing_verification(verification):
     scientific = (verification.get("scientific_name") or "").strip()
     if not decision or not scientific or decision.lower() != scientific.lower():
         return False
-    if decision.upper() in ("UNSURE", "NO_MATCH", "NO MATCH"):
+    if decision.upper().replace(" ", "_") in ("UNSURE", "NO_MATCH", "NO MATCH", "NONE_OF_THESE"):
         return False
     if verification.get("certainty") != "confident":
         return False
-    trait = (verification.get("trait") or "").strip()
-    lowered = trait.lower().strip(" .")
-    if len(trait) < 8:
+    return explicit_diagnostic_trait(verification.get("trait"))
+
+
+def verification_chose_top(verification, candidates):
+    """The reference check named the leading candidate rather than the runner-up or none."""
+    if not passing_verification(verification) or not candidates:
         return False
-    if re.fullmatch(r"(very |quite |just |looks )?(similar|the same|same)( looking)?", lowered):
-        return False
-    if "similar" in lowered and not any(word in lowered for word in ("unlike", "differs", "different", "not ", "instead", "distinct", "rather")):
+    chosen = (verification.get("scientific_name") or "").lower()
+    if chosen != (candidates[0].get("scientific_name") or "").lower():
         return False
     return True
 
@@ -3426,6 +3792,168 @@ def colors_contradict(visible_text, species_text):
     return visible.isdisjoint(named)
 
 
+def _without_negations(text):
+    return re.sub(r"\bnot\b[^,.;]*", " ", text or "", flags=re.IGNORECASE)
+
+
+def traits_contradict(photo_text, species_text):
+    """Color, shape, or pattern in the photo description that the species does not have."""
+    if colors_contradict(photo_text, _without_negations(species_text)):
+        return True
+    photo = (photo_text or "").lower()
+    species = (species_text or "").lower()
+    positive = _without_negations(species_text).lower()
+    lattice = ("lattice", "tile", "red mesh", "mesh pattern")
+    denies_lattice = any(phrase in species for phrase in ("not a red tile lattice", "not a red lattice", "no red lattice"))
+    if any(word in photo for word in lattice) and denies_lattice:
+        return True
+    photo_slender = any(word in photo for word in ("slender", "cylindrical arm"))
+    species_inflated = any(word in positive for word in ("inflated", "short broad", "cushion"))
+    species_slender = any(word in positive for word in ("slender", "cylindrical"))
+    if photo_slender and species_inflated and not species_slender:
+        return True
+    photo_inflated = any(word in photo for word in ("inflated", "knobby", "conical knob"))
+    if photo_inflated and species_slender and not species_inflated:
+        return True
+    return False
+
+
+def scope_setting():
+    """FINFINDR_SCOPE selects which ancestry list is in scope. Default is marine."""
+    raw = (os.environ.get("FINFINDR_SCOPE") or "marine").strip().lower()
+    return raw or "marine"
+
+
+def allowed_scope_names():
+    """None means every animal is in scope. Otherwise a set of ancestry names."""
+    mode = scope_setting()
+    if mode in ("all", "any", "off"):
+        return None
+    if mode == "marine":
+        return MARINE_SCOPE_ANCESTORS
+    names = {part.strip().lower() for part in mode.split(",") if part.strip()}
+    return names or MARINE_SCOPE_ANCESTORS
+
+
+def _ancestor_names(taxon):
+    names = set()
+    if not isinstance(taxon, dict):
+        return names
+    for key in ("name", "iconic_taxon_name"):
+        if taxon.get(key):
+            names.add(str(taxon[key]).strip().lower())
+    for ancestor in taxon.get("ancestors") or []:
+        if isinstance(ancestor, dict) and ancestor.get("name"):
+            names.add(str(ancestor["name"]).strip().lower())
+        elif isinstance(ancestor, str) and ancestor.strip():
+            names.add(ancestor.strip().lower())
+    return names
+
+
+def ancestry_in_scope(taxon, allowed=None):
+    """True, False, or None when the ancestry does not decide.
+
+    A land group inside a marine phylum, such as a land snail, is out of scope
+    unless the active scope list names that land group itself.
+    """
+    if allowed is None:
+        allowed = allowed_scope_names()
+    if allowed is None:
+        return True
+    names = _ancestor_names(taxon)
+    if not names:
+        return None
+    land_hits = names & TERRESTRIAL_SCOPE_EXCEPTIONS
+    if land_hits and not (land_hits & allowed):
+        return False
+    if names & allowed:
+        return True
+    if names & LAND_ICONIC_TAXA:
+        return False
+    return None
+
+
+def _worms_is_marine(scientific):
+    """WoRMS/OBIS isMarine. True, False, or None when the lookup does not answer."""
+    if not scientific or (call_time_left() is not None and call_time_left() < 1.5):
+        return None
+    quoted = requests.utils.quote(scientific)
+    payload = _external_json(
+        f"https://www.marinespecies.org/rest/AphiaRecordsByName/{quoted}",
+        {"like": "false", "marine_only": "false"},
+    )
+    rows = payload if isinstance(payload, list) else None
+    if rows is None and isinstance(payload, dict):
+        rows = payload.get("results") or payload.get("data")
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = (row.get("scientificname") or row.get("scientificName") or row.get("name") or "")
+        if name and name.lower() != scientific.lower():
+            continue
+        for key in ("isMarine", "is_marine", "marine"):
+            if key not in row or row.get(key) is None:
+                continue
+            if row.get(key) is True or str(row.get(key)).lower() in ("true", "1"):
+                return True
+            if row.get(key) is False or str(row.get(key)).lower() in ("false", "0"):
+                brackish = row.get("isBrackish", row.get("is_brackish"))
+                if brackish is True or str(brackish).lower() in ("true", "1"):
+                    return True
+                return False
+    return None
+
+
+def fetch_inat_taxon(scientific):
+    if not scientific:
+        return None
+    payload = _inat_json(
+        _TAXA_URL,
+        {"q": scientific, "rank": "species", "per_page": 5, "locale": "en"},
+        INAT_TIMEOUT,
+    )
+    match = None
+    for item in (payload or {}).get("results") or []:
+        if (
+            isinstance(item, dict)
+            and item.get("rank") in _SPECIES_RANKS
+            and (item.get("name") or "").lower() == scientific.lower()
+        ):
+            match = item
+            break
+    if not match:
+        return None
+    if match.get("ancestors") or match.get("iconic_taxon_name"):
+        return match
+    taxon_id = match.get("id")
+    if not taxon_id or (call_time_left() is not None and call_time_left() < 1.5):
+        return match
+    full = _inat_json(f"{_TAXA_URL}/{taxon_id}", {}, INAT_TIMEOUT)
+    if isinstance(full, dict) and (full.get("name") or full.get("ancestors") or full.get("iconic_taxon_name")):
+        if full.get("results") and isinstance(full.get("results"), list):
+            return full["results"][0]
+        return full
+    return match
+
+
+def taxon_in_scope(scientific):
+    """True in scope, False for a clearly non-marine animal, None if unknown."""
+    allowed = allowed_scope_names()
+    if allowed is None:
+        return True
+    taxon = fetch_inat_taxon(scientific)
+    if taxon:
+        status = ancestry_in_scope(taxon, allowed)
+        if status is not None:
+            return status
+    marine = _worms_is_marine(scientific)
+    if marine is not None:
+        return marine
+    return None
+
+
 def _radius_wkt(lat, lng, radius_km):
     delta_lat = radius_km / 111.0
     cosine = max(0.2, abs(math.cos(math.radians(lat))))
@@ -3554,34 +4082,92 @@ def identify_get():
     return jsonify({"error": "Use POST to identify a photo."}), 405
 
 
+def _coerce_field(value):
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def read_identify_request():
+    """Form uploads and JSON uploads share one field map and one image path."""
+    fields = {}
+    payload = request.get_json(silent=True) if request.is_json else None
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if key in ("image", "image_base64"):
+                continue
+            fields[key] = _coerce_field(value)
+    for key in request.form.keys():
+        fields[key] = request.form.get(key) or ""
+    saw_image = False
+    image_bytes = None
+    if "image" in request.files:
+        saw_image = True
+        try:
+            image_bytes = request.files["image"].read()
+        except Exception as exc:
+            app.logger.warning("Could not read upload: %s", exc)
+            image_bytes = b""
+    elif isinstance(payload, dict):
+        raw = payload.get("image_base64")
+        if not isinstance(raw, str):
+            raw = payload.get("image") if isinstance(payload.get("image"), str) else ""
+        if isinstance(raw, str) and raw.strip():
+            saw_image = True
+            try:
+                image_bytes = base64.b64decode(raw)
+            except Exception:
+                app.logger.warning("Could not decode JSON image")
+                image_bytes = b""
+    return saw_image, image_bytes, fields
+
+
+def stamp_meta(meta, request_started):
+    stamped = dict(meta or {})
+    stamped["budget_s"] = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
+    if request_started is None:
+        stamped["total_ms"] = 0
+    else:
+        stamped["total_ms"] = int(round((time.monotonic() - request_started) * 1000))
+    stamped["external_calls"] = request_stat("external_calls")
+    stamped["inat_throttled"] = request_stat("inat_throttled")
+    return stamped
+
+
 @app.route("/identify", methods=["POST"])
 def identify():
-    if "image" not in request.files:
-        return jsonify({"error": "No image uploaded"}), 400
-
-    file = request.files["image"]
-    try:
-        image_bytes = file.read()
-    except Exception as exc:
-        app.logger.warning("Could not read upload: %s", exc)
-        return jsonify({"error": "Please upload a valid photo"}), 400
+    g.identify_started = time.monotonic()
+    begin_request_stats()
+    saw_image, image_bytes, fields = read_identify_request()
+    if not saw_image:
+        return jsonify({
+            "error": "No image uploaded",
+            "meta": stamp_meta({}, g.identify_started),
+        }), 400
 
     prepared = prepare_image(image_bytes)
     if not prepared:
-        return jsonify({"error": "Please upload a valid photo"}), 400
+        return jsonify({
+            "error": "Please upload a valid photo",
+            "meta": stamp_meta({}, g.identify_started),
+        }), 400
     jpeg_bytes, image_w, image_h = prepared
     image_px = f"{image_w}x{image_h}"
 
-    region = resolve_region(request.form.get("region"))
-    lat, lng, coord_source = _choose_coordinates(image_bytes)
+    region = resolve_region(fields.get("region"))
+    lat, lng, coord_source = _choose_coordinates(image_bytes, fields)
     region, location_fallback = apply_location_fallback(region, lat, lng)
     region_label = display_region_label(region, lat, lng, location_fallback)
-    mode = resolve_species_mode(request.form.get("species_list"))
-    debug = (request.form.get("debug") or "").strip() == "1"
-    model = resolve_model(request.form.get("model"), debug=debug)
-    verify = verification_enabled(debug, request.form.get("verify"))
-    discover = discovery_enabled(debug, request.form.get("discovery"))
-    exclude_observation = (request.form.get("exclude_observation_id") or "").strip()
+    mode = resolve_species_mode(fields.get("species_list"))
+    debug = (fields.get("debug") or "").strip() == "1"
+    model = resolve_model(fields.get("model"), debug=debug)
+    verify = verification_enabled(debug, fields.get("verify"))
+    discover = discovery_enabled(debug, fields.get("discovery"))
+    exclude_observation = (fields.get("exclude_observation_id") or "").strip()
 
     xai_key = os.environ.get("XAI_API_KEY")
     if not xai_key:
@@ -3589,9 +4175,10 @@ def identify():
         return jsonify({
             "error": "Identification is temporarily unavailable. Please try again later.",
             "region_label": region_label,
+            "meta": stamp_meta({}, g.identify_started),
         }), 500
 
-    request_started = time.monotonic()
+    request_started = g.identify_started
     set_call_deadline(request_started + _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115))
     started = time.perf_counter()
     species_payload = load_species_for_request(region, lat, lng, mode, exclude_observation)
@@ -3637,7 +4224,7 @@ def identify():
             None, "unavailable", answered, image_px, fallback_used, attempts,
             False, 0, 0, total_ms, "",
         )
-        meta["budget_s"] = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
+        meta = stamp_meta(meta, request_started)
         _log_identification(region["id"], meta)
         return jsonify({"error": message, "region_label": region_label, "meta": meta}), status
 
@@ -3658,6 +4245,7 @@ def identify():
         meta["range_km"] = range_km()
         meta["range_max"] = range_record_limit()
         meta["range_rule"] = range_rule_text()
+        meta = stamp_meta(meta, request_started)
         _log_identification(region["id"], meta)
         return jsonify({
             "result_text": text,
@@ -3675,6 +4263,33 @@ def identify():
     candidates = _prepare_off_list_candidates(parsed_candidates, species)
     off_list_kept = sum(1 for item in candidates if item.get("off_list"))
     app.logger.info("off_list_proposed=%s off_list_kept=%s", off_list_proposed, off_list_kept)
+    if candidates and taxon_in_scope(candidates[0]["scientific_name"]) is False:
+        meta = _identification_meta(
+            mode, sent, available, truncated, source, list_fetch_ms, model_ms,
+            tokens, token_source, answered, image_px, fallback_used, attempts,
+            False, 0, 0, None, "not_marine",
+        )
+        meta["photo_quality"] = photo_quality
+        meta["off_list_proposed"] = off_list_proposed
+        meta["off_list_kept"] = off_list_kept
+        meta["evidence"] = ["not_marine"]
+        meta = stamp_meta(meta, request_started)
+        _log_identification(region["id"], meta)
+        return jsonify({
+            "result_text": "",
+            "region_label": region_label,
+            "certainty": "unsure",
+            "photo_quality": photo_quality,
+            "reason": "not_marine",
+            "message": NOT_MARINE_MESSAGE,
+            "candidates": [],
+            "discovery": None,
+            "meta": meta,
+        })
+    candidates = [
+        item for item in candidates
+        if taxon_in_scope(item["scientific_name"]) is not False
+    ]
     verify_used = False
     verify_attempted = False
     verify_ms = 0
@@ -3689,18 +4304,24 @@ def identify():
         verify_skipped = "no_time"
     else:
         fetch_started = time.perf_counter()
-        fetch_deadline = time.monotonic() + 3.0
-        candidates = _attach_reference_photos(
-            candidates, lat, lng, exclude_observation, fetch_deadline
-        )
-        reference_fetch_ms = int(round((time.perf_counter() - fetch_started) * 1000))
+        fetch_cap = min(3.0, _time_left(request_started) - 6.0)
         reference_urls = []
-        photo_order = [item for item in candidates if item.get("off_list")] + [item for item in candidates if not item.get("off_list")]
-        for candidate in photo_order:
-            reference_urls.extend((candidate.get("_reference_urls") or [])[:1])
-        reference_urls = reference_urls[:4]
+        if fetch_cap < 0.4:
+            verify_skipped = "no_time"
+        else:
+            fetch_deadline = time.monotonic() + fetch_cap
+            candidates = _attach_reference_photos(
+                candidates, lat, lng, exclude_observation, fetch_deadline
+            )
+            photo_order = [item for item in candidates if item.get("off_list")] + [item for item in candidates if not item.get("off_list")]
+            for candidate in photo_order:
+                reference_urls.extend((candidate.get("_reference_urls") or [])[:1])
+            reference_urls = reference_urls[:4]
+        reference_fetch_ms = int(round((time.perf_counter() - fetch_started) * 1000))
         call_timeout = verify_call_budget(request_started)
-        if not reference_urls:
+        if verify_skipped == "no_time":
+            pass
+        elif not reference_urls:
             verify_skipped = "no_photos"
         elif call_timeout is None:
             verify_skipped = "no_time"
@@ -3754,9 +4375,10 @@ def identify():
         certainty = "unsure"
     shown = public_candidates(candidates, species)
     notes_text = _field_value(text, "Notes")
-    color_conflict = bool(shown) and colors_contradict(
+    known_traits = SPECIES_TRAITS.get((shown[0].get("scientific_name") if shown else "").lower(), "") if shown else ""
+    trait_conflict = bool(shown) and traits_contradict(
         f"{shown[0].get('trait') or ''} {notes_text}",
-        shown[0].get("common_name") or "",
+        f"{shown[0].get('common_name') or ''} {known_traits}",
     )
     discovery = None
     notable_note = ""
@@ -3773,7 +4395,11 @@ def identify():
             verification.get("decision") == "NO_MATCH" or verification_mismatch(verification)
         )
     )
-    no_match = color_conflict or rejected_all
+    no_match = trait_conflict or rejected_all
+    if no_match:
+        certainty = "unsure"
+        cap_unconfirmed_confidence(candidates)
+        shown = public_candidates(candidates, species)
     strong_id = (
         not no_match
         and not fallback_used
@@ -3781,6 +4407,7 @@ def identify():
         and certainty == "confident"
         and verify_used
         and passing_verification(verification)
+        and verification_chose_top(verification, candidates)
         and verification.get("scientific_name")
         and focus
         and verification["scientific_name"].lower() == focus.lower()
@@ -3794,7 +4421,7 @@ def identify():
                 "scientific_name": item["scientific_name"],
                 "common_name": item.get("common_name") or "",
                 "genus": genus,
-                "trait": item.get("trait") or verification.get("trait") or "",
+                "trait": item.get("trait") or (verification or {}).get("trait") or "",
             })
         genus = relatives[0]["genus"] if relatives else ""
         discovery = {
@@ -3820,7 +4447,10 @@ def identify():
         if range_status:
             evidence.append(f"external_range={range_status}")
         if unrecorded and strong_id and range_status == "absent":
-            nearest = nearest_research_records(focus, lat, lng)
+            if _time_left(request_started) >= 2:
+                nearest = nearest_research_records(focus, lat, lng)
+            else:
+                nearest = []
             traits = [item.get("trait") for item in shown if item.get("trait")]
             if verification and verification.get("trait"):
                 traits = [verification["trait"]] + [trait for trait in traits if trait != verification["trait"]]
@@ -3875,19 +4505,28 @@ def identify():
         if discovery and discovery.get("type") == "possible_range_extension":
             discovery = None
             evidence.append("discovery_blocked_without_verification")
-    if discovery and discovery.get("type") == "no_match" and not (rejected_all or color_conflict):
+    if discovery and discovery.get("type") == "no_match" and not (rejected_all or trait_conflict):
         discovery = None
+    if certainty != "confident":
+        for item in shown:
+            if item.get("confidence") == "high":
+                item["confidence"] = "medium"
+        if text:
+            text = _set_field(text, "Confidence", "low" if certainty == "unsure" else "medium")
+    checked = len(candidates) if verify_attempted else 0
+    passed = 1 if verify_used and passing_verification(verification) and verification_chose_top(verification, candidates) else 0
     meta["evidence"] = evidence
     meta["range_km"] = rule["radius_km"]
     meta["range_max"] = rule["max_records"]
     meta["range_rule"] = rule["text"]
     meta["verify_attempted"] = verify_attempted
-    meta["verify_succeeded"] = bool(verify_used and passing_verification(verification))
+    meta["verify_succeeded"] = bool(verify_used and passing_verification(verification) and verification_chose_top(verification, candidates))
     meta["verify_success_rate"] = verification_success_rate()
+    meta["verify_pass_rate"] = round(passed / checked, 4) if checked else None
     meta["verify_timeout_s"] = verify_timeout_cap()
-    meta["budget_s"] = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
     meta["off_list_proposed"] = off_list_proposed
     meta["off_list_kept"] = off_list_kept
+    meta = stamp_meta(meta, request_started)
     _log_identification(region["id"], meta)
     return jsonify({
         "result_text": text or "No response",
@@ -3901,22 +4540,30 @@ def identify():
     })
 
 
+def _error_body(message):
+    body = {"error": message}
+    if request.path == "/identify":
+        started = getattr(g, "identify_started", None)
+        body["meta"] = stamp_meta({}, started)
+    return body
+
+
 @app.errorhandler(RequestEntityTooLarge)
 def too_large(_exc):
-    return jsonify({"error": "That photo is too large. Please choose a smaller one."}), 413
+    return jsonify(_error_body("That photo is too large. Please choose a smaller one.")), 413
 
 
 @app.errorhandler(HTTPException)
 def http_exception(exc):
-    return jsonify({"error": exc.description or "Request failed"}), exc.code
+    return jsonify(_error_body(exc.description or "Request failed")), exc.code
 
 
 @app.errorhandler(Exception)
 def unhandled(exc):
     app.logger.exception("Unhandled error on %s", request.path)
     if isinstance(exc, HTTPException):
-        return jsonify({"error": exc.description or "Request failed"}), exc.code
-    return jsonify({"error": "Something went wrong. Please try again."}), 500
+        return jsonify(_error_body(exc.description or "Request failed")), exc.code
+    return jsonify(_error_body("Something went wrong. Please try again.")), 500
 
 
 @app.teardown_request

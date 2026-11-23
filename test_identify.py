@@ -1,8 +1,10 @@
 """Route and prompt checks for regional identification. No live xAI or iNaturalist calls."""
 
+import base64
 import io
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -144,8 +146,11 @@ class IdentifyTests(unittest.TestCase):
         os.environ.pop("FINFINDR_VERIFY_TIMEOUT", None)
         os.environ.pop("FINFINDR_VERIFY_IMAGE_PX", None)
         os.environ["FINFINDR_INAT_MIN_INTERVAL"] = "0"
+        self.cache_dir = tempfile.mkdtemp(prefix="finfindr-cache-")
+        os.environ["FINFINDR_CACHE_DIR"] = self.cache_dir
         finfindr_server._SPECIES_CACHE.clear()
         finfindr_server._INAT_JSON_CACHE.clear()
+        finfindr_server.clear_persisted_caches()
         finfindr_server._INAT_NEXT_AT = 0.0
         finfindr_server._SPECIES_INFLIGHT.clear()
         finfindr_server._inat_cache.clear()
@@ -168,6 +173,7 @@ class IdentifyTests(unittest.TestCase):
     def tearDown(self):
         self.get_patch.stop()
         self.post_patch.stop()
+        shutil.rmtree(getattr(self, "cache_dir", ""), ignore_errors=True)
 
     def fake_get(self, url, params=None, **kwargs):
         params = params or {}
@@ -293,6 +299,7 @@ class IdentifyTests(unittest.TestCase):
         self.assertIn("hint, not a menu", prompt)
         self.assertIn("propose up to 2 off_list species", prompt)
         self.assertEqual(self.captured["json"]["temperature"], 0)
+        self.assertEqual(self.captured["json"]["seed"], 0)
         self.assertEqual(self.captured["json"]["model"], "grok-4.7")
         self.assertEqual(body["meta"]["model"], "grok-4.7")
         self.assertEqual(body["meta"]["image_px"], "80x60")
@@ -603,9 +610,8 @@ class IdentifyTests(unittest.TestCase):
         self.assertFalse(body["meta"]["attempts"][0]["ok"])
         self.assertEqual(body["meta"]["attempts"][0]["error"], "timeout")
         self.assertTrue(body["meta"]["attempts"][1]["ok"])
-        self.assertGreaterEqual(self.captured["calls"][0]["timeout"], 45)
-        self.assertLessEqual(self.captured["calls"][0]["timeout"], 60)
-        self.assertLessEqual(self.captured["calls"][0]["timeout"] + 25 + 25, 110)
+        self.assertGreaterEqual(self.captured["calls"][0]["timeout"], 80)
+        self.assertLessEqual(self.captured["calls"][0]["timeout"], 100)
         self.assertLessEqual(self.captured["calls"][1]["timeout"], 25)
         self.assertIn("Cortez Rainbow Wrasse", body["result_text"])
 
@@ -658,6 +664,7 @@ class IdentifyTests(unittest.TestCase):
 
         self.get_patch.stop()
         finfindr_server._SPECIES_CACHE.clear()
+        finfindr_server.clear_persisted_caches()
         finfindr_server._SPECIES_WAIT_RESULT.clear()
         finfindr_server._INAT_JSON_CACHE.clear()
         seen = {"n": 0}
@@ -823,6 +830,11 @@ class IdentifyTests(unittest.TestCase):
         self.assertEqual(body["candidates"], [])
         self.assertEqual(body["certainty"], "unsure")
         self.assertIn("photo_invalid", body["meta"]["evidence"])
+        self.assertEqual(body["meta"]["budget_s"], 110)
+        self.assertIsInstance(body["meta"]["total_ms"], int)
+        self.assertIn("external_calls", body["meta"])
+        self.assertIn("inat_throttled", body["meta"])
+        self.assertNotEqual(body.get("reason"), "not_marine")
         prompt = self.prompt()
         self.assertIn("Never reject a species only because it is unrecorded", prompt)
         self.assertIn("Photo quality:", prompt)
@@ -1265,6 +1277,8 @@ class IdentifyTests(unittest.TestCase):
         self.assertIsNone(local["discovery"])
         self.assertNotEqual(local["certainty"], "confident")
         self.assertTrue(any(item.get("off_list") for item in local["candidates"]))
+        self.assertGreaterEqual(body["meta"]["off_list_proposed"], 1)
+        self.assertGreaterEqual(body["meta"]["off_list_kept"], 1)
 
     def test_identify_returns_inside_the_time_budget(self):
         def slow_post(*args, **kwargs):
@@ -1301,6 +1315,7 @@ class IdentifyTests(unittest.TestCase):
             return FakeResponse({"total_results": 3, "results": []})
 
         started = time.perf_counter()
+        finfindr_server.begin_request_stats()
         try:
             with patch("finfindr_server.http.get", side_effect=paced):
                 payload = finfindr_server._inat_get(
@@ -1318,6 +1333,8 @@ class IdentifyTests(unittest.TestCase):
         finally:
             os.environ["FINFINDR_INAT_MIN_INTERVAL"] = "0"
         self.assertEqual(payload["total_results"], 3)
+        self.assertGreaterEqual(finfindr_server.request_stat("inat_throttled"), 1)
+        self.assertGreaterEqual(finfindr_server.request_stat("external_calls"), 1)
         self.assertGreaterEqual(calls["n"], 3)
         self.assertGreaterEqual(time.perf_counter() - started, 0.2)
 
@@ -1344,7 +1361,8 @@ class IdentifyTests(unittest.TestCase):
             self.captured.pop("verify_raises", None)
         self.assertEqual(body["meta"]["verify_skipped"], "timeout")
         self.assertEqual(body["certainty"], "likely")
-        self.assertEqual(body["candidates"][0]["confidence"], "high")
+        self.assertNotEqual(body["candidates"][0]["confidence"], "high")
+        self.assertNotEqual(body["candidates"][0]["confidence"], "low")
         self.assertIsNone(body["discovery"])
         self.assertEqual(body["candidates"][0]["scientific_name"], "Abudefduf troschelii")
 
@@ -1401,9 +1419,221 @@ class IdentifyTests(unittest.TestCase):
 
     def test_model_timeouts_leave_room_for_fallback_and_verification(self):
         primary, fallback = finfindr_server.plan_model_timeouts(110, 80, 25, 25, True)
-        self.assertGreater(primary, 0)
+        self.assertGreaterEqual(primary, 80)
+        self.assertLessEqual(primary + 3, 110)
         self.assertGreater(fallback, 0)
-        self.assertLessEqual(primary + fallback + 25, 110)
+        self.assertFalse(finfindr_server.should_fallback(
+            {"ok": False, "retryable": True, "error": "timeout"}, 10, 25
+        ))
+        self.assertTrue(finfindr_server.should_fallback(
+            {"ok": False, "retryable": True, "error": "timeout"}, 40, 25
+        ))
+        self.assertTrue(finfindr_server.should_fallback(
+            {"ok": False, "retryable": True, "error": "connection"}, 30, 25
+        ))
+        self.assertTrue(finfindr_server.should_fallback(
+            {"ok": False, "retryable": True, "error": "http_502"}, 20, 25
+        ))
+        self.assertFalse(finfindr_server.should_fallback(
+            {"ok": False, "retryable": False, "error": "http_400"}, 100, 25
+        ))
+
+
+    def _felis_taxon(self, url, params):
+        if "taxa" in url:
+            return FakeResponse({"results": [{
+                "id": 118552,
+                "name": "Felis catus",
+                "rank": "species",
+                "iconic_taxon_name": "Mammalia",
+                "preferred_common_name": "Domestic Cat",
+                "ancestors": [
+                    {"name": "Animalia", "rank": "kingdom"},
+                    {"name": "Chordata", "rank": "phylum"},
+                    {"name": "Mammalia", "rank": "class"},
+                    {"name": "Carnivora", "rank": "order"},
+                    {"name": "Felidae", "rank": "family"},
+                ],
+            }]})
+        return None
+
+    def _assert_not_marine(self, body):
+        self.assertEqual(body["reason"], "not_marine")
+        self.assertEqual(
+            body["message"],
+            "FinFindr focuses on marine animal identification only. Please upload a photo of a marine animal.",
+        )
+        self.assertEqual(body["candidates"], [])
+        self.assertIsNone(body["discovery"])
+        self.assertNotEqual(body["certainty"], "confident")
+        blob = json.dumps({key: value for key, value in body.items() if key != "meta"})
+        self.assertNotIn("Felis", blob)
+        self.assertNotIn("catus", blob)
+        self.assertNotIn("Domestic", blob)
+        self.assertNotIn("high", blob.lower())
+        self.assertEqual(body["meta"]["budget_s"], 110)
+        self.assertIsInstance(body["meta"]["total_ms"], int)
+
+    def test_felis_catus_on_list_and_off_list_are_not_marine(self):
+        page = self.client.get("/").get_data(as_text=True)
+        self.assertIn("FinFindr focuses on marine animal identification only. Please upload a photo of a marine animal.", page)
+        self.assertIn('data.reason === "not_marine"', page)
+        self.assertIn("function showNotMarine", page)
+        self.assertIn("Can't identify from this photo", page)
+        self.inat_handler = self._felis_taxon
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Common name: Domestic Cat\n"
+            "Scientific name: Felis catus\n"
+            "Confidence: high\n"
+            "Candidate 1: Felis catus | Domestic Cat | high | pointed ears and whiskers\n"
+        )
+        on_list = self.post_photo().get_json()
+        self._assert_not_marine(on_list)
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Common name: Domestic Cat\n"
+            "Scientific name: Felis catus\n"
+            "Confidence: high\n"
+            "Off-list 1: Felis catus | Domestic Cat | whiskers and a short muzzle\n"
+        )
+        off_list = self.post_photo(region="sea-of-cortez").get_json()
+        self._assert_not_marine(off_list)
+        self.assertIn("actinopterygii", finfindr_server.MARINE_SCOPE_ANCESTORS)
+        self.assertIn("mollusca", finfindr_server.MARINE_SCOPE_ANCESTORS)
+        self.assertIn("echinodermata", finfindr_server.MARINE_SCOPE_ANCESTORS)
+        self.assertIn("cnidaria", finfindr_server.MARINE_SCOPE_ANCESTORS)
+        self.assertIn("crustacea", finfindr_server.MARINE_SCOPE_ANCESTORS)
+        self.assertIn("cheloniidae", finfindr_server.MARINE_SCOPE_ANCESTORS)
+        self.assertEqual(finfindr_server.scope_setting(), "marine")
+        os.environ["FINFINDR_SCOPE"] = "all"
+        try:
+            self.assertIsNone(finfindr_server.allowed_scope_names())
+            self.assertTrue(finfindr_server.taxon_in_scope("Felis catus"))
+        finally:
+            os.environ.pop("FINFINDR_SCOPE", None)
+
+    def test_fromia_lattice_is_not_a_confident_mithrodia(self):
+        self.inat_handler = self._taxon_photos
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Common name: Bradley's Sea Star\n"
+            "Scientific name: Mithrodia bradleyi\n"
+            "Confidence: high\n"
+            "Notes: A red sea star with a cream lattice across the arms.\n"
+            "Candidate 1: Mithrodia bradleyi | Bradley's Sea Star | high | red lattice of raised plates\n"
+            "Candidate 2: Phataria unifascialis | Blue Sea Star | medium | slender blue arms\n"
+        )
+        self.captured["verify_text"] = (
+            "Decision: Mithrodia bradleyi\n"
+            "Certainty: confident\n"
+            "Trait: red lattice of raised plates\n"
+        )
+        body = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertNotEqual(body["certainty"], "confident")
+        self.assertEqual(body["discovery"]["type"], "no_match")
+        self.assertFalse(any(item.get("confidence") == "high" for item in body["candidates"]))
+        finfindr_server._PHOTO_CACHE.clear()
+        finfindr_server._INAT_JSON_CACHE.clear()
+        self.captured["verify_text"] = (
+            "Decision: NONE_OF_THESE\nCertainty: unsure\nTrait: the red lattice matches none of these\n"
+        )
+        none = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertEqual(none["discovery"]["type"], "no_match")
+        self.assertNotEqual(none["certainty"], "confident")
+        self.assertIn("NONE_OF_THESE", self.prompt())
+
+    def test_abudefduf_short_diagnostic_trait_can_be_confident(self):
+        """A rank-1 Gulf sergeant major must not collapse to all-low.
+
+        The 8-character trait cutoff treated "5 bars" as a failed reference
+        check, and that failure lowered every candidate and set certainty to
+        unsure. A short explicit trait still passes. A fallback answer still
+        cannot be confident.
+        """
+        self.assertTrue(finfindr_server.explicit_diagnostic_trait("5 bars"))
+        self.assertFalse(finfindr_server.explicit_diagnostic_trait("similar"))
+        self.inat_handler = self._taxon_photos
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Abudefduf troschelii\n"
+            "Common name: Panamic sergeant major\n"
+            "Confidence: high\n"
+            "Notes: A silver damselfish with black bars.\n"
+            "Candidate 1: Abudefduf troschelii | Panamic sergeant major | high | 5 bars\n"
+            "Candidate 2: Abudefduf saxatilis | Sergeant major | medium | a yellow back\n"
+        )
+        self.captured["verify_text"] = (
+            "Decision: Abudefduf troschelii\nCertainty: confident\nTrait: 5 bars\n"
+        )
+        body = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertEqual(body["certainty"], "confident")
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Abudefduf troschelii")
+        self.assertEqual(body["candidates"][0]["confidence"], "high")
+        self.assertNotEqual(body["candidates"][1]["confidence"], "high")
+        self.assertTrue(body["meta"]["verify_succeeded"])
+        self.assertEqual(body["meta"]["verify_pass_rate"], 0.5)
+        self.assertIsNotNone(body["meta"]["verify_success_rate"])
+        self.assertFalse(body["meta"]["fallback_used"])
+
+    def test_form_and_json_posts_share_one_pipeline(self):
+        image = Image.new("RGB", (120, 40), (8, 40, 90))
+        exif = Image.Exif()
+        exif[274] = 6
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", exif=exif)
+        photo = buffer.getvalue()
+        form = self.client.post(
+            "/identify",
+            data={"image": (io.BytesIO(photo), "reef.jpg"), "region": "sea-of-cortez"},
+            content_type="multipart/form-data",
+        )
+        form_payload = self.captured["json"]
+        form_body = form.get_json()
+        self.captured["calls"] = []
+        js = self.client.post("/identify", json={
+            "image_base64": base64.b64encode(photo).decode("ascii"),
+            "region": "sea-of-cortez",
+        })
+        js_body = js.get_json()
+        self.assertEqual(form.status_code, 200)
+        self.assertEqual(js.status_code, 200)
+        self.assertEqual(form_payload["temperature"], 0)
+        self.assertEqual(self.captured["json"]["temperature"], 0)
+        self.assertEqual(form_payload["seed"], 0)
+        self.assertEqual(self.captured["json"]["seed"], 0)
+
+        def model_image(payload):
+            content = payload["input"][0]["content"]
+            return next(part["image_url"] for part in content if part["type"] == "input_image")
+
+        self.assertEqual(model_image(form_payload), model_image(self.captured["json"]))
+        encoded = model_image(form_payload).split(",", 1)[1]
+        with Image.open(io.BytesIO(base64.b64decode(encoded))) as sent:
+            self.assertGreater(sent.size[1], sent.size[0])
+        self.assertEqual(form_body["certainty"], js_body["certainty"])
+        self.assertEqual(form_body["candidates"], js_body["candidates"])
+        self.assertEqual(form_body["discovery"], js_body["discovery"])
+        self.assertEqual(form_body.get("message"), js_body.get("message"))
+        self.assertEqual(form_body["meta"]["image_px"], js_body["meta"]["image_px"])
+        self.assertEqual(form_body["meta"]["image_px"], "40x120")
+
+    def test_species_and_taxon_caches_survive_a_memory_clear(self):
+        query = finfindr_server.species_query_for(
+            finfindr_server._REGIONS_BY_ID["sea-of-cortez"], None, None
+        )
+        first = finfindr_server.load_species_list(query, "short", 5)
+        calls = len(self.species_calls)
+        finfindr_server._SPECIES_CACHE.clear()
+        second = finfindr_server.load_species_list(query, "short", 5)
+        self.assertEqual(len(self.species_calls), calls)
+        self.assertEqual(second["species"][0]["scientific"], first["species"][0]["scientific"])
+        self.inat_handler = self._felis_taxon
+        self.assertEqual(finfindr_server.fetch_inat_taxon("Felis catus")["iconic_taxon_name"], "Mammalia")
+        finfindr_server._INAT_JSON_CACHE.clear()
+        self.inat_handler = None
+        again = finfindr_server.fetch_inat_taxon("Felis catus")
+        self.assertEqual(again["iconic_taxon_name"], "Mammalia")
 
 
 class EvalScoreTests(unittest.TestCase):
@@ -1656,6 +1886,22 @@ class EvalScoreTests(unittest.TestCase):
         self.assertGreaterEqual(report["verified"]["errored"], 1)
         self.assertEqual(report["targets_result"]["checks"]["range_rule"]["result"], "pass")
         self.assertGreater(report["verified"]["false_reject_rate"], 0)
+        outcome = eval_region.retry_outcome(502, 200, False)
+        self.assertTrue(outcome["first_attempt_error"])
+        self.assertTrue(outcome["retried_ok"])
+        self.assertEqual(outcome["first_attempt_status"], 502)
+        quiet = eval_region.retry_outcome(200, 200, False)
+        self.assertFalse(quiet["first_attempt_error"])
+        self.assertFalse(quiet["retried_ok"])
+        failed = eval_region.retry_outcome(503, 503, True)
+        self.assertTrue(failed["first_attempt_error"])
+        self.assertFalse(failed["retried_ok"])
+        row["first_attempt_error"] = True
+        row["retried_ok"] = True
+        report = eval_region.build_report([good, row], "qa", targets, path, 1)
+        self.assertEqual(report["first_attempt_errors"], 1)
+        self.assertEqual(report["retried_ok"], 1)
+        self.assertIn("First-attempt errors: 1", eval_region.markdown_report(report))
 
 
 if __name__ == "__main__":

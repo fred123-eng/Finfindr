@@ -808,14 +808,24 @@ def score_targets(metrics, targets, rows):
     return {"checks": checks, "overall": overall, "slice": "verified"}
 
 
+def retry_summary(rows):
+    return {
+        "first_attempt_errors": sum(1 for row in rows if row.get("first_attempt_error")),
+        "retried_ok": sum(1 for row in rows if row.get("retried_ok")),
+    }
+
+
 def build_report(rows, label, targets, targets_path, runs):
     verified = [row for row in rows if row["key_confidence"] == "verified"]
     uncertain = [row for row in rows if row["key_confidence"] == "uncertain"]
+    retries = retry_summary(rows)
     return {
         "area": label,
         "runs": runs,
         "targets_path": targets_path,
         "range_rule": app_range_rule(),
+        "first_attempt_errors": retries["first_attempt_errors"],
+        "retried_ok": retries["retried_ok"],
         "targets_result": score_targets(summarize_answers(verified), targets, verified),
         "verified": summarize_answers(verified),
         "uncertain": summarize_answers(uncertain),
@@ -872,6 +882,8 @@ def markdown_report(report):
         f"- Overall: {report['targets_result']['overall']}",
         f"- Photos: {verified['n_photos']} verified, {uncertain['n_photos']} uncertain",
         f"- Runs: {report.get('runs')}",
+        f"- First-attempt errors: {report.get('first_attempt_errors', 0)}",
+        f"- Retried ok: {report.get('retried_ok', 0)}",
         "",
         "## Verified targets",
         "",
@@ -1029,20 +1041,52 @@ def append_result_row(path, row):
     Path(path).write_text(json.dumps({"results": rows}, indent=2), encoding="utf-8")
 
 
+def retry_outcome(first_status, final_status, final_has_error):
+    """A first-attempt 5xx counts even when the retry later succeeds."""
+    try:
+        first = int(first_status)
+    except (TypeError, ValueError):
+        first = 0
+    try:
+        final = int(final_status)
+    except (TypeError, ValueError):
+        final = 0
+    first_error = first == 0 or first >= 500
+    retried_ok = bool(first_error and 200 <= final < 500 and not final_has_error)
+    return {
+        "first_attempt_status": first,
+        "first_attempt_error": first_error,
+        "retried_ok": retried_ok,
+    }
+
+
 def identify_with_retry(session, base_url, image, item, delay):
-    """Try twice so one network error does not end the run."""
+    """Try twice so one network error does not end the run.
+
+    The returned body records the first status. A 5xx on the first attempt
+    stays a first_attempt_error when the second attempt succeeds.
+    """
     last = ({"error": "network"}, 0, 0)
+    first_status = None
     for attempt in range(2):
         try:
             body, latency_ms, status = identify_photo(session, base_url, image, item)
         except requests.RequestException as exc:
             body, latency_ms, status = {"error": str(exc)}, 0, 0
+        if first_status is None:
+            first_status = status
         last = (body, latency_ms, status)
         failed = status == 0 or status >= 500 or (isinstance(body, dict) and body.get("error"))
         if not failed or attempt == 1:
-            return last
+            break
         time.sleep(min(delay, 2.0) if delay else 0.2)
-    return last
+    body, latency_ms, status = last
+    if not isinstance(body, dict):
+        body = {"error": "non-json response"}
+    else:
+        body = dict(body)
+    body["_eval_retry"] = retry_outcome(first_status, status, bool(body.get("error")))
+    return body, latency_ms, status
 
 
 def evaluate_manifest(items, manifest_dir, base_url, runs, session=None, delay=10.0, concurrency=1, resume_path=""):
@@ -1071,6 +1115,11 @@ def evaluate_manifest(items, manifest_dir, base_url, runs, session=None, delay=1
                 item = dict(item)
                 item["synonyms"] = extra
         row = answer_from_response(body, item, run, latency_ms, status)
+        retry = body.get("_eval_retry") if isinstance(body, dict) else None
+        if isinstance(retry, dict):
+            row["first_attempt_status"] = retry.get("first_attempt_status")
+            row["first_attempt_error"] = bool(retry.get("first_attempt_error"))
+            row["retried_ok"] = bool(retry.get("retried_ok"))
         print(
             f"{item['photo_path']} run {run}: {row['guess'] or '(no name)'} "
             f"{row['klass']} credit={row['headline_credit']}",
