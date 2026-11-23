@@ -168,6 +168,11 @@ HTML = """
       <option value="1">On</option>
       <option value="0">Off</option>
     </select>
+    <label for="nocacheSelect">Skip answer cache</label>
+    <select id="nocacheSelect">
+      <option value="">Use cache</option>
+      <option value="1">nocache=1</option>
+    </select>
   </details>
 </div>
 
@@ -196,6 +201,7 @@ const modelInput = document.getElementById("modelInput");
 const verifySelect = document.getElementById("verifySelect");
 const discoverySelect = document.getElementById("discoverySelect");
 const excludeObservation = document.getElementById("excludeObservation");
+const nocacheSelect = document.getElementById("nocacheSelect");
 const locationStatus = document.getElementById("locationStatus");
 const MIN_DIMENSION = 32;
 const MAX_BYTES = 20 * 1024 * 1024;
@@ -791,6 +797,9 @@ async function handleFile(file) {
         formData.append("exclude_observation_id", excludeObservation.value.trim());
       }
     }
+    if (nocacheSelect && nocacheSelect.value === "1") {
+      formData.append("nocache", "1");
+    }
 
     const resp = await fetch("/identify", { method: "POST", body: formData });
     const parsed = await readJsonResponse(resp);
@@ -813,7 +822,7 @@ async function handleFile(file) {
       addRetry(card);
       return;
     }
-    if ((data.photo_quality === "poor" || data.photo_quality === "invalid") && data.certainty !== "confident") {
+    if ((!data.candidates || !data.candidates.length) && (data.photo_quality === "poor" || data.photo_quality === "invalid" || data.message === "Can't identify from this photo.")) {
       showPhotoRejection(card, data);
       addRetry(card);
       return;
@@ -2596,7 +2605,7 @@ def prefetch_reference_limit():
     """How many Sea of Cortez reference photos to warm. FINFINDR_PREFETCH_REFS=0 disables it."""
     raw = (os.environ.get("FINFINDR_PREFETCH_REFS") or "").strip()
     if not raw:
-        return 0
+        return 30
     if raw.lower() in ("0", "false", "off", "no"):
         return 0
     try:
@@ -2932,10 +2941,10 @@ def _model_cache_put(key, result):
     _disk_cache_put("model", key, result, MODEL_CACHE_TTL)
 
 
-def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key, extra_images=None, extra_detail="low"):
+def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key, extra_images=None, extra_detail="low", use_cache=True):
     """One model attempt, stopped when the wall clock runs out even if the socket keeps trickling."""
     cache_key = _model_cache_key(jpeg_bytes, prompt, model, extra_images)
-    if model_cache_enabled():
+    if use_cache and model_cache_enabled():
         cached = _model_cache_get(cache_key)
         if cached is not None:
             replay = dict(cached)
@@ -2960,7 +2969,7 @@ def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key, extra_images
         "ms": int(round((time.perf_counter() - started) * 1000)),
         "error": "failed", "status": 502,
     }
-    if model_cache_enabled():
+    if use_cache and model_cache_enabled():
         _model_cache_put(cache_key, result)
     return result
 
@@ -2998,7 +3007,21 @@ def should_fallback(result, remaining, fallback_cap):
     return False
 
 
-def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, extra_reserve=0, extra_images=None):
+def _record_parallel_fallback(fallback_thread, holder, fallback_model, attempts):
+    """Keep the grok-4 attempt on the record even when the primary answer is the one we use."""
+    if fallback_thread is None:
+        return
+    fallback_thread.join(0.05)
+    fallback = holder.get("fallback")
+    if not fallback:
+        attempts.append(_attempt_record(fallback_model, 0, False, "still_running"))
+        return
+    attempts.append(_attempt_record(
+        fallback_model, fallback.get("ms") or 0, fallback.get("ok"), None if fallback.get("ok") else fallback.get("error")
+    ))
+
+
+def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, extra_reserve=0, extra_images=None, use_cache=True):
     """Primary keeps most of its window. Fallback starts in parallel if it runs long.
 
     grok-4.7 still gets about 70s (XAI_PRIMARY_TIMEOUT). If it is still running
@@ -3008,7 +3031,7 @@ def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, ext
     """
     del extra_reserve
     worker_budget = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
-    primary_cap = _env_seconds("XAI_PRIMARY_TIMEOUT", 70, 5, 90)
+    primary_cap = _env_seconds("XAI_PRIMARY_TIMEOUT", 70, 5, 110)
     fallback_cap = _env_seconds("XAI_FALLBACK_TIMEOUT", 20, 5, 40)
     fallback_after = _env_seconds("XAI_FALLBACK_AFTER", 40, 5, 80)
     verify_hold = 16.0
@@ -3027,7 +3050,7 @@ def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, ext
 
     def run_primary():
         holder["primary"] = _call_vision_model(
-            jpeg_bytes, prompt, model, primary_timeout, api_key, extra_images
+            jpeg_bytes, prompt, model, primary_timeout, api_key, extra_images, use_cache=use_cache
         )
 
     primary_thread = _start_thread(run_primary, "finfindr-primary")
@@ -3038,7 +3061,7 @@ def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, ext
 
         def run_fallback():
             holder["fallback"] = _call_vision_model(
-                jpeg_bytes, prompt, fallback_model, fallback_timeout, api_key, extra_images
+                jpeg_bytes, prompt, fallback_model, fallback_timeout, api_key, extra_images, use_cache=use_cache
             )
 
         fallback_thread = _start_thread(run_fallback, "finfindr-fallback")
@@ -3046,6 +3069,7 @@ def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, ext
     result = holder.get("primary") or timed_out(model, primary_timeout * 1000)
     attempts.append(_attempt_record(model, result["ms"], result["ok"], None if result["ok"] else result.get("error")))
     if result.get("ok"):
+        _record_parallel_fallback(fallback_thread, holder, fallback_model, attempts)
         return result, attempts
     if fallback_thread is not None:
         fallback_thread.join(max(0.2, remaining() - 1.0))
@@ -3060,7 +3084,7 @@ def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, ext
         fallback_timeout = min(fallback_cap, max(1.0, remaining() - 2.0))
         if fallback_timeout >= 5.0:
             fallback = _call_vision_model(
-                jpeg_bytes, prompt, fallback_model, fallback_timeout, api_key, extra_images
+                jpeg_bytes, prompt, fallback_model, fallback_timeout, api_key, extra_images, use_cache=use_cache
             )
             attempts.append(_attempt_record(
                 fallback_model, fallback["ms"], fallback["ok"], None if fallback["ok"] else fallback.get("error")
@@ -3088,10 +3112,10 @@ def verification_enabled(debug, raw):
 
 
 def verify_timeout_cap():
-    """Seconds allowed for the reference-photo model call. FINFINDR_VERIFY_TIMEOUT overrides 25."""
+    """Seconds allowed for the reference-photo model call. FINFINDR_VERIFY_TIMEOUT overrides 12."""
     raw = (os.environ.get("FINFINDR_VERIFY_TIMEOUT") or "").strip()
     if not raw:
-        return 25.0
+        return 12.0
     try:
         value = float(raw)
     except ValueError:
@@ -3100,10 +3124,10 @@ def verify_timeout_cap():
 
 
 def verify_image_px():
-    """Longest edge of the photo sent with the reference check. Default 768."""
+    """Longest edge of the photo sent with the reference check. Default 512."""
     raw = (os.environ.get("FINFINDR_VERIFY_IMAGE_PX") or "").strip()
     if not raw:
-        return 768
+        return 512
     try:
         value = int(raw)
     except ValueError:
@@ -3809,6 +3833,33 @@ def photo_truly_unusable(quality, issue):
     return bool(_UNUSABLE_PHOTO.search(issue or ""))
 
 
+_NOT_MARINE_TEXT = re.compile(
+    r"not a marine|isn'?t marine|not marine|non-?marine|terrestrial|on grass|"
+    r"domestic cat|house cat|land animal|land bird|felis catus",
+    re.IGNORECASE,
+)
+
+
+def text_says_not_marine(text):
+    """True when the model itself says the photo is not a marine animal."""
+    return bool(_NOT_MARINE_TEXT.search(text or ""))
+
+
+def mark_unlisted_candidates(candidates, species):
+    """A medium or low name that is not in the regional list is an off-list proposal."""
+    listed = {(item.get("scientific") or "").lower() for item in species or [] if isinstance(item, dict)}
+    promoted = 0
+    for item in candidates:
+        if item.get("off_list"):
+            continue
+        if item.get("scientific_name", "").lower() in listed:
+            continue
+        if (item.get("confidence") or "medium") in ("low", "medium"):
+            item["off_list"] = True
+            promoted += 1
+    return promoted
+
+
 def app_commit():
     return (os.environ.get("RENDER_GIT_COMMIT") or os.environ.get("GIT_COMMIT") or "").strip()
 
@@ -4315,10 +4366,12 @@ def _offlist_followup_prompt(locality, candidates):
 
 def _needs_offlist_followup(candidates, verification, verify_skipped):
     """Ask again when the regional list did not produce a confirmed identification."""
-    if not candidates or any(item.get("off_list") for item in candidates):
+    if not candidates:
         return False
     if verify_skipped in ("timeout", "no_time"):
         return True
+    if any(item.get("off_list") for item in candidates):
+        return False
     if verification is not None and not passing_verification(verification):
         return True
     on_list = [item for item in candidates if not item.get("off_list")]
@@ -4427,6 +4480,7 @@ def _identify_http():
     verify = verification_enabled(debug, fields.get("verify"))
     discover = discovery_enabled(debug, fields.get("discovery"))
     exclude_observation = (fields.get("exclude_observation_id") or "").strip()
+    use_cache = (fields.get("nocache") or "").strip().lower() not in ("1", "true", "yes", "on")
 
     xai_key = os.environ.get("XAI_API_KEY")
     if not xai_key:
@@ -4463,6 +4517,7 @@ def _identify_http():
     result, attempts = _run_model_attempts(
         jpeg_bytes, prompt, model, xai_key, request_started,
         extra_reserve=verify_timeout_cap() if verify else 0,
+        use_cache=use_cache,
     )
     model_ms = sum(item["ms"] for item in attempts)
     answered = result.get("model") or model
@@ -4505,6 +4560,31 @@ def _identify_http():
     text = apply_standard_names(_extract_text(data), species)
     photo_quality = parse_photo_quality(text)
     photo_issue = _field_value(text, "Photo issue")
+    parsed_candidates = parse_model_candidates(text)
+    if text_says_not_marine("\n".join([text, photo_issue])) or (
+        parsed_candidates and taxon_in_scope(parsed_candidates[0]["scientific_name"]) is False
+    ):
+        meta = _identification_meta(
+            mode, sent, available, truncated, source, list_fetch_ms, model_ms,
+            tokens, token_source, answered, image_px, fallback_used, attempts,
+            False, 0, 0, None, "not_marine",
+        )
+        meta["photo_quality"] = photo_quality
+        meta["evidence"] = ["not_marine"]
+        apply_verify_rates(meta, False, False, 0, 0, "not_marine")
+        meta = stamp_meta(meta, request_started)
+        _log_identification(region["id"], meta)
+        return jsonify({
+            "result_text": "",
+            "region_label": region_label,
+            "certainty": "unsure",
+            "photo_quality": photo_quality,
+            "reason": "not_marine",
+            "message": NOT_MARINE_MESSAGE,
+            "candidates": [],
+            "discovery": None,
+            "meta": meta,
+        })
     if photo_truly_unusable(photo_quality, photo_issue):
         total_ms = int(round((time.monotonic() - request_started) * 1000))
         meta = _identification_meta(
@@ -4531,9 +4611,9 @@ def _identify_http():
             "discovery": None,
             "meta": meta,
         })
-    parsed_candidates = parse_model_candidates(text)
     off_list_proposed = sum(1 for item in parsed_candidates if item.get("off_list"))
     candidates = _prepare_off_list_candidates(parsed_candidates, species)
+    off_list_proposed += mark_unlisted_candidates(candidates, species)
     off_list_kept = sum(1 for item in candidates if item.get("off_list"))
     app.logger.info("off_list_proposed=%s off_list_kept=%s", off_list_proposed, off_list_kept)
     if candidates and taxon_in_scope(candidates[0]["scientific_name"]) is False:
@@ -4648,6 +4728,7 @@ def _identify_http():
             model if not fallback_used else answered,
             follow_timeout,
             xai_key,
+            use_cache=use_cache,
         )
         attempts.append(_attempt_record(
             model if not fallback_used else answered,
@@ -4667,17 +4748,17 @@ def _identify_http():
                 if item.get("off_list") and taxon_in_scope(item["scientific_name"]) is not False
             ]
             seen_names = {(item.get("scientific_name") or "").lower() for item in candidates}
+            fresh = []
             for item in prepared:
                 if item["scientific_name"].lower() in seen_names:
                     continue
-                candidates.append(item)
+                fresh.append(item)
                 seen_names.add(item["scientific_name"].lower())
+            if fresh and not passing_verification(verification):
+                candidates = fresh + candidates
+            else:
+                candidates.extend(fresh)
             off_list_kept = sum(1 for item in candidates if item.get("off_list"))
-            if not passing_verification(verification):
-                off_items = [item for item in candidates if item.get("off_list")]
-                on_items = [item for item in candidates if not item.get("off_list")]
-                if off_items:
-                    candidates = off_items + on_items
     verification_disagreed = bool(
         verify_used and verification is not None and not passing_verification(verification)
     )
@@ -4708,6 +4789,18 @@ def _identify_http():
         )
     )
     no_match = trait_conflict or rejected_all
+    color_reject = False
+    if isinstance(verification, dict):
+        trait_line = (verification.get("trait") or "").lower()
+        color_reject = any(cue in trait_line for cue in (
+            "does not match", "doesn't match", "wrong color", "wrong colour",
+            "different color", "different colour", "color does not", "colour does not",
+        ))
+    if no_match and shown and not trait_conflict and not color_reject:
+        # The top candidate is the closest name we have. Saying "no match"
+        # while still ranking that species first is a false reject.
+        no_match = False
+        rejected_all = False
     if no_match:
         certainty = "unsure"
         cap_unconfirmed_confidence(candidates)
@@ -4756,7 +4849,7 @@ def _identify_http():
             evidence.append(f"records_in_radius={record_count}")
         unrecorded = record_count is not None and record_count <= rule["max_records"]
         off_list_focus = bool(shown and shown[0].get("off_list"))
-        range_ready = strong_id or (off_list_focus and not passing_verification(verification))
+        range_ready = strong_id or off_list_focus
         range_status = external_range_status(focus, lat, lng, rule["radius_km"]) if unrecorded and range_ready else ""
         if range_status:
             evidence.append(f"external_range={range_status}")
@@ -4779,10 +4872,11 @@ def _identify_http():
                 "nearest_known_record_source": "iNaturalist" if nearest else "",
                 "traits": [trait for trait in traits if trait][:3],
                 "rule": rule,
+                "external_range": range_status or "unknown",
             }
             evidence.append("verification_agreed" if strong_id else "off_list_range_unverified")
-            if not strong_id:
-                certainty = "unsure"
+            if not strong_id and certainty == "confident":
+                certainty = "likely"
         elif unrecorded and strong_id and range_status == "unknown":
             certainty = "unsure"
             notable_note = (
@@ -4838,30 +4932,15 @@ def _identify_http():
     verified_id = bool(
         verify_used and passing_verification(verification) and verification_chose_top(verification, candidates) and not fallback_used
     )
-    if photo_quality in ("poor", "invalid") and not verified_id and not photo_truly_unusable(photo_quality, photo_issue):
-        meta["evidence"] = evidence + ["photo_quality_unconfirmed"]
-        meta["photo_quality"] = photo_quality
-        apply_verify_rates(meta, verify_attempted, verify_used, checked, passed, verify_skipped or "photo_quality")
-        meta["verify_succeeded"] = False
-        meta["verify_timeout_s"] = verify_timeout_cap()
-        meta["off_list_proposed"] = off_list_proposed
-        meta["off_list_kept"] = off_list_kept
-        meta["range_km"] = rule["radius_km"]
-        meta["range_max"] = rule["max_records"]
-        meta["range_rule"] = rule["text"]
-        meta = stamp_meta(meta, request_started)
-        _log_identification(region["id"], meta)
-        return jsonify({
-            "result_text": "",
-            "region_label": region_label,
-            "certainty": "unsure",
-            "photo_quality": photo_quality,
-            "photo_issue": photo_issue or "The animal is not clear enough to identify.",
-            "message": "Can't identify from this photo.",
-            "candidates": [],
-            "discovery": None,
-            "meta": meta,
-        })
+    if photo_quality in ("poor", "invalid") and not photo_truly_unusable(photo_quality, photo_issue):
+        if certainty == "confident":
+            certainty = "likely"
+        for item in shown:
+            if item.get("confidence") == "high":
+                item["confidence"] = "medium"
+        evidence.append("quality_lowered_confidence")
+    if verify_skipped in ("timeout", "connection", "no_time") and certainty == "confident":
+        certainty = "likely"
     meta["evidence"] = evidence
     meta["range_km"] = rule["radius_km"]
     meta["range_max"] = rule["max_records"]

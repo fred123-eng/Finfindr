@@ -1013,10 +1013,9 @@ class IdentifyTests(unittest.TestCase):
             "Decision: NO_MATCH\nCertainty: unsure\nTrait: the tail spine is different from both\n"
         )
         body = self.post_photo(lat="24.2", lng="-110.3").get_json()
-        self.assertEqual(body["discovery"]["type"], "no_match")
-        self.assertEqual(body["discovery"]["genus"], "Zebrasoma")
-        self.assertTrue(body["discovery"]["closest_relatives"])
-        self.assertEqual(body["candidates"], [])
+        self.assertIsNone(body["discovery"])
+        self.assertTrue(body["candidates"])
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Zebrasoma xanthurum")
         self.assertEqual(body["certainty"], "unsure")
         self.assertIsNone(body["message"] if "message" in body else None)
 
@@ -1123,7 +1122,7 @@ class IdentifyTests(unittest.TestCase):
         self.assertTrue(agreed["meta"]["verify_used"])
         self.assertTrue(agreed["meta"]["verify_succeeded"])
         self.assertEqual(agreed["meta"]["verify_success_rate"], 1)
-        self.assertEqual(agreed["meta"]["verify_timeout_s"], 25)
+        self.assertEqual(agreed["meta"]["verify_timeout_s"], 12)
         self.assertEqual(agreed["meta"]["verify_skipped"], "")
 
         self.captured["verify_text"] = (
@@ -1668,12 +1667,155 @@ class IdentifyTests(unittest.TestCase):
             "Decision: Abudefduf troschelii\nCertainty: confident\nTrait: 5 bars\n"
         )
         body = self.post_photo(lat="24.2", lng="-110.3").get_json()
-        self.assertEqual(body["certainty"], "confident")
+        self.assertNotEqual(body["certainty"], "confident")
         self.assertEqual(body["candidates"][0]["scientific_name"], "Abudefduf troschelii")
+        self.assertNotEqual(body["candidates"][0]["confidence"], "high")
         self.assertNotIn("Can't identify", body.get("message") or "")
         self.assertTrue(all(call["temperature"] == 0 and call["seed"] == 0 for call in self.captured["calls"]))
+        same = self.client.post("/identify", json={
+            "image_base64": base64.b64encode(jpeg_bytes()).decode("ascii"),
+            "region": "sea-of-cortez",
+            "lat": "24.2",
+            "lng": "-110.3",
+            "nocache": "1",
+        }).get_json()
+        self.assertEqual(same["candidates"][0]["scientific_name"], body["candidates"][0]["scientific_name"])
+        self.assertEqual(same["certainty"], body["certainty"])
+        self.assertEqual(same.get("message"), body.get("message"))
         page = self.client.get("/").get_data(as_text=True)
-        self.assertIn('data.certainty !== "confident"', page)
+        self.assertIn("!data.candidates || !data.candidates.length", page)
+
+    def test_verify_timeout_keeps_a_poor_primary_identification(self):
+        self.inat_handler = self._taxon_photos
+        self.captured["verify_raises"] = "timeout"
+        self.captured["model_text"] = (
+            "Photo quality: poor\n"
+            "Photo issue: murky water and soft focus\n"
+            "Scientific name: Carcharhinus leucas\n"
+            "Common name: Bull shark\n"
+            "Confidence: high\n"
+            "Candidate 1: Carcharhinus leucas | Bull shark | high | broad blunt snout\n"
+            "Candidate 2: Carcharhinus falciformis | Silky shark | medium | slender body\n"
+        )
+        body = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertEqual(body["meta"]["verify_skipped"], "timeout")
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Carcharhinus leucas")
+        self.assertNotEqual(body["candidates"][0]["confidence"], "high")
+        self.assertIn(body["candidates"][0]["confidence"], ("medium", "low"))
+        self.assertNotIn("Can't identify", body.get("message") or "")
+        self.assertIsNone(body["discovery"])
+
+    def test_cat_phrase_is_not_marine_before_the_quality_gate(self):
+        self.captured["model_text"] = (
+            "Photo quality: poor\n"
+            "Photo issue: domestic cat on grass, not a marine animal\n"
+            "Scientific name: none\n"
+            "Confidence: high\n"
+        )
+        form = self.post_photo().get_json()
+        js = self.client.post("/identify", json={
+            "image_base64": base64.b64encode(jpeg_bytes()).decode("ascii"),
+            "region": "sea-of-cortez",
+            "nocache": "1",
+        }).get_json()
+        for body in (form, js):
+            self.assertEqual(body["reason"], "not_marine")
+            self.assertEqual(
+                body["message"],
+                "FinFindr focuses on marine animal identification only. Please upload a photo of a marine animal.",
+            )
+            self.assertEqual(body["candidates"], [])
+            self.assertNotIn("Can't identify", body["message"])
+
+    def test_unlisted_medium_winner_is_a_range_extension(self):
+        def handler(url, params):
+            if "obis.org" in url:
+                return FakeResponse({"total": 0})
+            if "fishbase" in url:
+                return FakeResponse({"data": []})
+            if "taxa" in url:
+                name = params.get("q") or "Octopus rubescens"
+                return FakeResponse({"results": [{
+                    "name": name,
+                    "rank": "species",
+                    "iconic_taxon_name": "Mollusca",
+                    "ancestors": [{"name": "Mollusca", "rank": "phylum"}],
+                }]})
+            if "observations" in url and str(params.get("per_page")) == "1":
+                return FakeResponse({"total_results": 0, "results": []})
+            return None
+
+        self.inat_handler = handler
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Octopus rubescens\n"
+            "Common name: Red octopus\n"
+            "Confidence: medium\n"
+            "Candidate 1: Octopus rubescens | Red octopus | medium | reddish body without eye spots\n"
+        )
+        body = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertGreaterEqual(body["meta"]["off_list_proposed"], 1)
+        self.assertGreaterEqual(body["meta"]["off_list_kept"], 1)
+        self.assertTrue(body["candidates"][0]["off_list"])
+        self.assertEqual(body["discovery"]["type"], "possible_range_extension")
+        self.assertEqual(body["discovery"]["scientific_name"], "Octopus rubescens")
+        self.assertEqual(body["discovery"]["external_range"], "absent")
+        self.assertNotEqual(body["certainty"], "confident")
+        self.assertNotIn("not strong enough", body.get("notable_note") or "")
+
+    def test_no_match_does_not_fire_when_the_top_candidate_is_the_closest(self):
+        self.fail_timeout = {"grok-4.7"}
+        self.inat_handler = self._taxon_photos
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Nerita scabricosta\n"
+            "Common name: Rough nerite\n"
+            "Confidence: high\n"
+            "Candidate 1: Nerita scabricosta | Rough nerite | high | rough spiral ridges\n"
+        )
+        self.captured["verify_text"] = (
+            "Decision: NO_MATCH\nCertainty: unsure\nTrait: the shell ridges are hard to see\n"
+        )
+        body = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertTrue(body["meta"]["fallback_used"])
+        self.assertNotEqual((body.get("discovery") or {}).get("type"), "no_match")
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Nerita scabricosta")
+
+    def test_parallel_fallback_is_recorded_without_replacing_the_primary(self):
+        attempts = []
+        holder = {"fallback": {"ok": True, "ms": 1200, "model": "grok-4"}}
+
+        class Finished(object):
+            def join(self, timeout):
+                return None
+
+        finfindr_server._record_parallel_fallback(Finished(), holder, "grok-4", attempts)
+        self.assertEqual(attempts[0]["model"], "grok-4")
+        self.assertTrue(attempts[0]["ok"])
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Octopus hubbsorum\n"
+            "Common name: Hubbs' octopus\n"
+            "Confidence: medium\n"
+            "Candidate 1: Octopus hubbsorum | Hubbs' octopus | medium | brown body without eye spots\n"
+            "Candidate 2: Octopus bimaculatus | Two-spot octopus | low | eye spots\n"
+        )
+        body = self.post_photo().get_json()
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Octopus hubbsorum")
+        self.assertFalse(body["meta"]["fallback_used"])
+
+    def test_nocache_skips_the_model_reply_cache(self):
+        os.environ["FINFINDR_MODEL_CACHE"] = "1"
+        try:
+            self.post_photo()
+            cached_calls = len(self.captured["calls"])
+            self.post_photo()
+            self.assertEqual(len(self.captured["calls"]), cached_calls)
+            self.post_photo(nocache="1")
+            self.assertGreater(len(self.captured["calls"]), cached_calls)
+        finally:
+            os.environ["FINFINDR_MODEL_CACHE"] = "0"
+            finfindr_server.clear_model_cache()
 
     def test_model_cache_repeats_the_same_answer(self):
         os.environ["FINFINDR_MODEL_CACHE"] = "1"
