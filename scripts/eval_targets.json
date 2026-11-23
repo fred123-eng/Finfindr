@@ -2,7 +2,7 @@
   "confident_precision": {"min": 0.99},
   "false_accepts_per_100": {"max": 1},
   "correct_reject_rate": {"min": 0.98},
-  "false_reject_rate": {"max": 0.05},
+  "false_reject_rate": {"max": 0.01},
   "decoy_false_flag_rate": {"max": 0.02},
   "discovery_precision": {"min": 0.99},
   "discovery_recall": {"min": 0.80},

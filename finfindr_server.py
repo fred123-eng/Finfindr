@@ -15,6 +15,7 @@ import random
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 
@@ -818,7 +819,24 @@ async function handleFile(file) {
     }
 
     const resp = await fetch("/identify", { method: "POST", body: formData });
-    const parsed = await readJsonResponse(resp);
+    let parsed = await readJsonResponse(resp);
+    if (parsed.ok && parsed.data && parsed.data.job_id) {
+      const statusUrl = parsed.data.status_url || ("/identify/status/" + parsed.data.job_id);
+      const waitStarted = Date.now();
+      while (Date.now() - waitStarted < 260000) {
+        await new Promise(function (resolve) { setTimeout(resolve, 2000); });
+        const poll = await fetch(statusUrl);
+        const update = await readJsonResponse(poll);
+        if (!update.ok) { parsed = update; break; }
+        const job = update.data || {};
+        const title = card.querySelector(".progress-title");
+        if (title && job.progress) title.textContent = job.progress;
+        if (job.status === "done" || job.status === "timeout") {
+          parsed = { ok: true, data: job.result || {}, region_label: (job.result || {}).region_label };
+          break;
+        }
+      }
+    }
     clearInterval(progressTimer);
     const progressNote = card.querySelector(".progress-note");
     if (progressNote) progressNote.remove();
@@ -3101,45 +3119,82 @@ def _record_parallel_fallback(fallback_thread, holder, fallback_model, attempts)
     ))
 
 
-def _model_deadlines(request_started):
-    """When to stop waiting for grok-4.7, leaving time for the reference check.
+def model_call_timeout():
+    """Seconds each model is allowed. Both grok-4 and grok-4.7 get this. Default 180."""
+    return _env_seconds("XAI_MODEL_TIMEOUT", 180, 30, 240)
 
-    XAI_SLOW_DEADLINE is that wait. XAI_PRIMARY_TIMEOUT is accepted as the same
-    number so an older staging setting still applies. The fast model uses
-    XAI_FAST_TIMEOUT and is not held until the slow deadline.
-    """
-    budget_end = request_started + _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
-    if (os.environ.get("XAI_SLOW_DEADLINE") or "").strip():
-        cap = _env_seconds("XAI_SLOW_DEADLINE", 70, 15, 90)
-    else:
-        cap = _env_seconds("XAI_PRIMARY_TIMEOUT", 70, 15, 95)
-    slow_deadline = min(request_started + cap, budget_end - 15.0)
-    fast_cap = _env_seconds("XAI_FAST_TIMEOUT", 25, 8, 40)
-    return slow_deadline, fast_cap
+
+def job_wall_seconds():
+    """Hard cap for one identification. Default 240s, above the measured 109s max."""
+    return _env_seconds("FINFINDR_JOB_WALL", 240, 60, 360)
+
+
+_JOB_ID = contextvars.ContextVar("finfindr_job_id", default=None)
+
+
+def job_directory():
+    """Shared across gunicorn workers. In-memory storage is not, because workers do not share RAM."""
+    path = (os.environ.get("FINFINDR_JOB_DIR") or "").strip() or os.path.join(cache_dir(), "jobs")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _job_path(job_id):
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "", job_id or "")
+    return os.path.join(job_directory(), safe + ".json")
+
+
+def job_write(job_id, payload):
+    path = _job_path(job_id)
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+    os.replace(temporary, path)
+
+
+def job_read(job_id):
+    path = _job_path(job_id)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def job_update(job_id, **changes):
+    current = job_read(job_id) or {"id": job_id}
+    current.update(changes)
+    job_write(job_id, current)
+    return current
+
+
+def job_progress(text):
+    job_id = _JOB_ID.get()
+    if job_id and text:
+        job_update(job_id, status="running", progress=text)
 
 
 def _run_paired_models(jpeg_bytes, prompt, models, api_key, request_started, use_cache=True, on_fast=None):
-    """Run grok-4 and grok-4.7 together. Do not cancel the slow model early.
+    """Run every configured model to completion, then return.
 
-    grok-4's candidates are handed to on_fast as soon as they arrive so the
-    reference photos can be fetched while grok-4.7 is still thinking. If
-    grok-4.7 is still running at the slow deadline, the caller continues
-    with whoever has finished.
+    grok-4.7 is not abandoned because it is slower. The only time its answer
+    is missing is when that call errors or reaches the 180s client timeout.
+    Reference photos for grok-4 start when grok-4 returns, without stopping 4.7.
     """
-    slow_deadline, fast_cap = _model_deadlines(request_started)
+    del request_started
+    timeout = model_call_timeout()
     holder = {}
     threads = {}
-    fast_name = "grok-4" if "grok-4" in models else models[0]
+    fast_name = "grok-4" if "grok-4" in models else ""
+    job_progress("Asking both models")
 
     def launch(name):
-        role = "fast" if name == fast_name and len(models) > 1 else "slow"
-        timeout = fast_cap if role == "fast" else max(8.0, slow_deadline - time.monotonic())
-
-        def run(name=name, timeout=timeout, role=role):
+        def run(name=name):
             holder[name] = _call_vision_model(
                 jpeg_bytes, prompt, name, timeout, api_key, use_cache=use_cache
             )
-            if role == "fast" and holder[name].get("ok") and on_fast:
+            if name == fast_name and holder[name].get("ok") and on_fast:
                 try:
                     on_fast(holder[name])
                 except Exception:
@@ -3150,12 +3205,7 @@ def _run_paired_models(jpeg_bytes, prompt, models, api_key, request_started, use
     for name in models:
         launch(name)
     for name in models:
-        if name == fast_name and len(models) > 1:
-            threads[name].join(min(fast_cap + 0.5, max(0.2, slow_deadline - time.monotonic())))
-        else:
-            left = slow_deadline - time.monotonic()
-            if left > 0:
-                threads[name].join(left)
+        threads[name].join(timeout + 1.0)
     reports = []
     attempts = []
     for name in models:
@@ -3199,15 +3249,19 @@ def verification_enabled(debug, raw):
 
 
 def verify_timeout_cap():
-    """Seconds allowed for the reference-photo model call. FINFINDR_VERIFY_TIMEOUT overrides 12."""
+    """Seconds for the reference check. Never shortened to save time. Default 60.
+
+    A configured value below 45 is raised to 45. The old 12s cap was cutting
+    the check off while the job still had time.
+    """
     raw = (os.environ.get("FINFINDR_VERIFY_TIMEOUT") or "").strip()
     if not raw:
-        return 12.0
+        return 60.0
     try:
         value = float(raw)
     except ValueError:
-        return 25.0
-    return min(40.0, max(5.0, value))
+        return 60.0
+    return min(120.0, max(45.0, value))
 
 
 def verify_image_px():
@@ -3223,15 +3277,14 @@ def verify_image_px():
 
 
 def verify_call_budget(request_started):
-    """Seconds left for verification. None if fewer than 6 seconds remain.
+    """The full reference-check allowance. It is not trimmed because a model ran long.
 
-    The configured cap is not allowed to end the check while the request still
-    has time. Whatever is left in the budget, up to 40s, is what the call gets.
+    None only when the job wall is already exhausted.
     """
     left = _time_left(request_started) - 2.0
-    if left < 6.0:
+    if left < 15.0:
         return None
-    return min(40.0, left)
+    return min(verify_timeout_cap(), left)
 
 
 def _shrink_jpeg(jpeg_bytes, limit):
@@ -3303,8 +3356,7 @@ def _verify_skip_reason(result):
 
 
 def _time_left(request_started):
-    budget = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
-    return request_started + budget - time.monotonic()
+    return request_started + job_wall_seconds() - time.monotonic()
 
 
 def load_species_for_request(region, lat, lng, mode, exclude_observation_id=None):
@@ -3818,7 +3870,7 @@ def _attach_reference_photos(candidates, lat, lng, exclude_observation_id, deadl
         attached = []
         for future, candidate in zip(futures, candidates):
             try:
-                attached.append(future.result(timeout=2.5))
+                attached.append(future.result(timeout=12.0))
             except Exception:
                 app.logger.warning("reference photo timed out for %s", candidate.get("scientific_name"))
                 attached.append(candidate)
@@ -4715,7 +4767,7 @@ def read_identify_request():
 
 def stamp_meta(meta, request_started):
     stamped = dict(meta or {})
-    stamped["budget_s"] = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
+    stamped["budget_s"] = job_wall_seconds()
     if request_started is None:
         stamped["total_ms"] = 0
     else:
@@ -4865,8 +4917,8 @@ def _unsure_crash_body():
 
 
 def response_wall_seconds():
-    """Hard cap for the HTTP response. Whitespace heartbeats must not hold it open longer."""
-    return _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115) + 5.0
+    """Hard cap for a synchronous response. The async job uses the same wall."""
+    return job_wall_seconds()
 
 
 def _wall_timeout_response(started):
@@ -4946,16 +4998,115 @@ def health():
     })
 
 
+def _request_wants_sync():
+    flag = (request.args.get("sync") or "").strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        return True
+    payload = request.get_json(silent=True) if request.is_json else None
+    if isinstance(payload, dict) and str(payload.get("sync") or "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    if str(request.form.get("sync") or "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    return False
+
+
+def _timeout_result():
+    """An over-wall job is unsure. It is never a confident identification."""
+    meta = apply_verify_rates(
+        stamp_meta({"verify_skipped": "wall", "fallback_used": False, "attempts": []}, None),
+        False, False, 0, 0, "wall",
+    )
+    return {
+        "result_text": "",
+        "certainty": "unsure",
+        "photo_quality": "good",
+        "candidates": [],
+        "discovery": None,
+        "message": "Identification is taking too long. Please try again.",
+        "reason": "timeout",
+        "meta": meta,
+    }
+
+
+def _response_json(response):
+    if isinstance(response, tuple):
+        response = response[0]
+    try:
+        data = response.get_json(silent=True)
+    except Exception:
+        data = None
+    return data if isinstance(data, dict) else None
+
+
+def _force_unsure(data):
+    data = dict(data or {})
+    data["certainty"] = "unsure"
+    data["reason"] = "timeout"
+    data["message"] = "Identification is taking too long. Please try again."
+    data["candidates"] = []
+    data["discovery"] = None
+    meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+    meta["verify_skipped"] = meta.get("verify_skipped") or "wall"
+    data["meta"] = meta
+    return data
+
+
+def _execute_job(job_id, image_bytes, fields):
+    _JOB_ID.set(job_id)
+    started = time.monotonic()
+    job_update(job_id, status="running", progress="Identifying")
+    with app.app_context():
+        try:
+            response = _identify_http(image_bytes, fields)
+            data = _response_json(response) or _timeout_result()
+        except Exception:
+            app.logger.exception("identification job failed")
+            data = _timeout_result()
+    if time.monotonic() - started > job_wall_seconds() or data.get("certainty") == "confident" and time.monotonic() - started > job_wall_seconds():
+        data = _force_unsure(data)
+    elif time.monotonic() - started > job_wall_seconds():
+        data = _force_unsure(data)
+    job_update(job_id, status="done" if data.get("reason") != "timeout" else "timeout", progress="Done", result=data)
+
+
 @app.route("/identify", methods=["POST"])
 def identify():
-    """Run identification on a worker thread and send bytes before a proxy gives up.
+    """POST returns a job id. ?sync=1 waits and returns the identification itself.
 
-    A silent response longer than about 30s becomes a Cloudflare 520. Fast
-    answers return normally. Longer ones stream whitespace, which JSON parsers
-    ignore, and then the JSON body. The stream stops at the budget plus 5
-    seconds even if the worker is still going, so a heartbeat cannot hold the
-    connection open past about 115 seconds.
+    The browser polls GET /identify/status/<job_id>. The work runs on a thread,
+    and the job file is on disk so any gunicorn worker can read it.
     """
+    if not _request_wants_sync():
+        saw_image, image_bytes, fields = read_identify_request()
+        if not saw_image:
+            return jsonify({
+                "error": "No image uploaded",
+                "meta": stamp_meta({}, time.monotonic()),
+            }), 400
+        if not prepare_image(image_bytes):
+            return jsonify({
+                "error": "Please upload a valid photo",
+                "meta": stamp_meta({}, time.monotonic()),
+            }), 400
+        job_id = uuid.uuid4().hex
+        job_write(job_id, {
+            "id": job_id,
+            "status": "pending",
+            "progress": "Queued",
+            "created_at": time.time(),
+            "result": None,
+        })
+        worker = threading.Thread(
+            target=_execute_job, args=(job_id, image_bytes, fields), name="finfindr-job", daemon=True,
+        )
+        worker.start()
+        return jsonify({
+            "job_id": job_id,
+            "status": "pending",
+            "progress": "Queued",
+            "status_url": "/identify/status/" + job_id,
+        }), 202
+
     started = time.monotonic()
     holder = {}
 
@@ -4988,15 +5139,37 @@ def identify():
     )
 
 
-def _identify_http():
+@app.route("/identify/status/<job_id>", methods=["GET"])
+def identify_status(job_id):
+    job = job_read(job_id)
+    if not job:
+        return jsonify({"error": "Unknown identification job.", "meta": stamp_meta({}, None)}), 404
+    age = time.time() - float(job.get("created_at") or time.time())
+    status = job.get("status") or "pending"
+    result = job.get("result")
+    if status in ("pending", "running") and age > job_wall_seconds():
+        status = "timeout"
+        result = _force_unsure(result if isinstance(result, dict) else _timeout_result())
+    body = {
+        "job_id": job_id,
+        "status": status,
+        "progress": job.get("progress") or "",
+    }
+    if result is not None:
+        body["result"] = result
+    return jsonify(body)
+
+
+def _identify_http(image_bytes=None, fields=None):
     g.identify_started = time.monotonic()
     begin_request_stats()
-    saw_image, image_bytes, fields = read_identify_request()
-    if not saw_image:
-        return jsonify({
-            "error": "No image uploaded",
-            "meta": stamp_meta({}, g.identify_started),
-        }), 400
+    if image_bytes is None:
+        saw_image, image_bytes, fields = read_identify_request()
+        if not saw_image:
+            return jsonify({
+                "error": "No image uploaded",
+                "meta": stamp_meta({}, g.identify_started),
+            }), 400
 
     prepared = prepare_image(image_bytes)
     if not prepared:
@@ -5029,7 +5202,7 @@ def _identify_http():
         }), 500
 
     request_started = g.identify_started
-    set_call_deadline(request_started + _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115))
+    set_call_deadline(request_started + job_wall_seconds())
     species_payload, list_fetch_ms = load_species_alongside_model(
         region, lat, lng, mode, exclude_observation
     )
@@ -5189,8 +5362,9 @@ def _identify_http():
     elif verify_call_budget(request_started) is None:
         verify_skipped = "no_time"
     else:
+        job_progress("Checking reference photos")
         fetch_started = time.perf_counter()
-        fetch_cap = min(3.0, _time_left(request_started) - 6.0)
+        fetch_cap = min(20.0, max(0.0, _time_left(request_started) - 8.0))
         reference_urls = []
         if fetch_cap < 0.4:
             verify_skipped = "no_time"

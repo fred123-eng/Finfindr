@@ -52,7 +52,7 @@ DEFAULT_TARGETS = {
     "confident_precision": {"min": 0.99},
     "false_accepts_per_100": {"max": 1},
     "correct_reject_rate": {"min": 0.98},
-    "false_reject_rate": {"max": 0.05},
+    "false_reject_rate": {"max": 0.01},
     "decoy_false_flag_rate": {"max": 0.02},
     "discovery_precision": {"min": 0.99},
     "discovery_recall": {"min": 0.80},
@@ -1002,7 +1002,8 @@ def identify_photo(session, base_url, image, item):
         base_url.rstrip("/") + "/identify",
         files={"image": ("eval.jpg", image, "image/jpeg")},
         data=data,
-        timeout=130,
+        params={"sync": "1"},
+        timeout=300,
     )
     latency_ms = int(round((time.perf_counter() - started) * 1000))
     try:

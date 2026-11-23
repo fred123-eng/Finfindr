@@ -235,7 +235,7 @@ class IdentifyTests(unittest.TestCase):
         return FakeResponse(body)
 
     def post_photo(self, **fields):
-        data = {"image": (io.BytesIO(jpeg_bytes()), "reef.jpg")}
+        data = {"image": (io.BytesIO(jpeg_bytes()), "reef.jpg"), "sync": "1"}
         data.update(fields)
         return self.client.post("/identify", data=data, content_type="multipart/form-data")
 
@@ -400,7 +400,7 @@ class IdentifyTests(unittest.TestCase):
         self.assertAlmostEqual(found[1], -110.3128, places=2)
         response = self.client.post(
             "/identify",
-            data={"image": (io.BytesIO(photo), "lapaz.jpg"), "region": "my-location"},
+            data={"image": (io.BytesIO(photo), "lapaz.jpg"), "region": "my-location", "sync": "1"},
             content_type="multipart/form-data",
         )
         self.assertEqual(response.status_code, 200)
@@ -413,7 +413,7 @@ class IdentifyTests(unittest.TestCase):
         photo = jpeg_bytes(gps=(21.3, -157.8))
         response = self.client.post(
             "/identify",
-            data={"image": (io.BytesIO(photo), "hawaii.jpg"), "region": "sea-of-cortez"},
+            data={"image": (io.BytesIO(photo), "hawaii.jpg"), "region": "sea-of-cortez", "sync": "1"},
             content_type="multipart/form-data",
         )
         self.assertEqual(response.get_json()["region_label"], "Sea of Cortez / La Paz")
@@ -533,7 +533,7 @@ class IdentifyTests(unittest.TestCase):
         wide = jpeg_bytes(2000, 1000)
         response = self.client.post(
             "/identify",
-            data={"image": (io.BytesIO(wide), "wide.jpg")},
+            data={"image": (io.BytesIO(wide), "wide.jpg"), "sync": "1"},
             content_type="multipart/form-data",
         )
         self.assertEqual(response.get_json()["meta"]["image_px"], "1024x512")
@@ -552,7 +552,7 @@ class IdentifyTests(unittest.TestCase):
             self.assertEqual(self.captured["json"]["model"], "grok-4.5")
             sized = self.client.post(
                 "/identify",
-                data={"image": (io.BytesIO(wide), "wide.jpg")},
+                data={"image": (io.BytesIO(wide), "wide.jpg"), "sync": "1"},
                 content_type="multipart/form-data",
             )
             self.assertEqual(sized.get_json()["meta"]["image_px"], "800x400")
@@ -625,8 +625,10 @@ class IdentifyTests(unittest.TestCase):
         self.assertTrue(by_model["grok-4"]["ok"])
         slow = next(call for call in self.captured["calls"] if call["model"] == "grok-4.7")
         fast = next(call for call in self.captured["calls"] if call["model"] == "grok-4")
-        self.assertGreaterEqual(slow["timeout"], 60)
-        self.assertLessEqual(fast["timeout"], 30)
+        self.assertGreaterEqual(slow["timeout"], 150)
+        self.assertLessEqual(slow["timeout"], 180)
+        self.assertGreaterEqual(fast["timeout"], 150)
+        self.assertLessEqual(fast["timeout"], 180)
         self.assertEqual(fast["temperature"], 0)
         self.assertEqual(fast["seed"], 0)
         self.assertIn("Cortez Rainbow Wrasse", body["result_text"])
@@ -855,7 +857,7 @@ class IdentifyTests(unittest.TestCase):
         self.assertEqual(body["candidates"], [])
         self.assertEqual(body["certainty"], "unsure")
         self.assertIn("photo_invalid", body["meta"]["evidence"])
-        self.assertEqual(body["meta"]["budget_s"], 110)
+        self.assertEqual(body["meta"]["budget_s"], 240)
         self.assertIsInstance(body["meta"]["total_ms"], int)
         self.assertIn("external_calls", body["meta"])
         self.assertIn("inat_throttled", body["meta"])
@@ -1131,7 +1133,7 @@ class IdentifyTests(unittest.TestCase):
         self.assertTrue(agreed["meta"]["verify_used"])
         self.assertTrue(agreed["meta"]["verify_succeeded"])
         self.assertEqual(agreed["meta"]["verify_success_rate"], 1)
-        self.assertEqual(agreed["meta"]["verify_timeout_s"], 12)
+        self.assertEqual(agreed["meta"]["verify_timeout_s"], 60)
         self.assertEqual(agreed["meta"]["verify_skipped"], "")
 
         self.captured["verify_text"] = (
@@ -1318,8 +1320,8 @@ class IdentifyTests(unittest.TestCase):
         body = response.get_json()
         self.assertIn("total_ms", body["meta"])
         self.assertIsInstance(body["meta"]["total_ms"], int)
-        self.assertLess(body["meta"]["total_ms"], 110000)
-        self.assertEqual(body["meta"]["budget_s"], 110)
+        self.assertLess(body["meta"]["total_ms"], 240000)
+        self.assertEqual(body["meta"]["budget_s"], 240)
 
 
     def test_inat_throttle_and_retry_after(self):
@@ -1493,7 +1495,7 @@ class IdentifyTests(unittest.TestCase):
         self.assertNotIn("catus", blob)
         self.assertNotIn("Domestic", blob)
         self.assertNotIn("high", blob.lower())
-        self.assertEqual(body["meta"]["budget_s"], 110)
+        self.assertEqual(body["meta"]["budget_s"], 240)
         self.assertIsInstance(body["meta"]["total_ms"], int)
         self.assertEqual(body["meta"]["verify_pass_rate"], 0)
         self.assertEqual(body["meta"]["verify_success_rate"], 0)
@@ -1611,7 +1613,7 @@ class IdentifyTests(unittest.TestCase):
         photo = buffer.getvalue()
         form = self.client.post(
             "/identify",
-            data={"image": (io.BytesIO(photo), "reef.jpg"), "region": "sea-of-cortez"},
+            data={"image": (io.BytesIO(photo), "reef.jpg"), "region": "sea-of-cortez", "sync": "1"},
             content_type="multipart/form-data",
         )
         form_payload = self.captured["json"]
@@ -1620,6 +1622,7 @@ class IdentifyTests(unittest.TestCase):
         js = self.client.post("/identify", json={
             "image_base64": base64.b64encode(photo).decode("ascii"),
             "region": "sea-of-cortez",
+            "sync": "1",
         })
         js_body = js.get_json()
         self.assertEqual(form.status_code, 200)
@@ -1694,6 +1697,7 @@ class IdentifyTests(unittest.TestCase):
             "lat": "24.2",
             "lng": "-110.3",
             "nocache": "1",
+            "sync": "1",
         }).get_json()
         self.assertEqual(same["candidates"][0]["scientific_name"], body["candidates"][0]["scientific_name"])
         self.assertEqual(same["certainty"], body["certainty"])
@@ -1765,6 +1769,7 @@ class IdentifyTests(unittest.TestCase):
             "image_base64": base64.b64encode(jpeg_bytes()).decode("ascii"),
             "region": "sea-of-cortez",
             "nocache": "1",
+            "sync": "1",
         }).get_json()
         for body in (form, js):
             self.assertEqual(body["reason"], "not_marine")
@@ -2121,11 +2126,9 @@ class IdentifyTests(unittest.TestCase):
     def test_long_primary_gives_verify_the_time_that_is_left(self):
         started = time.monotonic() - 70
         seconds = finfindr_server.verify_call_budget(started)
-        self.assertGreater(seconds, 12)
-        self.assertLessEqual(seconds, 40)
+        self.assertGreaterEqual(seconds, 45)
         quick = finfindr_server.verify_call_budget(time.monotonic())
-        self.assertGreater(quick, 12)
-        self.assertLessEqual(quick, 40)
+        self.assertGreaterEqual(quick, 45)
 
     def test_unresolved_mammal_or_bird_is_not_rejected(self):
         sea_lion = {
@@ -2270,6 +2273,27 @@ class IdentifyTests(unittest.TestCase):
         self.assertIn("try again", body["message"].lower())
         self.assertLess(time.monotonic() - started, 2.0)
 
+    def test_async_job_returns_an_id_then_the_result(self):
+        response = self.client.post(
+            "/identify",
+            data={"image": (io.BytesIO(jpeg_bytes()), "reef.jpg")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 202)
+        job = response.get_json()
+        self.assertTrue(job["job_id"])
+        deadline = time.time() + 8
+        status = None
+        while time.time() < deadline:
+            status = self.client.get("/identify/status/" + job["job_id"]).get_json()
+            if status["status"] in ("done", "timeout"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(status["status"], "done")
+        self.assertEqual(status["result"]["candidates"][0]["scientific_name"], "Thalassoma lucasanum")
+        self.assertIsInstance(status["result"]["meta"], dict)
+        self.assertNotEqual(status["result"]["certainty"], "confident")
+
     def test_identify_meta_is_never_null(self):
         missing = self.client.post("/identify", data={}).get_json()
         self.assertIsInstance(missing["meta"], dict)
@@ -2286,8 +2310,8 @@ class IdentifyTests(unittest.TestCase):
             os.environ.pop("XAI_PRIMARY_TIMEOUT", None)
             self.fail_timeout = set()
         slow = next(call for call in self.captured["calls"] if call["model"] == "grok-4.7")
-        self.assertGreaterEqual(slow["timeout"], 90)
-        self.assertLessEqual(slow["timeout"], 95)
+        self.assertGreaterEqual(slow["timeout"], 150)
+        self.assertLessEqual(slow["timeout"], 180)
 
     def test_fromia_contradiction_is_still_no_match(self):
         self.inat_handler = self._taxon_photos
@@ -2318,7 +2342,7 @@ class EvalScoreTests(unittest.TestCase):
         self.assertEqual(targets["confident_precision"]["min"], 0.99)
         self.assertEqual(targets["false_accepts_per_100"]["max"], 1)
         self.assertEqual(targets["correct_reject_rate"]["min"], 0.98)
-        self.assertEqual(targets["false_reject_rate"]["max"], 0.05)
+        self.assertEqual(targets["false_reject_rate"]["max"], 0.01)
         self.assertEqual(targets["decoy_false_flag_rate"]["max"], 0.02)
         self.assertEqual(targets["discovery_precision"]["min"], 0.99)
         self.assertEqual(targets["discovery_recall"]["min"], 0.80)
