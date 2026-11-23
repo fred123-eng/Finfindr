@@ -211,6 +211,9 @@ class IdentifyTests(unittest.TestCase):
         self.assertIn('class="test-options" hidden', page)
         self.assertIn('params.get("debug") === "1"', page)
         self.assertIn('id="modelInput"', page)
+        self.assertIn("Checking reference photos", page)
+        self.assertIn("Usually under a minute", page)
+        self.assertIn("Common name unavailable", page)
 
     def test_missing_and_invalid_photos_stay_json(self):
         missing = self.client.post("/identify", data={})
@@ -251,7 +254,8 @@ class IdentifyTests(unittest.TestCase):
         self.assertEqual(self.captured["json"]["model"], "grok-4.7")
         self.assertEqual(body["meta"]["model"], "grok-4.7")
         self.assertEqual(body["meta"]["image_px"], "80x60")
-        self.assertEqual(body["certainty"], "likely")
+        self.assertEqual(body["certainty"], "confident")
+        self.assertEqual(body["meta"]["verify_skipped"], "far_apart")
         self.assertFalse(body["meta"]["verify_used"])
         self.assertEqual(body["candidates"][0]["scientific_name"], "Thalassoma lucasanum")
         self.assertEqual(body["region_label"], "Sea of Cortez / La Paz")
@@ -675,6 +679,14 @@ class IdentifyTests(unittest.TestCase):
             candidates,
         )
         self.assertEqual(finfindr_server.certainty_for(candidates, agreed), "confident")
+        self.assertFalse(finfindr_server.candidates_far_apart(candidates))
+        self.assertTrue(finfindr_server.candidates_far_apart(candidates[:1]))
+        shown = finfindr_server.public_candidates(
+            [{"scientific_name": "Microspathodon dorsalis", "common_name": "", "confidence": "medium", "trait": "forehead bump", "reference_photo": None}],
+            None,
+        )
+        self.assertEqual(shown[0]["common_name"], "Giant Damselfish")
+        self.assertEqual(shown[0]["scientific_name"], "Microspathodon dorsalis")
         self.assertTrue(finfindr_server.verification_enabled(False, None))
         self.assertFalse(finfindr_server.verification_enabled(True, "0"))
         os.environ["FINFINDR_VERIFY"] = "0"
@@ -722,9 +734,18 @@ class IdentifyTests(unittest.TestCase):
             photos = finfindr_server.fetch_reference_photos("Sphoeroides annulatus", 24.1, -110.3, "50")
         self.assertTrue(photos)
         self.assertEqual(photos[0]["attribution"], "Alex Example")
-        self.assertIn("medium.jpg", photos[0]["url"])
+        self.assertIn("small.jpg", photos[0]["url"])
         self.assertEqual(photos[0]["license"], "CC BY-NC")
         self.assertTrue(photos[0]["source_url"].startswith("https://www.inaturalist.org/photos/"))
+
+    def test_favicon_and_identify_errors_are_not_html(self):
+        favicon = self.client.get("/favicon.ico")
+        self.assertEqual(favicon.status_code, 204)
+        with patch("finfindr_server.prepare_image", side_effect=RuntimeError("boom")):
+            response = self.post_photo()
+        self.assertEqual(response.status_code, 500)
+        self.assertTrue(response.is_json)
+        self.assertEqual(response.get_json()["error"], "Something went wrong. Please try again.")
 
     def test_missing_api_key_is_json(self):
         os.environ.pop("XAI_API_KEY", None)
