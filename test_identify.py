@@ -61,6 +61,7 @@ class FakeResponse:
         self.ok = 200 <= status < 300
         self._payload = payload
         self.text = json.dumps(payload)
+        self.headers = {}
 
     def json(self):
         return self._payload
@@ -142,7 +143,10 @@ class IdentifyTests(unittest.TestCase):
         os.environ.pop("FINFINDR_VERIFY", None)
         os.environ.pop("FINFINDR_VERIFY_TIMEOUT", None)
         os.environ.pop("FINFINDR_VERIFY_IMAGE_PX", None)
+        os.environ["FINFINDR_INAT_MIN_INTERVAL"] = "0"
         finfindr_server._SPECIES_CACHE.clear()
+        finfindr_server._INAT_JSON_CACHE.clear()
+        finfindr_server._INAT_NEXT_AT = 0.0
         finfindr_server._SPECIES_INFLIGHT.clear()
         finfindr_server._inat_cache.clear()
         finfindr_server._PHOTO_CACHE.clear()
@@ -287,6 +291,7 @@ class IdentifyTests(unittest.TestCase):
         self.assertIn("slender cylindrical arms", prompt)
         self.assertIn("thick inflated body", prompt)
         self.assertIn("hint, not a menu", prompt)
+        self.assertIn("propose up to 2 off_list species", prompt)
         self.assertEqual(self.captured["json"]["temperature"], 0)
         self.assertEqual(self.captured["json"]["model"], "grok-4.7")
         self.assertEqual(body["meta"]["model"], "grok-4.7")
@@ -598,7 +603,9 @@ class IdentifyTests(unittest.TestCase):
         self.assertFalse(body["meta"]["attempts"][0]["ok"])
         self.assertEqual(body["meta"]["attempts"][0]["error"], "timeout")
         self.assertTrue(body["meta"]["attempts"][1]["ok"])
-        self.assertGreaterEqual(self.captured["calls"][0]["timeout"], 70)
+        self.assertGreaterEqual(self.captured["calls"][0]["timeout"], 45)
+        self.assertLessEqual(self.captured["calls"][0]["timeout"], 60)
+        self.assertLessEqual(self.captured["calls"][0]["timeout"] + 25 + 25, 110)
         self.assertLessEqual(self.captured["calls"][1]["timeout"], 25)
         self.assertIn("Cortez Rainbow Wrasse", body["result_text"])
 
@@ -652,6 +659,7 @@ class IdentifyTests(unittest.TestCase):
         self.get_patch.stop()
         finfindr_server._SPECIES_CACHE.clear()
         finfindr_server._SPECIES_WAIT_RESULT.clear()
+        finfindr_server._INAT_JSON_CACHE.clear()
         seen = {"n": 0}
 
         def counting(url, params=None, **kwargs):
@@ -661,14 +669,16 @@ class IdentifyTests(unittest.TestCase):
         try:
             with patch("finfindr_server.http.get", side_effect=counting):
                 partial = finfindr_server.load_species_list(query, "short", 5)
-                self.assertFalse(partial["complete"])
+                self.assertTrue(partial["complete"])
+                self.assertEqual(partial["source"], "curated")
                 names = [item["scientific"] for item in partial["species"]]
-                self.assertNotIn("Thalassoma lucasanum", names)
+                self.assertIn("Thalassoma lucasanum", names)
                 self.assertIn("Hydrophis platurus", names)
-                self.assertIsNone(finfindr_server._species_cache_get(("short", "place:122897")))
+                cached = finfindr_server._species_cache_get(("short", query["key"]))
+                self.assertTrue(cached and cached.get("source") == "curated")
                 before = seen["n"]
                 finfindr_server.load_species_list(query, "short", 5)
-                self.assertGreater(seen["n"], before)
+                self.assertEqual(seen["n"], before)
         finally:
             self.get_patch.start()
 
@@ -821,6 +831,10 @@ class IdentifyTests(unittest.TestCase):
         self.obs_calls = []
 
         def handler(url, params):
+            if "obis.org" in url:
+                return FakeResponse({"total": 0, "results": []})
+            if "fishbase" in url:
+                return FakeResponse({"data": []})
             if "observations" in url:
                 self.obs_calls.append(params)
                 if str(params.get("per_page")) == "1":
@@ -1075,6 +1089,7 @@ class IdentifyTests(unittest.TestCase):
             "Decision: Zebrasoma xanthurum\nCertainty: confident\nTrait: yellow tail\n"
         )
         finfindr_server._PHOTO_CACHE.clear()
+        finfindr_server._INAT_JSON_CACHE.clear()
         agreed = self.post_photo(lat="24.2", lng="-110.3").get_json()
         self.assertEqual(agreed["certainty"], "confident")
         self.assertTrue(agreed["meta"]["verify_used"])
@@ -1191,6 +1206,10 @@ class IdentifyTests(unittest.TestCase):
 
     def test_off_list_species_can_be_a_range_extension_but_not_a_local_confident_match(self):
         def handler(url, params):
+            if "obis.org" in url:
+                return FakeResponse({"total": 0, "results": []})
+            if "fishbase" in url:
+                return FakeResponse({"data": []})
             if "taxa" in url:
                 name = params.get("q") or ""
                 if name.lower().startswith("notareal"):
@@ -1241,6 +1260,7 @@ class IdentifyTests(unittest.TestCase):
 
         self.record_count = 12
         finfindr_server._PHOTO_CACHE.clear()
+        finfindr_server._INAT_JSON_CACHE.clear()
         local = self.post_photo(lat="24.2", lng="-110.3").get_json()
         self.assertIsNone(local["discovery"])
         self.assertNotEqual(local["certainty"], "confident")
@@ -1265,6 +1285,125 @@ class IdentifyTests(unittest.TestCase):
         self.assertIsInstance(body["meta"]["total_ms"], int)
         self.assertLess(body["meta"]["total_ms"], 110000)
         self.assertEqual(body["meta"]["budget_s"], 110)
+
+
+    def test_inat_throttle_and_retry_after(self):
+        os.environ["FINFINDR_INAT_MIN_INTERVAL"] = "0.2"
+        finfindr_server._INAT_NEXT_AT = 0.0
+        calls = {"n": 0}
+
+        def paced(url, params=None, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                response = FakeResponse({}, status=429)
+                response.headers = {"Retry-After": "0"}
+                return response
+            return FakeResponse({"total_results": 3, "results": []})
+
+        started = time.perf_counter()
+        try:
+            with patch("finfindr_server.http.get", side_effect=paced):
+                payload = finfindr_server._inat_get(
+                    "https://api.inaturalist.org/v1/observations",
+                    {"taxon_name": "Abudefduf troschelii", "per_page": 1},
+                    (3, 8),
+                    {"Accept": "application/json"},
+                )
+                finfindr_server._inat_get(
+                    "https://api.inaturalist.org/v1/taxa",
+                    {"q": "Abudefduf troschelii"},
+                    (3, 8),
+                    {"Accept": "application/json"},
+                )
+        finally:
+            os.environ["FINFINDR_INAT_MIN_INTERVAL"] = "0"
+        self.assertEqual(payload["total_results"], 3)
+        self.assertGreaterEqual(calls["n"], 3)
+        self.assertGreaterEqual(time.perf_counter() - started, 0.2)
+
+    def test_exclude_observation_id_is_sent_as_not_id(self):
+        response = self.post_photo(lat="24.2", lng="-110.3", exclude_observation_id="4242")
+        self.assertEqual(response.status_code, 200)
+        listed = [call for call in self.species_calls if str(call.get("not_id") or "") == "4242"]
+        self.assertTrue(listed)
+
+    def test_infrastructure_failure_keeps_the_model_confidence(self):
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Abudefduf troschelii\n"
+            "Common name: Panamic sergeant major\n"
+            "Confidence: high\n"
+            "Candidate 1: Abudefduf troschelii | Panamic sergeant major | high | five black bars\n"
+            "Candidate 2: Abudefduf saxatilis | Sergeant major | medium | a yellow back\n"
+        )
+        self.inat_handler = self._taxon_photos
+        self.captured["verify_raises"] = "timeout"
+        try:
+            body = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        finally:
+            self.captured.pop("verify_raises", None)
+        self.assertEqual(body["meta"]["verify_skipped"], "timeout")
+        self.assertEqual(body["certainty"], "likely")
+        self.assertEqual(body["candidates"][0]["confidence"], "high")
+        self.assertIsNone(body["discovery"])
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Abudefduf troschelii")
+
+    def test_color_contradiction_becomes_no_match(self):
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Phataria unifascialis\n"
+            "Common name: Blue Sea Star\n"
+            "Confidence: high\n"
+            "Notes: A red mesh star.\n"
+            "Candidate 1: Phataria unifascialis | Blue Sea Star | high | red mesh pattern\n"
+        )
+        body = self.post_photo().get_json()
+        self.assertEqual(body["discovery"]["type"], "no_match")
+        self.assertEqual(body["certainty"], "unsure")
+        self.assertTrue(finfindr_server.colors_contradict("red mesh pattern", "Blue Sea Star"))
+        self.assertFalse(finfindr_server.colors_contradict("blue arms", "Blue Sea Star"))
+
+    def test_candidates_are_sorted_by_confidence(self):
+        shown = finfindr_server.public_candidates([
+            {"scientific_name": "Aaa aaa", "common_name": "Low fish", "confidence": "low", "trait": "plain"},
+            {"scientific_name": "Bbb bbb", "common_name": "Medium fish", "confidence": "medium", "trait": "barred"},
+        ], None)
+        self.assertEqual([item["scientific_name"] for item in shown], ["Bbb bbb", "Aaa aaa"])
+
+    def test_fallback_model_cannot_be_confident(self):
+        self.fail_timeout = {"grok-4.7"}
+        self.inat_handler = self._taxon_photos
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Thalassoma lucasanum\n"
+            "Confidence: high\n"
+            "Candidate 1: Thalassoma lucasanum | Cortez Rainbow Wrasse | high | yellow tail\n"
+            "Candidate 2: Bodianus diplotaenia | Mexican hogfish | medium | red head\n"
+        )
+        self.captured["verify_text"] = (
+            "Decision: Thalassoma lucasanum\nCertainty: confident\nTrait: a yellow tail unlike the red head\n"
+        )
+        body = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertTrue(body["meta"]["fallback_used"])
+        self.assertNotEqual(body["certainty"], "confident")
+        self.assertFalse(finfindr_server.passing_verification({
+            "decision": "Thalassoma lucasanum",
+            "scientific_name": "Thalassoma lucasanum",
+            "certainty": "confident",
+            "trait": "similar",
+        }))
+
+    def test_get_identify_is_json_405(self):
+        response = self.client.get("/identify")
+        self.assertEqual(response.status_code, 405)
+        self.assertTrue(response.is_json)
+        self.assertIn("error", response.get_json())
+
+    def test_model_timeouts_leave_room_for_fallback_and_verification(self):
+        primary, fallback = finfindr_server.plan_model_timeouts(110, 80, 25, 25, True)
+        self.assertGreater(primary, 0)
+        self.assertGreater(fallback, 0)
+        self.assertLessEqual(primary + fallback + 25, 110)
 
 
 class EvalScoreTests(unittest.TestCase):
@@ -1485,6 +1624,38 @@ class EvalScoreTests(unittest.TestCase):
         self.assertEqual(len(report["verified"]["discovery_flips"]), 1)
         self.assertEqual(report["verified"]["discovery_precision"], 1)
         self.assertLess(report["verified"]["consistency"], 1)
+
+    def test_synonyms_errors_and_server_range_rule(self):
+        self.assertTrue(eval_region.names_equivalent("Thalassoma lucasanum", "Thalassoma lucasanum", []))
+        self.assertTrue(eval_region.names_equivalent(
+            "Thalassoma grammaticum", "Thalassoma lucasanum", ["Thalassoma grammaticum"]
+        ))
+        self.assertEqual(eval_region.observation_id_from_source(
+            "https://www.inaturalist.org/observations/4242"
+        ), "4242")
+        item = self._item(synonyms=["Abudefduf declivifrons"], source_url="https://www.inaturalist.org/observations/99")
+        row = eval_region.answer_from_response(
+            self._body(candidates=[{
+                "scientific_name": "Abudefduf declivifrons",
+                "common_name": "Night sergeant",
+                "trait": "dark bars",
+            }], meta={"range_km": 100, "range_max": 0, "range_rule": "no records"}),
+            item,
+            1,
+            10,
+            status=500,
+        )
+        row["klass"] = "error"
+        row["errored"] = True
+        self.assertTrue(row["species_correct"])
+        targets, path = eval_region.load_targets()
+        good = eval_region.answer_from_response(self._body(), self._item(), 1, 10)
+        good["server_range_km"] = 100
+        good["server_range_max"] = 0
+        report = eval_region.build_report([good, row], "qa", targets, path, 1)
+        self.assertGreaterEqual(report["verified"]["errored"], 1)
+        self.assertEqual(report["targets_result"]["checks"]["range_rule"]["result"], "pass")
+        self.assertGreater(report["verified"]["false_reject_rate"], 0)
 
 
 if __name__ == "__main__":

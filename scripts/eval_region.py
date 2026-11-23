@@ -32,6 +32,7 @@ import statistics
 import sys
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 os.environ.setdefault("FINFINDR_PREFETCH", "0")
@@ -221,7 +222,69 @@ def normalize_item(raw):
         "nearest_known_record_km": _optional_float(_cell(raw, "nearest_known_record_km")),
         "nearest_known_record_source": _cell(raw, "nearest_known_record_source"),
         "expected_traits": split_list(_cell(raw, "expected_traits")),
+        "synonyms": _synonyms_from_row(raw),
     }
+
+
+def _synonyms_from_row(raw):
+    names = split_list(_cell(raw, "synonyms", "synonym"), semicolon=True)
+    notes = _cell(raw, "notes")
+    match = re.search(r"synonyms?\s*:\s*([^\n]+)", notes, re.IGNORECASE)
+    if match:
+        names.extend(split_list(match.group(1)))
+    seen = []
+    for name in names:
+        if name and name not in seen:
+            seen.append(name)
+    return seen
+
+
+def observation_id_from_source(url):
+    match = re.search(r"inaturalist\.org/observations/(\d+)", url or "")
+    return match.group(1) if match else ""
+
+
+def names_equivalent(guess, truth, synonyms=None):
+    """True when the guess is the labeled taxon or one of its accepted synonyms."""
+    guess_name = _norm(guess)
+    truth_name = _norm(truth)
+    if not guess_name or not truth_name:
+        return False
+    if guess_name == truth_name:
+        return True
+    accepted = {_norm(name) for name in (synonyms or []) if _norm(name)}
+    return guess_name in accepted or truth_name in accepted
+
+
+def inat_synonym_names(session, limiter, scientific):
+    """Accepted name and synonym strings from iNaturalist, or an empty list if the lookup fails."""
+    if not scientific:
+        return []
+    try:
+        if limiter:
+            limiter.wait()
+        response = session.get(
+            "https://api.inaturalist.org/v1/taxa",
+            params={"q": scientific, "rank": "species", "per_page": 5, "locale": "en"},
+            timeout=(5, 20),
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError):
+        return []
+    names = []
+    target = _norm(scientific)
+    for taxon in payload.get("results") or []:
+        if _norm(taxon.get("name")) != target and _norm(taxon.get("matched_term")) != target:
+            continue
+        for label in (taxon.get("name"), taxon.get("matched_term")):
+            if label and label not in names:
+                names.append(label)
+        for entry in taxon.get("taxon_names") or []:
+            name = entry.get("name") if isinstance(entry, dict) else ""
+            if name and name not in names:
+                names.append(name)
+    return names
 
 
 def load_manifest(path):
@@ -375,8 +438,9 @@ def answer_from_response(body, item, run, latency_ms, status=200):
     names = species_names(body)
     truth = _norm(item.get("true_taxon"))
     guess = names[0] if names else ""
-    species_correct = bool(truth) and _norm(guess) == truth
-    top3 = bool(truth) and truth in {_norm(name) for name in names[:3]}
+    synonyms = item.get("synonyms") or []
+    species_correct = names_equivalent(guess, item.get("true_taxon"), synonyms)
+    top3 = any(names_equivalent(name, item.get("true_taxon"), synonyms) for name in names[:3])
     klass = classify_answer(body)
     discovery = body.get("discovery") if isinstance(body.get("discovery"), dict) else {}
     discovery_type = discovery.get("type") or ""
@@ -466,7 +530,10 @@ def answer_from_response(body, item, run, latency_ms, status=200):
         "false_accept_reason": reason,
         "headline_credit": credit,
         "range_rule": meta.get("range_rule") or "",
+        "server_range_km": meta.get("range_km"),
+        "server_range_max": meta.get("range_max"),
         "evidence": meta.get("evidence") or [],
+        "errored": klass == "error" or status not in (200, None),
     }
 
 
@@ -576,9 +643,12 @@ def summarize_answers(rows, include_sources=True):
     decoys = [row for row in rows if row["decoy"]]
     decoy_flags = [row for row in decoys if row["discovery_type"] == RANGE_FLAG]
     hedged = [row for row in rows if row["klass"] == "hedged"]
+    errored = [row for row in rows if row.get("errored") or row.get("klass") == "error"]
     refused_identifiable = [
         row for row in identifiable
-        if row["klass"] in ("hedged", "cant_identify") or row["discovery_type"] == "no_match"
+        if row["klass"] in ("hedged", "cant_identify", "error")
+        or row.get("errored")
+        or row["discovery_type"] == "no_match"
     ]
     correct_matches = [
         row for row in identifiable
@@ -639,6 +709,11 @@ def summarize_answers(rows, include_sources=True):
         ],
         "correct_match_rate": _round(_rate(len(correct_matches), len(identifiable))),
         "false_reject_rate": _round(_rate(len(refused_identifiable), len(identifiable))),
+        "errored": len(errored),
+        "errored_results": [
+            {"photo_path": row["photo_path"], "run": row["run"], "status": row.get("status"), "klass": row["klass"]}
+            for row in errored
+        ],
         "correct_reject_rate": _round(_rate(
             sum(1 for row in should_reject if row["klass"] == "cant_identify"),
             len(should_reject),
@@ -697,7 +772,8 @@ def judge(value, spec):
     return "pass"
 
 
-def score_targets(metrics, targets, rule):
+def score_targets(metrics, targets, rows):
+    """Score thresholds. The range rule is checked against the server's own meta, not the local process."""
     keys = (
         "confident_precision",
         "false_accepts_per_100",
@@ -713,11 +789,15 @@ def score_targets(metrics, targets, rule):
         checks[key] = {"value": metrics.get(key), "target": spec, "result": judge(metrics.get(key), spec)}
     rule_spec = targets.get("range_rule") or {}
     if rule_spec:
-        matches = (
-            rule.get("radius_km") == rule_spec.get("radius_km")
-            and rule.get("max_records") == rule_spec.get("max_records")
-        )
-        checks["range_rule"] = {"value": rule, "target": rule_spec, "result": "pass" if matches else "fail"}
+        server_km = {row.get("server_range_km") for row in rows if row.get("server_range_km") is not None}
+        server_max = {row.get("server_range_max") for row in rows if row.get("server_range_max") is not None}
+        if not server_km and not server_max:
+            result = "n/a"
+            shown = {}
+        else:
+            result = "pass" if server_km == {rule_spec.get("radius_km")} and server_max == {rule_spec.get("max_records")} else "fail"
+            shown = {"radius_km": sorted(server_km), "max_records": sorted(server_max)}
+        checks["range_rule"] = {"value": shown, "target": rule_spec, "result": result}
     results = [item["result"] for item in checks.values()]
     if any(result == "fail" for result in results):
         overall = "fail"
@@ -729,15 +809,14 @@ def score_targets(metrics, targets, rule):
 
 
 def build_report(rows, label, targets, targets_path, runs):
-    rule = app_range_rule()
     verified = [row for row in rows if row["key_confidence"] == "verified"]
     uncertain = [row for row in rows if row["key_confidence"] == "uncertain"]
     return {
         "area": label,
         "runs": runs,
         "targets_path": targets_path,
-        "range_rule": rule,
-        "targets_result": score_targets(summarize_answers(verified), targets, rule),
+        "range_rule": app_range_rule(),
+        "targets_result": score_targets(summarize_answers(verified), targets, verified),
         "verified": summarize_answers(verified),
         "uncertain": summarize_answers(uncertain),
         "all": summarize_answers(rows),
@@ -903,6 +982,9 @@ def identify_photo(session, base_url, image, item):
     if item.get("lat") is not None and item.get("lng") is not None:
         data["lat"] = str(item["lat"])
         data["lng"] = str(item["lng"])
+    observation_id = observation_id_from_source(item.get("source_url") or "")
+    if observation_id:
+        data["exclude_observation_id"] = observation_id
     started = time.perf_counter()
     response = session.post(
         base_url.rstrip("/") + "/identify",
@@ -918,21 +1000,95 @@ def identify_photo(session, base_url, image, item):
     return body, latency_ms, response.status_code
 
 
-def evaluate_manifest(items, manifest_dir, base_url, runs, session=None):
+def _done_keys(rows):
+    return {(row.get("photo_path"), row.get("run")) for row in rows}
+
+
+def load_resume_rows(path):
+    source = Path(path) if path else None
+    if not source or not source.is_file():
+        return []
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if isinstance(payload, dict):
+        rows = payload.get("results") or []
+    elif isinstance(payload, list):
+        rows = payload
+    else:
+        rows = []
+    return [row for row in rows if isinstance(row, dict) and row.get("photo_path")]
+
+
+def append_result_row(path, row):
+    if not path:
+        return
+    rows = load_resume_rows(path)
+    rows.append(row)
+    Path(path).write_text(json.dumps({"results": rows}, indent=2), encoding="utf-8")
+
+
+def identify_with_retry(session, base_url, image, item, delay):
+    """Try twice so one network error does not end the run."""
+    last = ({"error": "network"}, 0, 0)
+    for attempt in range(2):
+        try:
+            body, latency_ms, status = identify_photo(session, base_url, image, item)
+        except requests.RequestException as exc:
+            body, latency_ms, status = {"error": str(exc)}, 0, 0
+        last = (body, latency_ms, status)
+        failed = status == 0 or status >= 500 or (isinstance(body, dict) and body.get("error"))
+        if not failed or attempt == 1:
+            return last
+        time.sleep(min(delay, 2.0) if delay else 0.2)
+    return last
+
+
+def evaluate_manifest(items, manifest_dir, base_url, runs, session=None, delay=10.0, concurrency=1, resume_path=""):
     session = session or requests.Session()
     session.headers.setdefault("User-Agent", USER_AGENT)
     limiter = RateLimiter(INAT_MIN_INTERVAL)
-    rows = []
+    rows = load_resume_rows(resume_path)
+    done = _done_keys(rows)
+    jobs = []
     for item in items:
-        image = load_photo(session, limiter, item["photo_path"], manifest_dir)
         for run in range(1, runs + 1):
-            body, latency_ms, status = identify_photo(session, base_url, image, item)
-            rows.append(answer_from_response(body, item, run, latency_ms, status))
-            print(
-                f"{item['photo_path']} run {run}: {rows[-1]['guess'] or '(no name)'} "
-                f"{rows[-1]['klass']} credit={rows[-1]['headline_credit']}",
-                flush=True,
-            )
+            if (item["photo_path"], run) in done:
+                continue
+            jobs.append((item, run))
+
+    def one(job):
+        item, run = job
+        try:
+            image = load_photo(session, limiter, item["photo_path"], manifest_dir)
+            body, latency_ms, status = identify_with_retry(session, base_url, image, item, delay)
+        except (OSError, requests.RequestException) as exc:
+            body, latency_ms, status = {"error": str(exc)}, 0, 0
+        if not (item.get("synonyms") or []):
+            extra = inat_synonym_names(session, limiter, item.get("true_taxon"))
+            if extra:
+                item = dict(item)
+                item["synonyms"] = extra
+        row = answer_from_response(body, item, run, latency_ms, status)
+        print(
+            f"{item['photo_path']} run {run}: {row['guess'] or '(no name)'} "
+            f"{row['klass']} credit={row['headline_credit']}",
+            flush=True,
+        )
+        append_result_row(resume_path, row)
+        if delay:
+            time.sleep(delay)
+        return row
+
+    workers = max(1, int(concurrency or 1))
+    if workers == 1:
+        for job in jobs:
+            rows.append(one(job))
+        return rows
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for row in pool.map(one, jobs):
+            rows.append(row)
     return rows
 
 
@@ -995,6 +1151,9 @@ def main():
     parser.add_argument("--json", dest="json_path", default="")
     parser.add_argument("--markdown", dest="md_path", default="")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--concurrency", type=int, default=1, help="Parallel identify calls (default 1)")
+    parser.add_argument("--delay", type=float, default=10.0, help="Seconds between identify calls (default 10)")
+    parser.add_argument("--resume", action="store_true", help="Append to --json and skip rows already saved")
     args = parser.parse_args()
     if args.runs < 1:
         raise SystemExit("--runs must be at least 1")
@@ -1008,7 +1167,11 @@ def main():
         if not items:
             raise SystemExit(f"No usable rows in {args.manifest}")
         label = Path(args.manifest).name
-        rows = evaluate_manifest(items, manifest_dir, args.base_url, args.runs, session)
+        rows = evaluate_manifest(
+            items, manifest_dir, args.base_url, args.runs, session,
+            delay=args.delay, concurrency=args.concurrency,
+            resume_path=args.json_path if args.resume else "",
+        )
     else:
         params, label = region_params(args)
         limiter = RateLimiter(INAT_MIN_INTERVAL)
