@@ -3940,11 +3940,29 @@ _UNUSABLE_PHOTO = re.compile(
 )
 
 
-def photo_truly_unusable(quality, issue):
-    """Murky or soft photos can still be identified. Blank, tiny, or no-animal frames cannot."""
-    if quality != "invalid":
+_TOO_BLURRY = re.compile(
+    r"\b(?:too blurry|completely blurry|hopelessly blurry|nothing in focus|too out of focus)\b",
+    re.IGNORECASE,
+)
+
+
+def photo_is_usable(quality, issue):
+    """Yes or no. No means no animal, or a blank, tiny, or too-blurry frame.
+
+    Murky water and soft focus are still usable. This answer is not a score
+    and must not change a later identification.
+    """
+    blob = issue or ""
+    if _UNUSABLE_PHOTO.search(blob) or _TOO_BLURRY.search(blob):
         return False
-    return bool(_UNUSABLE_PHOTO.search(issue or ""))
+    if (quality or "").lower() == "invalid" and _UNUSABLE_PHOTO.search(blob):
+        return False
+    return True
+
+
+def photo_truly_unusable(quality, issue):
+    """Backward-compatible name. True when the photo gate says no."""
+    return not photo_is_usable(quality, issue)
 
 
 _CLEAR_LAND_ANIMAL = re.compile(
@@ -4571,6 +4589,43 @@ def _prefer_bull_shark(candidates, text):
     return candidates
 
 
+def _result_payload(
+    *,
+    region_label,
+    certainty,
+    photo_quality,
+    meta,
+    result_text="",
+    candidates=None,
+    discovery=None,
+    message="",
+    reason="",
+    notable_note=None,
+    photo_issue="",
+):
+    """The only identification body. Gates and the final decision both use it."""
+    if not isinstance(meta, dict):
+        meta = stamp_meta({"verify_skipped": reason or "missing_meta"}, None)
+    body = {
+        "result_text": result_text or "",
+        "region_label": region_label,
+        "certainty": certainty,
+        "photo_quality": photo_quality,
+        "candidates": [] if candidates is None else candidates,
+        "discovery": discovery,
+        "meta": meta,
+    }
+    if message:
+        body["message"] = message
+    if reason:
+        body["reason"] = reason
+    if notable_note is not None:
+        body["notable_note"] = notable_note
+    if photo_issue:
+        body["photo_issue"] = photo_issue
+    return body
+
+
 def _no_match_result_text(discovery):
     """One wording for a rejected identification. No species is named as the match."""
     names = []
@@ -4877,62 +4932,37 @@ def _identify_http():
     photo_quality = parse_photo_quality(text)
     photo_issue = _field_value(text, "Photo issue")
     parsed_candidates = _prefer_bull_shark(parse_model_candidates(text), text)
-    named = parsed_candidates[0]["scientific_name"] if parsed_candidates else ""
-    taxon_status = taxon_in_scope(named) if named else None
-    # Text is only a land-animal veto when iNaturalist did not resolve a taxon.
-    if taxon_status is False or (taxon_status is None and text_says_not_marine("\n".join([text, photo_issue]))):
+    # Gate 1. A no stops here. A yes does not mark the identification down.
+    if not photo_is_usable(photo_quality, photo_issue):
         meta = _identification_meta(
             mode, sent, available, truncated, source, list_fetch_ms, model_ms,
             tokens, token_source, answered, image_px, fallback_used, attempts,
-            False, 0, 0, None, "not_marine",
+            False, 0, 0, None, "photo_unusable",
         )
         meta["photo_quality"] = photo_quality
-        meta["evidence"] = ["not_marine"]
-        apply_verify_rates(meta, False, False, 0, 0, "not_marine")
-        meta = stamp_meta(meta, request_started)
-        _log_identification(region["id"], meta)
-        return jsonify({
-            "result_text": "",
-            "region_label": region_label,
-            "certainty": "unsure",
-            "photo_quality": photo_quality,
-            "reason": "not_marine",
-            "message": NOT_MARINE_MESSAGE,
-            "candidates": [],
-            "discovery": None,
-            "meta": meta,
-        })
-    if photo_truly_unusable(photo_quality, photo_issue):
-        total_ms = int(round((time.monotonic() - request_started) * 1000))
-        meta = _identification_meta(
-            mode, sent, available, truncated, source, list_fetch_ms, model_ms,
-            tokens, token_source, answered, image_px, fallback_used, attempts,
-            False, 0, 0, total_ms, "photo_unusable",
-        )
-        meta["photo_quality"] = photo_quality
-        meta["evidence"] = [f"photo_{photo_quality}"]
+        meta["evidence"] = [f"photo_{photo_quality or 'unusable'}"]
         meta["range_km"] = range_km()
         meta["range_max"] = range_record_limit()
         meta["range_rule"] = range_rule_text()
         apply_verify_rates(meta, False, False, 0, 0, "photo_unusable")
         meta = stamp_meta(meta, request_started)
         _log_identification(region["id"], meta)
-        return jsonify({
-            "result_text": text,
-            "region_label": region_label,
-            "certainty": "unsure",
-            "photo_quality": photo_quality,
-            "photo_issue": photo_issue or "The animal is not clear enough to identify.",
-            "message": "Can't identify from this photo.",
-            "candidates": [],
-            "discovery": None,
-            "meta": meta,
-        })
+        return jsonify(_result_payload(
+            region_label=region_label,
+            certainty="unsure",
+            photo_quality=photo_quality,
+            message="Can't identify from this photo.",
+            photo_issue=photo_issue or "The animal is not clear enough to identify.",
+            meta=meta,
+        ))
     off_list_proposed = sum(1 for item in parsed_candidates if item.get("off_list"))
     candidates = _prepare_off_list_candidates(parsed_candidates, species)
     off_list_kept = sum(1 for item in candidates if item.get("off_list"))
     app.logger.info("off_list_proposed=%s off_list_kept=%s", off_list_proposed, off_list_kept)
-    if candidates and taxon_in_scope(candidates[0]["scientific_name"]) is False:
+    # Gate 2. Resolved non-marine ancestry stops. Unresolved ancestry does not.
+    named = candidates[0]["scientific_name"] if candidates else ""
+    taxon_status = taxon_in_scope(named) if named else None
+    if taxon_status is False or (taxon_status is None and text_says_not_marine("\n".join([text, photo_issue]))):
         meta = _identification_meta(
             mode, sent, available, truncated, source, list_fetch_ms, model_ms,
             tokens, token_source, answered, image_px, fallback_used, attempts,
@@ -4945,21 +4975,15 @@ def _identify_http():
         apply_verify_rates(meta, False, False, 0, 0, "not_marine")
         meta = stamp_meta(meta, request_started)
         _log_identification(region["id"], meta)
-        return jsonify({
-            "result_text": "",
-            "region_label": region_label,
-            "certainty": "unsure",
-            "photo_quality": photo_quality,
-            "reason": "not_marine",
-            "message": NOT_MARINE_MESSAGE,
-            "candidates": [],
-            "discovery": None,
-            "meta": meta,
-        })
-    candidates = [
-        item for item in candidates
-        if taxon_in_scope(item["scientific_name"]) is not False
-    ]
+        return jsonify(_result_payload(
+            region_label=region_label,
+            certainty="unsure",
+            photo_quality=photo_quality,
+            reason="not_marine",
+            message=NOT_MARINE_MESSAGE,
+            meta=meta,
+        ))
+    # Gate 3. Confidence is decided only from here on.
     verify_used = False
     verify_attempted = False
     verify_ms = 0
@@ -5129,7 +5153,6 @@ def _identify_http():
     strong_id = (
         not no_match
         and not fallback_used
-        and not photo_truly_unusable(photo_quality, photo_issue)
         and certainty == "confident"
         and verify_used
         and passing_verification(verification)
@@ -5289,13 +5312,8 @@ def _identify_http():
         certainty = "confident"
         for item in shown[:1]:
             item["confidence"] = "high"
-    elif photo_quality == "poor" and not photo_truly_unusable(photo_quality, photo_issue):
-        if certainty == "confident":
-            certainty = "likely"
-        for item in shown:
-            item["confidence"] = {"high": "medium", "medium": "low", "low": "low"}.get(item.get("confidence") or "medium", "medium")
-        evidence.append("quality_lowered_confidence")
     elif certainty != "confident":
+        # Unconfirmed identifications are not labeled high. Photo quality is not an input.
         for item in shown:
             if item.get("confidence") == "high":
                 item["confidence"] = "medium"
@@ -5318,16 +5336,16 @@ def _identify_http():
     meta["off_list_kept"] = off_list_kept
     meta = stamp_meta(meta, request_started)
     _log_identification(region["id"], meta)
-    return jsonify({
-        "result_text": text or "No response",
-        "region_label": region_label,
-        "certainty": certainty,
-        "photo_quality": photo_quality,
-        "candidates": [] if no_match else shown,
-        "discovery": discovery,
-        "notable_note": notable_note,
-        "meta": meta,
-    })
+    return jsonify(_result_payload(
+        result_text=text or "No response",
+        region_label=region_label,
+        certainty=certainty,
+        photo_quality=photo_quality,
+        candidates=[] if no_match else shown,
+        discovery=discovery,
+        notable_note=notable_note,
+        meta=meta,
+    ))
 
 
 def _error_body(message):

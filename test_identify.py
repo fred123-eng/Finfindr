@@ -1673,6 +1673,9 @@ class IdentifyTests(unittest.TestCase):
         self.assertEqual(body["candidates"][0]["confidence"], "high")
         self.assertIn("Confidence: high", body["result_text"])
         self.assertNotIn("quality_lowered_confidence", body["meta"]["evidence"])
+        self.assertTrue(finfindr_server.photo_is_usable("poor", "murky water and soft focus"))
+        self.assertFalse(finfindr_server.photo_is_usable("invalid", "too blurry to see the animal"))
+        self.assertFalse(finfindr_server.photo_is_usable("invalid", "blank frame"))
         self.assertGreater(body["meta"]["verify_pass_rate"], 0)
         self.assertNotIn("Can't identify", body.get("message") or "")
         self.assertTrue(all(call["temperature"] == 0 and call["seed"] == 0 for call in self.captured["calls"]))
@@ -1704,10 +1707,42 @@ class IdentifyTests(unittest.TestCase):
         body = self.post_photo(lat="24.2", lng="-110.3").get_json()
         self.assertEqual(body["meta"]["verify_skipped"], "timeout")
         self.assertEqual(body["candidates"][0]["scientific_name"], "Carcharhinus leucas")
-        self.assertNotEqual(body["candidates"][0]["confidence"], "high")
-        self.assertIn(body["candidates"][0]["confidence"], ("medium", "low"))
+        self.assertEqual(body["candidates"][0]["confidence"], "medium")
+        self.assertNotIn("quality_lowered_confidence", body["meta"]["evidence"])
         self.assertNotIn("Can't identify", body.get("message") or "")
         self.assertIsNone(body["discovery"])
+
+    def test_too_blurry_stops_before_an_identification(self):
+        self.captured["model_text"] = (
+            "Photo quality: invalid\n"
+            "Photo issue: too blurry to see the animal\n"
+            "Scientific name: Abudefduf troschelii\n"
+            "Confidence: high\n"
+            "Candidate 1: Abudefduf troschelii | Panamic sergeant major | high | 5 bars\n"
+        )
+        body = self.post_photo().get_json()
+        self.assertEqual(body["message"], "Can't identify from this photo.")
+        self.assertEqual(body["candidates"], [])
+        self.assertEqual(body["result_text"], "")
+        self.assertIsNone(body["discovery"])
+        self.assertIsInstance(body["meta"], dict)
+        self.assertNotIn("troschelii", json.dumps({k: v for k, v in body.items() if k != "meta"}))
+
+    def test_murky_photo_does_not_change_confidence(self):
+        self.captured["model_text"] = (
+            "Photo quality: poor\n"
+            "Photo issue: murky water and soft focus\n"
+            "Scientific name: Abudefduf troschelii\n"
+            "Common name: Panamic sergeant major\n"
+            "Confidence: medium\n"
+            "Candidate 1: Abudefduf troschelii | Panamic sergeant major | medium | 5 bars\n"
+        )
+        body = self.post_photo().get_json()
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Abudefduf troschelii")
+        self.assertEqual(body["candidates"][0]["confidence"], "medium")
+        self.assertIn("Confidence: medium", body["result_text"])
+        self.assertNotIn("quality_lowered_confidence", body["meta"]["evidence"])
+        self.assertNotIn("Can't identify", body.get("message") or "")
 
     def test_cat_phrase_is_not_marine_before_the_quality_gate(self):
         self.captured["model_text"] = (
