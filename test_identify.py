@@ -1141,7 +1141,8 @@ class IdentifyTests(unittest.TestCase):
         )
         finfindr_server._PHOTO_CACHE.clear()
         hedged = self.post_photo(lat="24.2", lng="-110.3").get_json()
-        self.assertEqual(hedged["certainty"], "unsure")
+        self.assertEqual(hedged["certainty"], "confident")
+        self.assertTrue(hedged["meta"]["agreement"])
         self.assertTrue(hedged["meta"]["verify_used"])
         self.assertFalse(hedged["meta"]["verify_succeeded"])
         self.assertIsNone(hedged["discovery"])
@@ -1157,7 +1158,8 @@ class IdentifyTests(unittest.TestCase):
         self.assertEqual(timed["meta"]["verify_skipped"], "timeout")
         self.assertTrue(timed["meta"]["verify_attempted"])
         self.assertFalse(timed["meta"]["verify_used"])
-        self.assertNotEqual(timed["certainty"], "confident")
+        self.assertEqual(timed["certainty"], "confident")
+        self.assertTrue(timed["meta"]["agreement"])
         self.assertIsNone(timed["discovery"])
         verify_calls = [call for call in self.captured["calls"] if call.get("verify")]
         self.assertTrue(verify_calls)
@@ -1224,10 +1226,10 @@ class IdentifyTests(unittest.TestCase):
             "Decision: UNSURE\nCertainty: unsure\nTrait: the arms are hidden\n"
         )
         unsure = self.post_photo(lat="24.2", lng="-110.3").get_json()
-        self.assertEqual(unsure["certainty"], "unsure")
+        self.assertEqual(unsure["certainty"], "confident")
+        self.assertTrue(unsure["meta"]["agreement"])
         self.assertIsNone(unsure["discovery"])
-        self.assertTrue(unsure["candidates"])
-        self.assertNotEqual(unsure["candidates"][0]["confidence"], "high")
+        self.assertEqual(unsure["candidates"][0]["confidence"], "high")
 
         self.captured["verify_text"] = (
             "Decision: Phataria unifascialis\n"
@@ -1383,9 +1385,9 @@ class IdentifyTests(unittest.TestCase):
         finally:
             self.captured.pop("verify_raises", None)
         self.assertEqual(body["meta"]["verify_skipped"], "timeout")
-        self.assertEqual(body["certainty"], "likely")
-        self.assertNotEqual(body["candidates"][0]["confidence"], "high")
-        self.assertNotEqual(body["candidates"][0]["confidence"], "low")
+        self.assertEqual(body["certainty"], "confident")
+        self.assertEqual(body["candidates"][0]["confidence"], "high")
+        self.assertTrue(body["meta"]["agreement"])
         self.assertIsNone(body["discovery"])
         self.assertEqual(body["candidates"][0]["scientific_name"], "Abudefduf troschelii")
 
@@ -1720,7 +1722,8 @@ class IdentifyTests(unittest.TestCase):
         body = self.post_photo(lat="24.2", lng="-110.3").get_json()
         self.assertEqual(body["meta"]["verify_skipped"], "timeout")
         self.assertEqual(body["candidates"][0]["scientific_name"], "Carcharhinus leucas")
-        self.assertEqual(body["candidates"][0]["confidence"], "medium")
+        self.assertEqual(body["candidates"][0]["confidence"], "high")
+        self.assertEqual(body["certainty"], "confident")
         self.assertNotIn("quality_lowered_confidence", body["meta"]["evidence"])
         self.assertNotIn("Can't identify", body.get("message") or "")
         self.assertIsNone(body["discovery"])
@@ -1924,14 +1927,20 @@ class IdentifyTests(unittest.TestCase):
 
         self.inat_handler = handler
         self.captured["verify_raises"] = "timeout"
-        self.captured["model_text"] = (
+        shared = (
             "Photo quality: good\n"
-            "Scientific name: Octopus bimaculatus\n"
-            "Common name: Two-spot octopus\n"
             "Confidence: medium\n"
             "Candidate 1: Octopus bimaculatus | Two-spot octopus | medium | faint side spots\n"
             "Candidate 2: Octopus hubbsorum | Hubbs' octopus | low | brown body\n"
         )
+        other = (
+            "Photo quality: good\n"
+            "Confidence: medium\n"
+            "Candidate 1: Octopus hubbsorum | Hubbs' octopus | medium | brown body\n"
+            "Candidate 2: Octopus bimaculatus | Two-spot octopus | low | faint side spots\n"
+        )
+        self.captured["model_text_by_model"] = {"grok-4": shared, "grok-4.7": other}
+        self.captured["model_text"] = shared
         self.captured["offlist_text"] = (
             "Off-list 1: Octopus rubescens | Red octopus | reddish body without eye spots\n"
             "Off-list 2: none\n"
@@ -2088,6 +2097,32 @@ class IdentifyTests(unittest.TestCase):
         self.assertNotIn("error", body)
         self.assertIsInstance(body["meta"], dict)
         self.assertIn("total_ms", body["meta"])
+
+    def test_agreement_plus_inconclusive_verify_can_be_confident(self):
+        self.inat_handler = self._taxon_photos
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Zalophus californianus\n"
+            "Common name: California sea lion\n"
+            "Confidence: high\n"
+            "Candidate 1: Zalophus californianus | California sea lion | high | external ear flaps\n"
+            "Candidate 2: Arctocephalus townsendi | Guadalupe fur seal | low | a pointed snout\n"
+        )
+        self.captured["verify_text"] = (
+            "Decision: UNSURE\nCertainty: unsure\nTrait: the reference photos do not separate them\n"
+        )
+        body = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertTrue(body["meta"]["agreement"])
+        self.assertEqual(body["certainty"], "confident")
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Zalophus californianus")
+        self.assertEqual(body["candidates"][0]["confidence"], "high")
+        self.assertIn("models_agreed", body["meta"]["evidence"])
+        self.captured["verify_text"] = (
+            "Decision: NO_MATCH\nCertainty: unsure\nTrait: the ear flaps do not match these seals\n"
+        )
+        finfindr_server._PHOTO_CACHE.clear()
+        blocked = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertNotEqual(blocked["certainty"], "confident")
 
     def test_disagreement_shows_both_species_until_verify_separates_them(self):
         self.captured["model_text_by_model"] = {

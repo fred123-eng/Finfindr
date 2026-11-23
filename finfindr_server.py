@@ -4020,6 +4020,41 @@ def verification_mismatch(verification):
     return any(cue in trait for cue in cues)
 
 
+def verification_contradicts(verification):
+    """The reference check rejected the animal, rather than failing to separate it."""
+    if not isinstance(verification, dict):
+        return False
+    decision = (verification.get("decision") or "").upper().replace(" ", "_").replace("-", "_")
+    if decision in ("NO_MATCH", "NONE_OF_THESE", "NOMATCH"):
+        return True
+    trait = (verification.get("trait") or "").lower()
+    cues = (
+        "does not match", "doesn't match", "do not match", "don't match",
+        "no match", "none of the reference", "wrong color", "wrong colour",
+        "different color", "different colour", "color does not", "colour does not",
+        "contradict",
+    )
+    return any(cue in trait for cue in cues)
+
+
+def agreed_identification_holds(verification, agreed_name, verify_skipped):
+    """Both models named this species, and the reference check did not contradict it.
+
+    A passing check, an unsure check, or a timeout can stay. A NO_MATCH, a
+    contradicting trait, or a check that names a different species cannot.
+    """
+    if not agreed_name or verification_contradicts(verification):
+        return False
+    if verify_skipped == "timeout":
+        return True
+    if not isinstance(verification, dict):
+        return False
+    decision = (verification.get("scientific_name") or verification.get("decision") or "").strip().lower()
+    if decision in ("", "unsure"):
+        return True
+    return decision == agreed_name.lower()
+
+
 def cap_unconfirmed_confidence(candidates):
     """A failed reference check must not leave a candidate labeled high."""
     for item in candidates:
@@ -5426,7 +5461,13 @@ def _identify_http(image_bytes=None, fields=None):
                 verify_skipped = _verify_skip_reason(verify_result)
     for candidate in candidates:
         candidate.pop("_reference_urls", None)
-    if _needs_offlist_followup(candidates, verification, verify_skipped) and _time_left(request_started) >= 12:
+    agreed_top = candidates[0]["scientific_name"] if candidates and result.get("agreement") else ""
+    models_agree = bool(agreed_top) and agreed_identification_holds(verification, agreed_top, verify_skipped)
+    if (
+        not models_agree
+        and _needs_offlist_followup(candidates, verification, verify_skipped)
+        and _time_left(request_started) >= 12
+    ):
         follow_timeout = min(16.0, max(5.0, _time_left(request_started) - 4.0))
         follow = _call_vision_model(
             jpeg_bytes,
@@ -5466,7 +5507,7 @@ def _identify_http(image_bytes=None, fields=None):
                 candidates.extend(fresh)
             off_list_kept = sum(1 for item in candidates if item.get("off_list"))
     verification_disagreed = bool(
-        verify_used and verification is not None and not passing_verification(verification)
+        verify_used and verification is not None and not passing_verification(verification) and not models_agree
     )
     certainty = certainty_for(candidates, verification if passing_verification(verification) else None)
     if verification_disagreed:
@@ -5668,10 +5709,14 @@ def _identify_http(image_bytes=None, fields=None):
     verified_id = bool(
         verify_used and passing_verification(verification) and verification_chose_top(verification, candidates)
     )
-    if verified_id and not no_match:
+    if models_agree and (trait_conflict or no_match or verification_contradicts(verification)):
+        models_agree = False
+    if (verified_id or models_agree) and not no_match:
         certainty = "confident"
         for item in shown[:1]:
             item["confidence"] = "high"
+        if models_agree and not verified_id:
+            evidence.append("models_agreed")
     elif certainty != "confident":
         # Unconfirmed identifications are not labeled high. Photo quality is not an input.
         for item in shown:
@@ -5683,8 +5728,11 @@ def _identify_http(image_bytes=None, fields=None):
     elif shown and text:
         text = _set_field(text, "Confidence", shown[0].get("confidence") or "medium")
     off_list_kept = sum(1 for item in shown if item.get("off_list"))
-    if verify_skipped in ("timeout", "connection", "no_time") and certainty == "confident":
+    if verify_skipped in ("timeout", "connection", "no_time") and certainty == "confident" and not models_agree:
         certainty = "likely"
+    if isinstance(verification, dict):
+        meta["verify_decision"] = verification.get("decision") or ""
+        meta["verify_trait"] = verification.get("trait") or ""
     meta["evidence"] = evidence
     meta["range_km"] = rule["radius_km"]
     meta["range_max"] = rule["max_records"]
