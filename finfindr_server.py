@@ -2821,9 +2821,14 @@ def configured_models(requested=None, debug=False):
         candidate = (requested or "").strip()
         if _safe_model_name(candidate):
             return [candidate]
-    single = (os.environ.get("XAI_MODEL") or "").strip()
-    if _safe_model_name(single):
-        return [single]
+    # XAI_MODEL used to mean "the one model". On staging it is grok-4.7, which
+    # is the slow model in the pair, not a reason to drop grok-4.
+    if not (os.environ.get("XAI_MODELS") or "").strip():
+        single = (os.environ.get("XAI_MODEL") or "").strip()
+        if _safe_model_name(single) and single != "grok-4":
+            return ["grok-4", single]
+        if _safe_model_name(single):
+            return ["grok-4", "grok-4.7"]
     raw = os.environ.get("XAI_MODELS", "grok-4,grok-4.7")
     models = []
     for part in raw.split(","):
@@ -3516,13 +3521,15 @@ def _bundle_model_reports(models, reports, attempts):
         }
     usable = [report for report in reports if _report_is_usable(report)]
     narrative = None
-    for preferred in ("grok-4.7", "grok-4"):
+    for report in usable:
+        if report["model"] != "grok-4":
+            narrative = report
+            break
+    if narrative is None:
         for report in usable:
-            if report["model"] == preferred:
+            if report["model"] == "grok-4":
                 narrative = report
                 break
-        if narrative:
-            break
     if narrative is None and usable:
         narrative = usable[0]
     any_ok = any(report.get("ok") for report in reports)

@@ -543,7 +543,7 @@ class IdentifyTests(unittest.TestCase):
         os.environ["XAI_MODEL"] = "grok-4.5"
         try:
             ignored = self.post_photo(model="grok-4.3")
-            self.assertEqual(self.captured["json"]["model"], "grok-4.5")
+            self.assertEqual(ignored.get_json()["meta"]["models_run"], ["grok-4", "grok-4.5"])
             self.assertEqual(ignored.get_json()["meta"]["model"], "grok-4.5")
             chosen = self.post_photo(model="grok-4.3", debug="1")
             self.assertEqual(self.captured["json"]["model"], "grok-4.3")
