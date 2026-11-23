@@ -530,7 +530,7 @@ class IdentifyTests(unittest.TestCase):
             data={"image": (io.BytesIO(wide), "wide.jpg")},
             content_type="multipart/form-data",
         )
-        self.assertEqual(response.get_json()["meta"]["image_px"], "1536x768")
+        self.assertEqual(response.get_json()["meta"]["image_px"], "1024x512")
         self.assertEqual(self.captured["json"]["model"], "grok-4.7")
 
         os.environ["MAX_IMAGE_PX"] = "800"
@@ -981,7 +981,7 @@ class IdentifyTests(unittest.TestCase):
         )
         body = self.post_photo(lat="24.2", lng="-110.3").get_json()
         self.assertIsNone(body["discovery"])
-        self.assertEqual(body["certainty"], "unsure")
+        self.assertEqual(body["certainty"], "likely")
         self.assertIn("notable if the identification is confirmed", body["notable_note"])
         self.assertTrue(body["candidates"])
 
@@ -1289,8 +1289,8 @@ class IdentifyTests(unittest.TestCase):
         finfindr_server._INAT_JSON_CACHE.clear()
         local = self.post_photo(lat="24.2", lng="-110.3").get_json()
         self.assertIsNone(local["discovery"])
-        self.assertNotEqual(local["certainty"], "confident")
-        self.assertTrue(any(item.get("off_list") for item in local["candidates"]))
+        self.assertEqual(local["certainty"], "confident")
+        self.assertFalse(local["candidates"][0]["off_list"])
         self.assertGreaterEqual(body["meta"]["off_list_proposed"], 1)
         self.assertGreaterEqual(body["meta"]["off_list_kept"], 1)
 
@@ -1667,9 +1667,12 @@ class IdentifyTests(unittest.TestCase):
             "Decision: Abudefduf troschelii\nCertainty: confident\nTrait: 5 bars\n"
         )
         body = self.post_photo(lat="24.2", lng="-110.3").get_json()
-        self.assertNotEqual(body["certainty"], "confident")
+        self.assertEqual(body["certainty"], "confident")
         self.assertEqual(body["candidates"][0]["scientific_name"], "Abudefduf troschelii")
-        self.assertNotEqual(body["candidates"][0]["confidence"], "high")
+        self.assertEqual(body["candidates"][0]["confidence"], "high")
+        self.assertIn("Confidence: high", body["result_text"])
+        self.assertNotIn("quality_lowered_confidence", body["meta"]["evidence"])
+        self.assertGreater(body["meta"]["verify_pass_rate"], 0)
         self.assertNotIn("Can't identify", body.get("message") or "")
         self.assertTrue(all(call["temperature"] == 0 and call["seed"] == 0 for call in self.captured["calls"]))
         same = self.client.post("/identify", json={
@@ -1922,6 +1925,126 @@ class IdentifyTests(unittest.TestCase):
         self.assertIn("Octopus rubescens", prompt)
         self.assertIn("Felimare californiensis", prompt)
         self.assertIn("Nerita scabricosta", prompt)
+
+
+    def test_scope_keeps_sea_lion_gull_and_oystercatcher(self):
+        def taxon(name, iconic, ancestors):
+            return {
+                "name": name,
+                "rank": "species",
+                "iconic_taxon_name": iconic,
+                "ancestors": [{"name": item, "rank": "family"} for item in ancestors],
+            }
+
+        cases = (
+            ("Zalophus californianus", "Mammalia", ["Otariidae", "Pinnipedia"]),
+            ("Larus heermanni", "Aves", ["Laridae"]),
+            ("Haematopus palliatus", "Aves", ["Haematopodidae"]),
+            ("Ursus maritimus", "Mammalia", ["Ursidae"]),
+        )
+        for name, iconic, ancestors in cases:
+            self.assertTrue(
+                finfindr_server.ancestry_in_scope(taxon(name, iconic, ancestors)),
+                name,
+            )
+        self.assertFalse(finfindr_server.text_says_not_marine("hauled out on rocks, not a marine mammal in the water"))
+        self.assertTrue(finfindr_server.text_says_not_marine("domestic cat on grass"))
+        self.inat_handler = lambda url, params: FakeResponse({"results": [{
+            "name": "Zalophus californianus",
+            "rank": "species",
+            "iconic_taxon_name": "Mammalia",
+            "ancestors": [
+                {"name": "Mammalia", "rank": "class"},
+                {"name": "Otariidae", "rank": "family"},
+                {"name": "Pinnipedia", "rank": "order"},
+            ],
+        }]}) if "taxa" in url else None
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Photo issue: hauled out on rocks\n"
+            "Scientific name: Zalophus californianus\n"
+            "Common name: California sea lion\n"
+            "Confidence: high\n"
+            "Candidate 1: Zalophus californianus | California sea lion | high | external ear flaps\n"
+        )
+        body = self.post_photo().get_json()
+        self.assertNotEqual(body.get("reason"), "not_marine")
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Zalophus californianus")
+
+    def test_records_in_the_region_are_not_off_list(self):
+        def handler(url, params):
+            if "observations" in url and str(params.get("per_page")) == "1":
+                return FakeResponse({"total_results": 29, "results": []})
+            if "taxa" in url:
+                return FakeResponse({"results": [{
+                    "name": params.get("q") or "Felimare californiensis",
+                    "rank": "species",
+                    "iconic_taxon_name": "Mollusca",
+                    "ancestors": [{"name": "Mollusca", "rank": "phylum"}],
+                }]})
+            return None
+
+        self.inat_handler = handler
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Felimare californiensis\n"
+            "Common name: California chromodorid\n"
+            "Confidence: medium\n"
+            "Candidate 1: Felimare californiensis | California chromodorid | medium | blue mantle with yellow spots\n"
+            "Off-list 1: Felimare californiensis | California chromodorid | blue mantle\n"
+        )
+        body = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertFalse(body["candidates"][0]["off_list"])
+        self.assertNotEqual((body.get("discovery") or {}).get("type"), "possible_range_extension")
+
+    def test_upstream_429_is_retried_and_not_a_502(self):
+        queue = {"left": 1}
+
+        def flaky(url, json=None, **kwargs):
+            if queue["left"]:
+                queue["left"] -= 1
+                response = FakeResponse({"error": "slow down"}, status=429)
+                response.headers = {"Retry-After": "0"}
+                return response
+            return self.fake_post(url, json=json, **kwargs)
+
+        self.post_patch.stop()
+        try:
+            with patch("finfindr_server.http.post", side_effect=flaky):
+                response = self.post_photo()
+        finally:
+            self.post_patch.start()
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("error", response.get_json())
+        self.assertEqual(queue["left"], 0)
+
+    def test_primary_window_is_not_shrunk_by_verify_hold(self):
+        os.environ["XAI_PRIMARY_TIMEOUT"] = "95"
+        try:
+            self.fail_timeout = {"grok-4.7"}
+            self.post_photo()
+        finally:
+            os.environ.pop("XAI_PRIMARY_TIMEOUT", None)
+            self.fail_timeout = set()
+        self.assertGreaterEqual(self.captured["calls"][0]["timeout"], 90)
+        self.assertLessEqual(self.captured["calls"][0]["timeout"], 95)
+
+    def test_fromia_contradiction_is_still_no_match(self):
+        self.inat_handler = self._taxon_photos
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Echinaster tenuispina\n"
+            "Common name: Thin-spined sea star\n"
+            "Confidence: medium\n"
+            "Notes: A red lattice star.\n"
+            "Candidate 1: Echinaster tenuispina | Thin-spined sea star | medium | red lattice of raised plates\n"
+        )
+        self.captured["verify_text"] = (
+            "Decision: NO_MATCH\nCertainty: unsure\nTrait: the red lattice does not match these stars\n"
+        )
+        body = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertEqual(body["discovery"]["type"], "no_match")
+        self.assertNotEqual(body["certainty"], "confident")
 
 
 class EvalScoreTests(unittest.TestCase):
