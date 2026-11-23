@@ -157,6 +157,8 @@ HTML = """
       <option value="1">On</option>
       <option value="0">Off</option>
     </select>
+    <label for="excludeObservation">Exclude iNat observation id</label>
+    <input id="excludeObservation" type="text" inputmode="numeric" placeholder="Optional" autocomplete="off">
     <label for="verifySelect">Reference check</label>
     <select id="verifySelect">
       <option value="">Server default</option>
@@ -190,6 +192,7 @@ const speciesListSelect = document.getElementById("speciesListSelect");
 const modelInput = document.getElementById("modelInput");
 const verifySelect = document.getElementById("verifySelect");
 const discoverySelect = document.getElementById("discoverySelect");
+const excludeObservation = document.getElementById("excludeObservation");
 const locationStatus = document.getElementById("locationStatus");
 const MIN_DIMENSION = 32;
 const MAX_BYTES = 20 * 1024 * 1024;
@@ -763,6 +766,9 @@ async function handleFile(file) {
       if (discoverySelect && (discoverySelect.value === "0" || discoverySelect.value === "1")) {
         formData.append("discovery", discoverySelect.value);
       }
+      if (excludeObservation && excludeObservation.value.trim()) {
+        formData.append("exclude_observation_id", excludeObservation.value.trim());
+      }
     }
 
     const resp = await fetch("/identify", { method: "POST", body: formData });
@@ -953,15 +959,19 @@ def prepare_image(image_bytes):
 
 
 
-# Connect + read caps. A slow vision call already uses up to 60s, and the
-# gunicorn worker timeout is 120s, so this lookup cannot be what kills the request.
-INAT_TIMEOUT = (1.0, 2.0)
+# Connect + read caps. A 1s read timeout was aborting healthy iNaturalist replies.
+INAT_TIMEOUT = (3.0, 8.0)
 INAT_CACHE_TTL = 24 * 60 * 60
 INAT_ERROR_TTL = 60
+_INAT_MIN_INTERVAL_DEFAULT = 1.0
 _INAT_URL = "https://api.inaturalist.org/v1/taxa"
 _SPECIES_RANKS = {"species", "subspecies", "variety", "form"}
 _cache_lock = threading.Lock()
 _inat_cache = {}
+_INAT_JSON_CACHE = {}
+_INAT_JSON_LOCK = threading.Lock()
+_INAT_PACE_LOCK = threading.Lock()
+_INAT_NEXT_AT = 0.0
 
 # Sea of Cortez names keyed by exact scientific name. Values match iNaturalist's
 # preferred English name, except Gymnothorax castaneus: that is the Panamic green
@@ -1176,19 +1186,16 @@ def _cache_put(key, value, ttl):
 def _fetch_inat_common_name_uncached(scientific):
     """Network lookup. Caller already missed the cache. Failures are cached briefly."""
     key = scientific.lower()
-    try:
-        resp = http.get(
-            _INAT_URL,
-            params={"q": scientific, "locale": "en", "per_page": 10},
-            headers={
-                "User-Agent": "FinFindr/1.0 (marine species common-name lookup)",
-                "Accept": "application/json",
-            },
-            timeout=INAT_TIMEOUT,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-    except (requests.RequestException, ValueError):
+    payload = _inat_get(
+        _INAT_URL,
+        {"q": scientific, "locale": "en", "per_page": 10},
+        INAT_TIMEOUT,
+        {
+            "User-Agent": "FinFindr/1.0 (marine species common-name lookup)",
+            "Accept": "application/json",
+        },
+    )
+    if not payload:
         app.logger.warning("iNaturalist lookup failed for %s", scientific)
         _cache_put(key, None, INAT_ERROR_TTL)
         return None
@@ -1709,6 +1716,7 @@ def assemble_prompt(locality, species, lookalikes, lat, lng):
         "- Prefer a species known from this region when the visible features fit one.",
         "- The regional species list is a hint, not a menu. Name an unlisted species when the features call for it. Do not replace that animal with a listed species that lacks those features.",
         "- A species with no records in this area can still be the right identification. Never reject a species only because it is unrecorded here.",
+        "- If the animal is not in the list, or a better match exists outside it, propose up to 2 off_list species on the Off-list lines. Do not invent a name.",
     ])
     if lookalikes:
         lines.append("")
@@ -1859,6 +1867,169 @@ def assemble_quota_list(group_results):
     return chosen
 
 
+def inat_min_interval():
+    """Seconds between iNaturalist requests. FINFINDR_INAT_MIN_INTERVAL=0 disables the pause."""
+    raw = (os.environ.get("FINFINDR_INAT_MIN_INTERVAL") or "").strip()
+    if not raw:
+        return _INAT_MIN_INTERVAL_DEFAULT
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _INAT_MIN_INTERVAL_DEFAULT
+
+
+def _inat_wait():
+    """Global pace so every iNaturalist call, including prefetch, stays at or under 1 per second."""
+    global _INAT_NEXT_AT
+    interval = inat_min_interval()
+    if interval <= 0:
+        return
+    with _INAT_PACE_LOCK:
+        now = time.monotonic()
+        delay = _INAT_NEXT_AT - now
+        if delay > 0:
+            time.sleep(delay)
+            now = time.monotonic()
+        _INAT_NEXT_AT = now + interval
+
+
+def _inat_cache_key(url, params):
+    items = tuple(sorted((str(key), str(value)) for key, value in (params or {}).items()))
+    return (url, items)
+
+
+def _inat_cache_get(url, params):
+    key = _inat_cache_key(url, params)
+    now = time.monotonic()
+    with _INAT_JSON_LOCK:
+        hit = _INAT_JSON_CACHE.get(key)
+        if not hit or hit[0] <= now:
+            _INAT_JSON_CACHE.pop(key, None)
+            return None
+        return hit[1]
+
+
+def _inat_cache_put(url, params, payload):
+    key = _inat_cache_key(url, params)
+    with _INAT_JSON_LOCK:
+        if len(_INAT_JSON_CACHE) > 512:
+            _INAT_JSON_CACHE.clear()
+        _INAT_JSON_CACHE[key] = (time.monotonic() + INAT_CACHE_TTL, payload)
+
+
+def _retry_after_seconds(response, attempt):
+    raw = ""
+    if response is not None:
+        raw = (response.headers.get("Retry-After") or "").strip()
+    try:
+        delay = float(raw)
+    except ValueError:
+        delay = float(attempt)
+    return min(8.0, max(0.0, delay))
+
+
+_CALL_DEADLINE = threading.local()
+
+
+def set_call_deadline(deadline):
+    _CALL_DEADLINE.value = deadline
+
+
+def clear_call_deadline():
+    if hasattr(_CALL_DEADLINE, "value"):
+        delattr(_CALL_DEADLINE, "value")
+
+
+def call_time_left():
+    deadline = getattr(_CALL_DEADLINE, "value", None)
+    if deadline is None:
+        return None
+    return deadline - time.monotonic()
+
+
+def _cap_timeout(timeout):
+    """Fit a requests timeout inside the request's hard budget."""
+    left = call_time_left()
+    if left is None:
+        return timeout
+    if left < 0.4:
+        return None
+    if isinstance(timeout, tuple):
+        connect, read = timeout
+        return (min(float(connect), left), min(float(read), left))
+    return min(float(timeout), left)
+
+
+def _http_get_bounded(url, params, headers, timeout):
+    """GET that returns even if the socket keeps trickling past the budget."""
+    capped = _cap_timeout(timeout)
+    if capped is None:
+        return None
+    read_cap = capped[1] if isinstance(capped, tuple) else float(capped)
+    holder = {}
+
+    def run():
+        try:
+            holder["resp"] = http.get(url, params=params, headers=headers, timeout=capped)
+        except Exception as exc:
+            holder["error"] = exc
+
+    worker = threading.Thread(target=run, name="finfindr-http", daemon=True)
+    worker.start()
+    worker.join(read_cap + 0.5)
+    if worker.is_alive():
+        app.logger.warning("outbound wall-clock timeout %s", url)
+        return None
+    if holder.get("error"):
+        raise holder["error"]
+    return holder.get("resp")
+
+
+def _inat_get(url, params, timeout, headers):
+    """One paced external GET. Successful JSON is cached for hours. 429s are retried."""
+    cached = _inat_cache_get(url, params)
+    if cached is not None:
+        return cached
+    host = url.split("/")[2] if "://" in url else url
+    for attempt in range(1, 4):
+        if call_time_left() is not None and call_time_left() < 0.4:
+            return None
+        _inat_wait()
+        try:
+            resp = _http_get_bounded(url, params, headers, timeout)
+        except requests.Timeout as exc:
+            app.logger.warning("%s read timeout: %s", host, exc)
+            return None
+        except requests.RequestException as exc:
+            app.logger.warning("%s request failed: %s", host, exc)
+            return None
+        if resp is None:
+            return None
+        if resp.status_code == 429 and attempt < 3:
+            delay = _retry_after_seconds(resp, attempt)
+            app.logger.warning("%s 429; retrying in %ss", host, delay)
+            left = call_time_left()
+            if left is not None:
+                delay = min(delay, max(0.0, left - 0.5))
+            if delay:
+                time.sleep(delay)
+            continue
+        if resp.status_code == 429:
+            app.logger.warning("%s failed: 429 normal_throttling", host)
+            return None
+        try:
+            resp.raise_for_status()
+            payload = resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            app.logger.warning("%s request failed: %s", host, exc)
+            return None
+        if isinstance(payload, dict):
+            _inat_cache_put(url, params, payload)
+            return payload
+        return None
+    return None
+
+
 def _inat_species_page(query, page, per_page, taxon_id, timeout, exclude=None):
     params = {
         "locale": "en",
@@ -1868,6 +2039,8 @@ def _inat_species_page(query, page, per_page, taxon_id, timeout, exclude=None):
         "page": page,
         "per_page": per_page,
     }
+    if query.get("not_id"):
+        params["not_id"] = query["not_id"]
     if taxon_id:
         params["taxon_id"] = taxon_id
         if exclude:
@@ -1886,21 +2059,7 @@ def _inat_species_page(query, page, per_page, taxon_id, timeout, exclude=None):
         params["swlng"] = query["swlng"]
         params["nelat"] = query["nelat"]
         params["nelng"] = query["nelng"]
-    try:
-        resp = http.get(
-            SPECIES_COUNTS_URL,
-            params=params,
-            headers=_SPECIES_HEADERS,
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-    except (requests.RequestException, ValueError) as exc:
-        app.logger.warning("iNaturalist species_counts failed: %s", exc)
-        return None
-    if not isinstance(payload, dict):
-        return None
-    return payload
+    return _inat_get(SPECIES_COUNTS_URL, params, timeout, _SPECIES_HEADERS)
 
 
 def _collect_species_rows(query, taxon_id, per_page, max_pages, deadline, exclude=None):
@@ -1914,9 +2073,9 @@ def _collect_species_rows(query, taxon_id, per_page, max_pages, deadline, exclud
             time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
         if time.monotonic() >= deadline:
             break
-        remaining = max(0.4, deadline - time.monotonic())
+        remaining = max(3.0, deadline - time.monotonic())
         data = _inat_species_page(
-            query, page, per_page, taxon_id, (1.0, min(2.5, remaining)), exclude=exclude
+            query, page, per_page, taxon_id, (3.0, min(8.0, remaining)), exclude=exclude
         )
         if data is None:
             break
@@ -1969,7 +2128,7 @@ def _fetch_short_species_list(query, deadline):
         if not pending or time.monotonic() >= deadline:
             break
         still_pending = []
-        with ThreadPoolExecutor(max_workers=len(pending) or 1) as pool:
+        with ThreadPoolExecutor(max_workers=1) as pool:
             futures = [pool.submit(fetch_taxon, group, taxon_id) for group, taxon_id in pending]
             for (group, taxon_id), future in zip(pending, futures):
                 try:
@@ -1984,9 +2143,12 @@ def _fetch_short_species_list(query, deadline):
                     still_pending.append((group, taxon_id))
         pending = still_pending
 
-    if not any(buckets.values()):
+    if pending or not any(buckets.values()):
+        # A partial quota list is not usable. Prefer the curated list when this region has one.
         if query.get("curated_fallback"):
-            return _curated_species_payload()
+            payload = _curated_species_payload()
+            payload["complete"] = True
+            return payload
         return _empty_species()
     species = assemble_quota_list(
         {"label": group["label"], "quota": group["quota"], "rows": buckets[group["label"]]}
@@ -1995,7 +2157,7 @@ def _fetch_short_species_list(query, deadline):
     return {
         "species": species,
         "available": sum(totals.values()),
-        "complete": not pending,
+        "complete": True,
         "source": "inaturalist",
     }
 
@@ -2098,7 +2260,7 @@ def load_species_list(query, mode, budget, refresh_incomplete=False, _retry=True
             return cached
         with _SPECIES_LOCK:
             shared = _SPECIES_WAIT_RESULT.get(key)
-        if shared:
+        if shared and (shared.get("complete") or shared.get("source") in ("curated", "none")):
             return shared
         if refresh_incomplete and _retry and not (cached and cached.get("complete")):
             return load_species_list(query, mode, budget, refresh_incomplete=True, _retry=False)
@@ -2134,7 +2296,7 @@ def prefetch_reference_limit():
     """How many Sea of Cortez reference photos to warm. FINFINDR_PREFETCH_REFS=0 disables it."""
     raw = (os.environ.get("FINFINDR_PREFETCH_REFS") or "").strip()
     if not raw:
-        return 24
+        return 0
     if raw.lower() in ("0", "false", "off", "no"):
         return 0
     try:
@@ -2175,6 +2337,8 @@ def _prefetch_species_lists():
         except OSError:
             app.logger.warning("species prefetch lock unavailable; warming without it")
         named = [region for region in REGIONS if region["id"] not in ("other", "my-location")]
+        if (os.environ.get("FINFINDR_PREFETCH_ALL") or "").strip() != "1":
+            named = [region for region in named if region["id"] == "sea-of-cortez"]
         named.sort(key=lambda region: 0 if region["id"] == "sea-of-cortez" else 1)
         for region in named:
             query = species_query_for(region, None, None)
@@ -2416,8 +2580,25 @@ def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key, extra_images
     }
 
 
+def plan_model_timeouts(remaining, primary_cap, fallback_cap, verify_reserve, fallback_enabled):
+    """Keep primary + fallback + verification inside the time still left."""
+    slack = 5.0
+    verify_reserve = max(0.0, verify_reserve)
+    fallback_hold = fallback_cap if fallback_enabled else 0.0
+    primary = min(primary_cap, remaining - verify_reserve - fallback_hold - slack)
+    if primary < 12.0 and fallback_enabled:
+        fallback_hold = 0.0
+        primary = min(primary_cap, remaining - verify_reserve - slack)
+    primary = max(0.0, primary)
+    left = remaining - primary
+    fallback_timeout = 0.0
+    if fallback_hold > 0 and left >= fallback_cap + verify_reserve:
+        fallback_timeout = min(fallback_cap, left - verify_reserve - 1.0)
+    return primary, max(0.0, fallback_timeout)
+
+
 def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, extra_reserve=0, extra_images=None):
-    """Primary model gets most of the budget. One faster fallback uses what is left.
+    """Primary model gets most of the budget. Fallback runs only when it still fits.
 
     Wall time stays under FINFINDR_TIME_BUDGET (default 110s) so a 120s worker
     can still return JSON.
@@ -2431,22 +2612,22 @@ def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, ext
     def remaining():
         return deadline - time.monotonic()
 
-    reserve = 15.0 + max(0.0, extra_reserve)
-    primary_timeout = min(primary_cap, max(1.0, remaining() - reserve))
-    if remaining() < reserve + 5:
-        primary_timeout = max(1.0, remaining() - 1.0)
+    fallback_model = resolve_fallback_model(model)
+    primary_timeout, fallback_timeout = plan_model_timeouts(
+        remaining(), primary_cap, fallback_cap, max(0.0, extra_reserve), bool(fallback_model)
+    )
+    primary_timeout = max(1.0, primary_timeout) if remaining() > 2 else max(0.5, remaining() - 0.2)
     result = _call_vision_model(jpeg_bytes, prompt, model, primary_timeout, api_key, extra_images)
     attempts.append(_attempt_record(model, result["ms"], result["ok"], None if result["ok"] else result.get("error")))
     if result["ok"] or not result["retryable"]:
         return result, attempts
 
-    fallback = resolve_fallback_model(model)
-    left = remaining()
-    if fallback and left >= 5:
+    if fallback_model and fallback_timeout >= 5 and remaining() >= fallback_timeout + max(0.0, extra_reserve):
         result = _call_vision_model(
-            jpeg_bytes, prompt, fallback, min(fallback_cap, left - 1.0), api_key, extra_images
+            jpeg_bytes, prompt, fallback_model, min(fallback_timeout, remaining() - max(0.0, extra_reserve) - 1.0),
+            api_key, extra_images,
         )
-        attempts.append(_attempt_record(fallback, result["ms"], result["ok"], None if result["ok"] else result.get("error")))
+        attempts.append(_attempt_record(fallback_model, result["ms"], result["ok"], None if result["ok"] else result.get("error")))
     return result, attempts
 
 
@@ -2573,10 +2754,17 @@ def _time_left(request_started):
     return request_started + budget - time.monotonic()
 
 
-def load_species_for_request(region, lat, lng, mode):
+def load_species_for_request(region, lat, lng, mode, exclude_observation_id=None):
     """Use coordinates worldwide. Widen the radius once when the local list is sparse."""
     query = species_query_for(region, lat, lng)
-    budget = 4.0 if mode == "short" else 12.0
+    if query and exclude_observation_id:
+        query = dict(query)
+        query["not_id"] = str(exclude_observation_id)
+        query["key"] = f"{query['key']}:not:{exclude_observation_id}"
+    left = call_time_left()
+    budget = 20.0 if mode == "short" else 30.0
+    if left is not None:
+        budget = min(budget, max(2.0, left - 75.0))
     payload = load_species_list(query, mode, budget)
     if not query or not query.get("radius"):
         return payload
@@ -2584,7 +2772,11 @@ def load_species_for_request(region, lat, lng, mode):
     if count >= SPARSE_SPECIES_MIN or query["radius"] >= WIDE_RADIUS_KM:
         return payload
     wider = species_query_for(region, lat, lng, radius=WIDE_RADIUS_KM)
-    wider_payload = load_species_list(wider, mode, 3.0 if mode == "short" else 6.0)
+    if exclude_observation_id:
+        wider = dict(wider)
+        wider["not_id"] = str(exclude_observation_id)
+        wider["key"] = f"{wider['key']}:not:{exclude_observation_id}"
+    wider_payload = load_species_list(wider, mode, 8.0 if mode == "short" else 12.0)
     if len(wider_payload.get("species") or []) > count:
         return wider_payload
     return payload
@@ -2719,21 +2911,15 @@ def _cached_photos(key):
 
 
 def _inat_json(url, params, timeout):
-    try:
-        resp = http.get(
-            url,
-            params=params,
-            headers={
-                "User-Agent": "FinFindr/1.0 (reference photo lookup; https://github.com/fred123-eng/Finfindr)",
-                "Accept": "application/json",
-            },
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-    except (requests.RequestException, ValueError):
-        return None
-    return payload if isinstance(payload, dict) else None
+    return _inat_get(
+        url,
+        params,
+        timeout,
+        {
+            "User-Agent": "FinFindr/1.0 (reference photo lookup; https://github.com/fred123-eng/Finfindr)",
+            "Accept": "application/json",
+        },
+    )
 
 
 def confirm_species_name(scientific):
@@ -2743,7 +2929,7 @@ def confirm_species_name(scientific):
     payload = _inat_json(
         _TAXA_URL,
         {"q": scientific, "rank": "species", "per_page": 5, "locale": "en"},
-        (0.8, 1.5),
+        INAT_TIMEOUT,
     )
     for item in (payload or {}).get("results") or []:
         if (
@@ -2790,7 +2976,7 @@ def fetch_reference_photos(scientific, lat, lng, exclude_observation_id=None, de
     taxon_payload = _inat_json(
         _TAXA_URL,
         {"q": scientific, "rank": "species", "per_page": 5, "locale": "en"},
-        (1.0, 2.0),
+        INAT_TIMEOUT,
     )
     taxon = None
     for item in (taxon_payload or {}).get("results") or []:
@@ -2949,7 +3135,7 @@ def candidates_far_apart(candidates):
 
 
 def passing_verification(verification):
-    """True only when the reference check names a candidate and is confident."""
+    """True only when the reference check names a candidate, is confident, and cites a real trait."""
     if not isinstance(verification, dict):
         return False
     decision = (verification.get("decision") or "").strip()
@@ -2958,7 +3144,17 @@ def passing_verification(verification):
         return False
     if decision.upper() in ("UNSURE", "NO_MATCH", "NO MATCH"):
         return False
-    return verification.get("certainty") == "confident"
+    if verification.get("certainty") != "confident":
+        return False
+    trait = (verification.get("trait") or "").strip()
+    lowered = trait.lower().strip(" .")
+    if len(trait) < 8:
+        return False
+    if re.fullmatch(r"(very |quite |just |looks )?(similar|the same|same)( looking)?", lowered):
+        return False
+    if "similar" in lowered and not any(word in lowered for word in ("unlike", "differs", "different", "not ", "instead", "distinct", "rather")):
+        return False
+    return True
 
 
 def verification_mismatch(verification):
@@ -2998,7 +3194,18 @@ def certainty_for(candidates, verification):
     return "likely"
 
 
+_CONFIDENCE_RANK = {"high": 0, "medium": 1, "low": 2}
+
+
+def sort_candidates(candidates):
+    """High before medium before low, keeping the model's order inside one level."""
+    ranked = list(enumerate(candidates or []))
+    ranked.sort(key=lambda pair: (_CONFIDENCE_RANK.get((pair[1].get("confidence") or "medium"), 1), pair[0]))
+    return [item for _, item in ranked]
+
+
 def public_candidates(candidates, species):
+    candidates = sort_candidates(candidates)
     chosen = []
     seen = set()
     in_list = 0
@@ -3124,7 +3331,7 @@ def _obs_coordinates(obs):
     return None, None
 
 
-def count_research_records(scientific, lat, lng, radius, place_id=None, bbox=None):
+def count_research_records(scientific, lat, lng, radius, place_id=None, bbox=None, not_id=None):
     """How many research-grade records iNaturalist has in this radius or place. None if the lookup fails."""
     params = {
         "taxon_name": scientific,
@@ -3133,6 +3340,8 @@ def count_research_records(scientific, lat, lng, radius, place_id=None, bbox=Non
         "per_page": 1,
         "locale": "en",
     }
+    if not_id:
+        params["not_id"] = not_id
     if lat is not None and lng is not None:
         params.update({"lat": lat, "lng": lng, "radius": radius})
     elif place_id:
@@ -3141,7 +3350,7 @@ def count_research_records(scientific, lat, lng, radius, place_id=None, bbox=Non
         params.update(bbox)
     else:
         return None
-    payload = _inat_json(_OBS_URL, params, (1.0, 2.0))
+    payload = _inat_json(_OBS_URL, params, INAT_TIMEOUT)
     if not payload or "total_results" not in payload:
         return None
     try:
@@ -3165,7 +3374,7 @@ def nearest_research_records(scientific, lat, lng, limit=3):
         "order_by": "observed_on",
         "order": "desc",
         "locale": "en",
-    }, (1.0, 2.0))
+    }, INAT_TIMEOUT)
     rows = list((payload or {}).get("results") or [])
     if not rows:
         payload = _inat_json(_OBS_URL, {
@@ -3176,7 +3385,7 @@ def nearest_research_records(scientific, lat, lng, limit=3):
             "order_by": "observed_on",
             "order": "desc",
             "locale": "en",
-        }, (1.0, 2.0))
+        }, INAT_TIMEOUT)
         rows = list((payload or {}).get("results") or [])
     found = []
     for obs in rows:
@@ -3193,6 +3402,124 @@ def nearest_research_records(scientific, lat, lng, limit=3):
         })
     found.sort(key=lambda item: (item["distance_km"], item["url"]))
     return found[:limit]
+
+
+_COLOR_WORDS = {
+    "red": "red", "orange": "orange", "yellow": "yellow", "green": "green",
+    "blue": "blue", "purple": "purple", "pink": "pink", "black": "black",
+    "white": "white", "brown": "brown", "grey": "gray", "gray": "gray",
+    "scarlet": "red", "crimson": "red", "azure": "blue",
+}
+
+
+def _color_set(text):
+    words = re.findall(r"[a-z]+", (text or "").lower())
+    return {_COLOR_WORDS[word] for word in words if word in _COLOR_WORDS}
+
+
+def colors_contradict(visible_text, species_text):
+    """True when the photo notes name a color the species name does not share."""
+    visible = _color_set(visible_text)
+    named = _color_set(species_text)
+    if not visible or not named:
+        return False
+    return visible.isdisjoint(named)
+
+
+def _radius_wkt(lat, lng, radius_km):
+    delta_lat = radius_km / 111.0
+    cosine = max(0.2, abs(math.cos(math.radians(lat))))
+    delta_lng = radius_km / (111.0 * cosine)
+    south, north = lat - delta_lat, lat + delta_lat
+    west, east = lng - delta_lng, lng + delta_lng
+    return f"POLYGON(({west} {south},{east} {south},{east} {north},{west} {north},{west} {south}))"
+
+
+def _external_json(url, params):
+    return _inat_get(
+        url,
+        params,
+        INAT_TIMEOUT,
+        {"User-Agent": "FinFindr/1.0 (range evidence; https://github.com/fred123-eng/Finfindr)", "Accept": "application/json"},
+    )
+
+
+def obis_records_nearby(scientific, lat, lng, radius_km):
+    """How many OBIS occurrences fall near the point. None when the lookup fails."""
+    if lat is None or lng is None or not scientific:
+        return None
+    payload = _external_json("https://api.obis.org/v3/occurrence", {
+        "scientificname": scientific,
+        "geometry": _radius_wkt(lat, lng, radius_km),
+        "size": 0,
+    })
+    if not payload or "total" not in payload:
+        return None
+    try:
+        return int(payload.get("total") or 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def fishbase_range_contains(scientific, lat, lng):
+    """True when a FishBase distribution box contains the point, False when none do, None if unknown."""
+    parts = (scientific or "").split()
+    if len(parts) < 2 or lat is None or lng is None:
+        return None
+    species = _external_json("https://fishbase.ropensci.org/species", {
+        "genus": parts[0],
+        "species": parts[1],
+    })
+    rows = species.get("data") if isinstance(species, dict) else None
+    if rows is None and isinstance(species, dict):
+        rows = species.get("results")
+    if isinstance(species, list):
+        rows = species
+    if not rows:
+        return None
+    spec_code = None
+    for row in rows:
+        if isinstance(row, dict) and row.get("SpecCode"):
+            spec_code = row["SpecCode"]
+            break
+    if not spec_code:
+        return None
+    distributions = _external_json("https://fishbase.ropensci.org/distributions", {"SpecCode": spec_code})
+    boxes = distributions.get("data") if isinstance(distributions, dict) else None
+    if isinstance(distributions, list):
+        boxes = distributions
+    if not boxes:
+        return None
+    for box in boxes:
+        if not isinstance(box, dict):
+            continue
+        try:
+            north = float(box.get("NorthernLat") if box.get("NorthernLat") is not None else box.get("NorthLat"))
+            south = float(box.get("SouthernLat") if box.get("SouthernLat") is not None else box.get("SouthLat"))
+            west = float(box.get("WesternLong") if box.get("WesternLong") is not None else box.get("WestLong"))
+            east = float(box.get("EasternLong") if box.get("EasternLong") is not None else box.get("EastLong"))
+        except (TypeError, ValueError):
+            continue
+        if south <= lat <= north and west <= lng <= east:
+            return True
+    return False
+
+
+def external_range_status(scientific, lat, lng, radius_km):
+    """'known', 'absent', or 'unknown' from OBIS and FishBase. Unknown means do not flag."""
+    if call_time_left() is not None and call_time_left() < 3:
+        return "unknown"
+    obis = obis_records_nearby(scientific, lat, lng, radius_km)
+    fish = fishbase_range_contains(scientific, lat, lng)
+    if obis is None and fish is None:
+        return "unknown"
+    if obis is not None and obis > 0:
+        return "known"
+    if fish is True:
+        return "known"
+    if obis == 0 or fish is False:
+        return "absent"
+    return "unknown"
 
 
 def _result_text_for(candidate, group, alt, notes, confidence):
@@ -3220,6 +3547,11 @@ def favicon():
 def _permissions_policy(response):
     response.headers.setdefault("Permissions-Policy", "geolocation=(self)")
     return response
+
+
+@app.route("/identify", methods=["GET", "HEAD"])
+def identify_get():
+    return jsonify({"error": "Use POST to identify a photo."}), 405
 
 
 @app.route("/identify", methods=["POST"])
@@ -3260,8 +3592,9 @@ def identify():
         }), 500
 
     request_started = time.monotonic()
+    set_call_deadline(request_started + _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115))
     started = time.perf_counter()
-    species_payload = load_species_for_request(region, lat, lng, mode)
+    species_payload = load_species_for_request(region, lat, lng, mode, exclude_observation)
     list_fetch_ms = int(round((time.perf_counter() - started) * 1000))
     species = species_payload.get("species") or []
     locality = locality_text(region, lat, lng, coord_source)
@@ -3282,7 +3615,8 @@ def identify():
     source = species_payload.get("source") or "none"
 
     result, attempts = _run_model_attempts(
-        jpeg_bytes, prompt, model, xai_key, request_started, extra_reserve=20 if verify else 0
+        jpeg_bytes, prompt, model, xai_key, request_started,
+        extra_reserve=verify_timeout_cap() if verify else 0,
     )
     model_ms = sum(item["ms"] for item in attempts)
     answered = result.get("model") or model
@@ -3336,7 +3670,11 @@ def identify():
             "discovery": None,
             "meta": meta,
         })
-    candidates = _prepare_off_list_candidates(parse_model_candidates(text), species)
+    parsed_candidates = parse_model_candidates(text)
+    off_list_proposed = sum(1 for item in parsed_candidates if item.get("off_list"))
+    candidates = _prepare_off_list_candidates(parsed_candidates, species)
+    off_list_kept = sum(1 for item in candidates if item.get("off_list"))
+    app.logger.info("off_list_proposed=%s off_list_kept=%s", off_list_proposed, off_list_kept)
     verify_used = False
     verify_attempted = False
     verify_ms = 0
@@ -3407,12 +3745,19 @@ def identify():
                 verify_skipped = _verify_skip_reason(verify_result)
     for candidate in candidates:
         candidate.pop("_reference_urls", None)
+    verification_disagreed = bool(
+        verify_used and verification is not None and not passing_verification(verification)
+    )
     certainty = certainty_for(candidates, verification if passing_verification(verification) else None)
-    if not passing_verification(verification):
+    if verification_disagreed:
         cap_unconfirmed_confidence(candidates)
-    if verify_attempted and not passing_verification(verification):
         certainty = "unsure"
     shown = public_candidates(candidates, species)
+    notes_text = _field_value(text, "Notes")
+    color_conflict = bool(shown) and colors_contradict(
+        f"{shown[0].get('trait') or ''} {notes_text}",
+        shown[0].get("common_name") or "",
+    )
     discovery = None
     notable_note = ""
     evidence = [f"photo_{photo_quality}"]
@@ -3423,13 +3768,19 @@ def identify():
     discovery_checked = False
     record_count = None
     focus = shown[0]["scientific_name"] if shown else ""
-    no_match = bool(verification and verification.get("decision") == "NO_MATCH")
+    rejected_all = bool(
+        verify_used and verification and (
+            verification.get("decision") == "NO_MATCH" or verification_mismatch(verification)
+        )
+    )
+    no_match = color_conflict or rejected_all
     strong_id = (
-        photo_quality == "good"
+        not no_match
+        and not fallback_used
+        and photo_quality == "good"
         and certainty == "confident"
         and verify_used
-        and verification
-        and verification.get("certainty") == "confident"
+        and passing_verification(verification)
         and verification.get("scientific_name")
         and focus
         and verification["scientific_name"].lower() == focus.lower()
@@ -3457,13 +3808,18 @@ def identify():
         certainty = "unsure"
         evidence.append("no_species_match")
     elif discover and focus and photo_quality == "good" and lat is not None and lng is not None and _time_left(request_started) >= 3:
-        record_count = count_research_records(focus, lat, lng, rule["radius_km"])
+        record_count = count_research_records(
+            focus, lat, lng, rule["radius_km"], not_id=exclude_observation or None
+        )
         discovery_checked = record_count is not None
         evidence.append(f"range_rule={rule['text']}")
         if record_count is not None:
             evidence.append(f"records_in_radius={record_count}")
         unrecorded = record_count is not None and record_count <= rule["max_records"]
-        if unrecorded and strong_id:
+        range_status = external_range_status(focus, lat, lng, rule["radius_km"]) if unrecorded and strong_id else ""
+        if range_status:
+            evidence.append(f"external_range={range_status}")
+        if unrecorded and strong_id and range_status == "absent":
             nearest = nearest_research_records(focus, lat, lng)
             traits = [item.get("trait") for item in shown if item.get("trait")]
             if verification and verification.get("trait"):
@@ -3481,6 +3837,14 @@ def identify():
                 "rule": rule,
             }
             evidence.append("verification_agreed")
+        elif unrecorded and strong_id and range_status == "unknown":
+            certainty = "unsure"
+            notable_note = (
+                f"{shown[0].get('common_name') or focus} has {record_count} research-grade "
+                f"iNaturalist records within {rule['radius_km']} km, but outside range evidence "
+                "could not be checked. This is not flagged as a range extension."
+            )
+            evidence.append("range_evidence_unavailable")
         elif unrecorded and not strong_id:
             certainty = "unsure"
             notable_note = (
@@ -3500,13 +3864,18 @@ def identify():
     )
     meta["photo_quality"] = photo_quality
     meta["discovery_checked"] = discovery_checked
+    if fallback_used and certainty == "confident":
+        certainty = "likely"
+        if discovery and discovery.get("type") == "possible_range_extension":
+            discovery = None
+            evidence.append("fallback_not_confident")
     if not (verify_used and passing_verification(verification)):
         if certainty == "confident":
-            certainty = "unsure" if verify_attempted else ("likely" if shown else "unsure")
+            certainty = "likely" if shown else "unsure"
         if discovery and discovery.get("type") == "possible_range_extension":
             discovery = None
             evidence.append("discovery_blocked_without_verification")
-    if discovery and discovery.get("type") == "no_match" and not verify_used:
+    if discovery and discovery.get("type") == "no_match" and not (rejected_all or color_conflict):
         discovery = None
     meta["evidence"] = evidence
     meta["range_km"] = rule["radius_km"]
@@ -3517,6 +3886,8 @@ def identify():
     meta["verify_success_rate"] = verification_success_rate()
     meta["verify_timeout_s"] = verify_timeout_cap()
     meta["budget_s"] = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
+    meta["off_list_proposed"] = off_list_proposed
+    meta["off_list_kept"] = off_list_kept
     _log_identification(region["id"], meta)
     return jsonify({
         "result_text": text or "No response",
@@ -3535,14 +3906,22 @@ def too_large(_exc):
     return jsonify({"error": "That photo is too large. Please choose a smaller one."}), 413
 
 
+@app.errorhandler(HTTPException)
+def http_exception(exc):
+    return jsonify({"error": exc.description or "Request failed"}), exc.code
+
+
 @app.errorhandler(Exception)
 def unhandled(exc):
     app.logger.exception("Unhandled error on %s", request.path)
-    if request.path == "/identify":
-        return jsonify({"error": "Something went wrong. Please try again."}), 500
     if isinstance(exc, HTTPException):
-        return exc
-    return "Internal Server Error", 500
+        return jsonify({"error": exc.description or "Request failed"}), exc.code
+    return jsonify({"error": "Something went wrong. Please try again."}), 500
+
+
+@app.teardown_request
+def _clear_request_deadline(_exc):
+    clear_call_deadline()
 
 
 @app.before_request
