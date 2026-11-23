@@ -49,6 +49,7 @@ HTML = """
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>FinFindr</title>
+<link rel="icon" href="/favicon.ico">
 <style>
   :root { --deep: #0a2540; --teal: #0d9488; --aqua: #22d3ee; --white: #f8fafc; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -86,7 +87,7 @@ HTML = """
   #fileInput { display: block; width: 100%; max-width: 100%; margin: 1rem auto; font-size: 1rem; color: var(--white); }
   #results { max-width: 800px; margin: 0 auto; }
   .result-card { background: rgba(0,0,0,0.35); border-radius: 16px; margin-bottom: 1.25rem; border: 1px solid rgba(255,255,255,0.1); overflow: hidden; }
-  .result-card img { width: 100%; max-height: 280px; object-fit: cover; display: block; background: rgba(0,0,0,0.25); }
+  .result-card img.preview { width: 100%; max-height: 70vh; object-fit: contain; object-position: center; display: block; background: rgba(0,0,0,0.35); }
   .result-body { padding: 1rem; }
   .result-body h3 { margin-bottom: 0.3rem; font-size: 1.35rem; overflow-wrap: anywhere; }
   .scientific { margin: 0.45rem 0 0.7rem; padding: 0.55rem 0.75rem; border-radius: 12px; background: rgba(34, 211, 238, 0.12); border: 1px solid rgba(34, 211, 238, 0.45); }
@@ -115,7 +116,7 @@ HTML = """
     header h1 { font-size: 2rem; }
     .upload-zone { padding: 1.25rem 0.9rem; }
     #identifyBtn, .retry-btn { width: 100%; }
-    .result-card img { max-height: 220px; }
+    .result-card img.preview { max-height: 50vh; }
     .sci { font-size: 1.05rem; }
     .region-panel { text-align: left; }
   }
@@ -227,18 +228,24 @@ function readSavedLocation() {
   }
 }
 
-function requestLocation() {
+function applySavedLocation() {
   const saved = readSavedLocation();
-  if (saved) {
-    browserLat = saved.lat;
-    browserLng = saved.lng;
-    setLocationStatus("Using your location (" + saved.lat.toFixed(2) + ", " + saved.lng.toFixed(2) + ").");
+  if (!saved) {
+    setLocationStatus("Select Use my location to share your position. Photo GPS is still used when the picture has it.");
+    return;
   }
+  browserLat = saved.lat;
+  browserLng = saved.lng;
+  setLocationStatus("Using your saved location (" + saved.lat.toFixed(2) + ", " + saved.lng.toFixed(2) + ").");
+}
+
+function requestLocation() {
+  applySavedLocation();
   if (!navigator.geolocation) {
     setLocationStatus("Location is not available in this browser. Pick a region, or photos will be identified as Sea of Cortez / La Paz. Photo GPS is still used when the picture has it.");
     return;
   }
-  if (browserLat == null) setLocationStatus("Finding your location…");
+  setLocationStatus("Finding your location…");
   navigator.geolocation.getCurrentPosition(function (pos) {
     browserLat = pos.coords.latitude;
     browserLng = pos.coords.longitude;
@@ -273,7 +280,7 @@ function restoreRegionChoice() {
     speciesListSelect.value = listMode;
     if (debugMode && speciesListOptions) speciesListOptions.open = true;
   }
-  if (regionSelect.value === "my-location") requestLocation();
+  if (regionSelect.value === "my-location") applySavedLocation();
 }
 
 regionSelect.addEventListener("change", function () {
@@ -337,7 +344,12 @@ function showCandidates(card, candidates) {
       sci.textContent = item.scientific_name;
       cap.appendChild(sci);
     }
-    if (item.confidence) {
+    if (item.off_list) {
+      const off = document.createElement("div");
+      off.textContent = "Not on the regional list";
+      cap.appendChild(off);
+    }
+    if (item.confidence && item.confidence !== "high") {
       const conf = document.createElement("div");
       conf.className = "confidence";
       conf.textContent = item.confidence + " confidence";
@@ -472,11 +484,21 @@ function addRetry(card) {
 
 function inatSubmitLink() {
   const link = document.createElement("a");
+  link.className = "inat-submit";
   link.href = "https://www.inaturalist.org/observations/upload";
   link.target = "_blank";
   link.rel = "noopener";
   link.textContent = "Submit to iNaturalist for expert confirmation";
   return link;
+}
+
+function appendNearestRecord(box, discovery) {
+  if (discovery.nearest_known_record_km === null || discovery.nearest_known_record_km === undefined || discovery.nearest_known_record_km === "") return;
+  const line = document.createElement("p");
+  line.className = "nearest-record";
+  const source = discovery.nearest_known_record_source || "iNaturalist";
+  line.textContent = "Nearest known record: " + discovery.nearest_known_record_km + " km (" + source + ")";
+  box.appendChild(line);
 }
 
 function showPhotoRejection(card, data) {
@@ -519,6 +541,7 @@ function showDiscovery(card, data) {
       near.textContent = "Nearest known records";
       box.appendChild(heading);
       box.appendChild(lead);
+      appendNearestRecord(box, discovery);
       if (list.childNodes.length) {
         box.appendChild(why);
         box.appendChild(list);
@@ -540,6 +563,7 @@ function showDiscovery(card, data) {
     } else {
       box.appendChild(heading);
       box.appendChild(lead);
+      appendNearestRecord(box, discovery);
       if (list.childNodes.length) {
         box.appendChild(why);
         box.appendChild(list);
@@ -690,11 +714,11 @@ async function handleFile(file) {
     card.className = "result-card is-loading";
     card.setAttribute("aria-busy", "true");
     card.innerHTML = `
-      <img class="preview" alt="Photo being identified" style="width:100%; max-height:280px; object-fit:cover;">
+      <img class="preview" alt="Photo being identified" style="width:100%; max-height:70vh; object-fit:contain; object-position:center;">
       <div class="result-body">
         <div class="spinner" role="status" aria-label="Identifying photo"></div>
         <h3 class="progress-title">Identifying…</h3>
-        <p class="hint progress-note">Usually under a minute.</p>
+        <p class="hint progress-note">Usually 30–90 seconds.</p>
         <div class="scientific" hidden>
           <div class="sci-label" hidden>Scientific name</div>
           <div class="sci" translate="no"></div>
@@ -1723,7 +1747,11 @@ def assemble_prompt(locality, species, lookalikes, lat, lng):
         "Candidate 1: <scientific name> | <common name> | <high/medium/low> | <one trait that separates it from the next candidate>",
         "Candidate 2: <scientific name> | <common name> | <high/medium/low> | <one trait>",
         "Candidate 3: <scientific name or none> | <common name> | <high/medium/low> | <one trait>",
+        "Off-list 1: <scientific name or none> | <common name> | <trait that the regional list does not cover>",
+        "Off-list 2: <scientific name or none> | <common name> | <trait>",
         "List the best supported species first. Include a look-alike when one is plausible. Use none only when you have no second species.",
+        "When the visible animal matches a listed species, set both off-list lines to none.",
+        "When it does not, name up to two real species that are not in the regional list. Do not invent a name.",
     ])
     return NL.join(lines)
 
@@ -2330,8 +2358,8 @@ def _attempt_record(model, elapsed_ms, ok, error=None):
     return record
 
 
-def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key, extra_images=None, extra_detail="low"):
-    """One model attempt. Retryable covers timeout, connection loss, and HTTP 5xx."""
+def _call_vision_model_once(jpeg_bytes, prompt, model, timeout, api_key, extra_images=None, extra_detail="low"):
+    """One HTTP attempt. The socket timeout matches the caller's wall-clock budget."""
     started = time.perf_counter()
     payload = _vision_payload(jpeg_bytes, prompt, model, extra_images, extra_detail=extra_detail)
     try:
@@ -2362,6 +2390,30 @@ def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key, extra_images
         app.logger.warning("xAI invalid JSON model=%s", model)
         return {"ok": False, "retryable": True, "model": model, "ms": elapsed, "error": "invalid_json", "status": 502}
     return {"ok": True, "retryable": False, "model": model, "ms": elapsed, "data": data, "status": 200}
+
+
+def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key, extra_images=None, extra_detail="low"):
+    """One model attempt, stopped when the wall clock runs out even if the socket keeps trickling."""
+    started = time.perf_counter()
+    holder = {}
+
+    def run():
+        holder["result"] = _call_vision_model_once(
+            jpeg_bytes, prompt, model, timeout, api_key, extra_images, extra_detail
+        )
+
+    worker = threading.Thread(target=run, name="finfindr-model", daemon=True)
+    worker.start()
+    worker.join(max(0.2, timeout))
+    if worker.is_alive():
+        elapsed = int(round((time.perf_counter() - started) * 1000))
+        app.logger.warning("xAI wall-clock timeout model=%s after %sms", model, elapsed)
+        return {"ok": False, "retryable": True, "model": model, "ms": elapsed, "error": "timeout", "status": 504}
+    return holder.get("result") or {
+        "ok": False, "retryable": True, "model": model,
+        "ms": int(round((time.perf_counter() - started) * 1000)),
+        "error": "failed", "status": 502,
+    }
 
 
 def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, extra_reserve=0, extra_images=None):
@@ -2399,6 +2451,7 @@ def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, ext
 
 
 _CANDIDATE_LINE = re.compile(r"^candidate\s*\d+\s*:\s*(.+)$", re.IGNORECASE)
+_OFFLIST_LINE = re.compile(r"^off-?list\s*\d+\s*:\s*(.+)$", re.IGNORECASE)
 _PHOTO_CACHE = {}
 _PHOTO_LOCK = threading.Lock()
 _TAXA_URL = "https://api.inaturalist.org/v1/taxa"
@@ -2537,49 +2590,84 @@ def load_species_for_request(region, lat, lng, mode):
     return payload
 
 
-def parse_model_candidates(text):
-    """Top species from the first pass. Falls back to the single named species."""
-    normalized = _result_lines(text or "")
-    found = []
-    seen = set()
-    for line in normalized.split("\n"):
-        match = _CANDIDATE_LINE.match(line.strip())
-        if not match:
-            continue
-        parts = [part.strip() for part in match.group(1).split("|")]
-        if not parts or parts[0].lower() in ("", "none"):
-            continue
-        scientific = exact_scientific_name(parts[0])
-        if not scientific or scientific.lower() in seen:
-            continue
-        confidence = parts[2].lower() if len(parts) > 2 else "medium"
-        if confidence not in ("high", "medium", "low"):
-            confidence = "medium"
-        found.append({
-            "scientific_name": scientific,
-            "common_name": parts[1] if len(parts) > 1 and parts[1].lower() != "none" else "",
-            "confidence": confidence,
-            "trait": parts[3] if len(parts) > 3 else "",
-            "reference_photo": None,
-        })
-        seen.add(scientific.lower())
-        if len(found) == 3:
-            break
-    if found:
-        return found
-    scientific = exact_scientific_name(_field_value(normalized, "Scientific name"))
+def _candidate_from_parts(parts, off_list=False):
+    if not parts or parts[0].lower() in ("", "none"):
+        return None
+    scientific = exact_scientific_name(parts[0])
     if not scientific:
-        return []
-    confidence = _field_value(normalized, "Confidence").lower()
+        return None
+    confidence = parts[2].lower() if len(parts) > 2 else "medium"
     if confidence not in ("high", "medium", "low"):
         confidence = "medium"
-    return [{
+    trait = parts[3] if len(parts) > 3 else (parts[2] if off_list and len(parts) > 2 and confidence == "medium" and parts[2].lower() not in ("high", "medium", "low") else "")
+    if off_list and len(parts) == 3 and parts[2].lower() not in ("high", "medium", "low"):
+        confidence = "medium"
+        trait = parts[2]
+    return {
         "scientific_name": scientific,
-        "common_name": _field_value(normalized, "Common name"),
+        "common_name": parts[1] if len(parts) > 1 and parts[1].lower() != "none" else "",
         "confidence": confidence,
-        "trait": "",
+        "trait": trait,
+        "off_list": off_list,
         "reference_photo": None,
-    }]
+    }
+
+
+def parse_model_candidates(text):
+    """Top species from the first pass, plus up to two off-list proposals."""
+    normalized = _result_lines(text or "")
+    found = []
+    off_list = []
+    seen = set()
+    for line in normalized.split("\n"):
+        stripped = line.strip()
+        off_match = _OFFLIST_LINE.match(stripped)
+        match = _CANDIDATE_LINE.match(stripped)
+        if off_match:
+            item = _candidate_from_parts([part.strip() for part in off_match.group(1).split("|")], off_list=True)
+            if item and item["scientific_name"].lower() not in seen and len(off_list) < 2:
+                off_list.append(item)
+                seen.add(item["scientific_name"].lower())
+            continue
+        if not match or len(found) >= 3:
+            continue
+        item = _candidate_from_parts([part.strip() for part in match.group(1).split("|")], off_list=False)
+        if not item or item["scientific_name"].lower() in seen:
+            continue
+        if "off_list" in stripped.lower() or "off-list" in stripped.lower():
+            item["off_list"] = True
+            if len(off_list) < 2:
+                off_list.append(item)
+                seen.add(item["scientific_name"].lower())
+            continue
+        found.append(item)
+        seen.add(item["scientific_name"].lower())
+    if not found:
+        scientific = exact_scientific_name(_field_value(normalized, "Scientific name"))
+        if scientific and scientific.lower() not in seen:
+            confidence = _field_value(normalized, "Confidence").lower()
+            if confidence not in ("high", "medium", "low"):
+                confidence = "medium"
+            found.append({
+                "scientific_name": scientific,
+                "common_name": _field_value(normalized, "Common name"),
+                "confidence": confidence,
+                "trait": "",
+                "off_list": False,
+                "reference_photo": None,
+            })
+            seen.add(scientific.lower())
+    top = exact_scientific_name(_field_value(normalized, "Scientific name"))
+    if top and top.lower() not in seen and len(off_list) < 2:
+        off_list.append({
+            "scientific_name": top,
+            "common_name": _field_value(normalized, "Common name"),
+            "confidence": "medium",
+            "trait": "",
+            "off_list": True,
+            "reference_photo": None,
+        })
+    return found + off_list
 
 
 def _medium_photo_url(url):
@@ -2646,6 +2734,46 @@ def _inat_json(url, params, timeout):
     except (requests.RequestException, ValueError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def confirm_species_name(scientific):
+    """True when iNaturalist has this exact species name. Failures count as unconfirmed."""
+    if not scientific:
+        return False
+    payload = _inat_json(
+        _TAXA_URL,
+        {"q": scientific, "rank": "species", "per_page": 5, "locale": "en"},
+        (0.8, 1.5),
+    )
+    for item in (payload or {}).get("results") or []:
+        if (
+            isinstance(item, dict)
+            and item.get("rank") in _SPECIES_RANKS
+            and (item.get("name") or "").lower() == scientific.lower()
+        ):
+            return True
+    return False
+
+
+def _prepare_off_list_candidates(candidates, species):
+    """Keep off-list names only when they are real taxa and not already in the regional list."""
+    listed = {(item.get("scientific") or "").lower() for item in species or [] if isinstance(item, dict)}
+    kept = []
+    checked = 0
+    for item in candidates:
+        if not item.get("off_list"):
+            kept.append(item)
+            continue
+        if item["scientific_name"].lower() in listed:
+            item["off_list"] = False
+            kept.append(item)
+            continue
+        if checked >= 2:
+            continue
+        checked += 1
+        if confirm_species_name(item["scientific_name"]):
+            kept.append(item)
+    return kept
 
 
 def fetch_reference_photos(scientific, lat, lng, exclude_observation_id=None, deadline=None):
@@ -2757,6 +2885,7 @@ def _verification_prompt(candidates):
         "Each later image is a research-grade reference photo of one candidate. Compare diagnostic traits you can see. Do not pick a candidate just because it was listed first.",
         "If the photos do not separate the candidates, say you cannot decide.",
         "If the animal matches none of the reference photos, the decision is NO_MATCH. Do not force the closest name.",
+        "If a clear trait such as the main color disagrees with every reference photo, the decision is NO_MATCH.",
         "",
     ]
     for index, candidate in enumerate(candidates, start=1):
@@ -2832,6 +2961,30 @@ def passing_verification(verification):
     return verification.get("certainty") == "confident"
 
 
+def verification_mismatch(verification):
+    """The reference check rejected the candidates, including a clear color mismatch."""
+    if not isinstance(verification, dict) or passing_verification(verification):
+        return False
+    if (verification.get("decision") or "").upper().replace(" ", "_") == "NO_MATCH":
+        return True
+    trait = (verification.get("trait") or "").lower()
+    cues = (
+        "does not match", "doesn't match", "do not match", "don't match",
+        "no match", "none of the reference", "wrong color", "wrong colour",
+        "different color", "different colour", "color does not", "colour does not",
+        "main color", "main colour",
+    )
+    return any(cue in trait for cue in cues)
+
+
+def cap_unconfirmed_confidence(candidates):
+    """A failed reference check must not leave a candidate labeled high."""
+    for item in candidates:
+        if item.get("confidence") == "high":
+            item["confidence"] = "low"
+    return candidates
+
+
 def certainty_for(candidates, verification):
     """Confident only after a passing reference-photo check. Otherwise at most likely."""
     if not candidates:
@@ -2846,7 +2999,24 @@ def certainty_for(candidates, verification):
 
 
 def public_candidates(candidates, species):
-    chosen = candidates[:3]
+    chosen = []
+    seen = set()
+    in_list = 0
+    off_list = 0
+    for item in candidates:
+        key = (item.get("scientific_name") or "").lower()
+        if not key or key in seen:
+            continue
+        if item.get("off_list"):
+            if off_list >= 2:
+                continue
+            off_list += 1
+        else:
+            if in_list >= 3:
+                continue
+            in_list += 1
+        chosen.append(item)
+        seen.add(key)
     resolved = resolve_common_names([item["scientific_name"] for item in chosen], species)
     cleaned = []
     for item in chosen:
@@ -2866,6 +3036,7 @@ def public_candidates(candidates, species):
             "common_name": common,
             "confidence": item.get("confidence") or "medium",
             "trait": item.get("trait") or "",
+            "off_list": bool(item.get("off_list")),
             "reference_photo": photo,
         })
     return cleaned
@@ -3040,6 +3211,17 @@ def index():
     return render_template_string(HTML)
 
 
+@app.route("/favicon.ico")
+def favicon():
+    return ("", 204)
+
+
+@app.after_request
+def _permissions_policy(response):
+    response.headers.setdefault("Permissions-Policy", "geolocation=(self)")
+    return response
+
+
 @app.route("/identify", methods=["POST"])
 def identify():
     if "image" not in request.files:
@@ -3115,10 +3297,13 @@ def identify():
         else:
             status = 502
             message = "Could not identify this photo. Please try again."
+        total_ms = int(round((time.monotonic() - request_started) * 1000))
         meta = _identification_meta(
             mode, sent, available, truncated, source, list_fetch_ms, model_ms,
             None, "unavailable", answered, image_px, fallback_used, attempts,
+            False, 0, 0, total_ms, "",
         )
+        meta["budget_s"] = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
         _log_identification(region["id"], meta)
         return jsonify({"error": message, "region_label": region_label, "meta": meta}), status
 
@@ -3151,7 +3336,7 @@ def identify():
             "discovery": None,
             "meta": meta,
         })
-    candidates = parse_model_candidates(text)
+    candidates = _prepare_off_list_candidates(parse_model_candidates(text), species)
     verify_used = False
     verify_attempted = False
     verify_ms = 0
@@ -3172,8 +3357,10 @@ def identify():
         )
         reference_fetch_ms = int(round((time.perf_counter() - fetch_started) * 1000))
         reference_urls = []
-        for candidate in candidates:
-            reference_urls.extend(candidate.get("_reference_urls") or [])
+        photo_order = [item for item in candidates if item.get("off_list")] + [item for item in candidates if not item.get("off_list")]
+        for candidate in photo_order:
+            reference_urls.extend((candidate.get("_reference_urls") or [])[:1])
+        reference_urls = reference_urls[:4]
         call_timeout = verify_call_budget(request_started)
         if not reference_urls:
             verify_skipped = "no_photos"
@@ -3188,7 +3375,7 @@ def identify():
                 answered,
                 call_timeout,
                 xai_key,
-                reference_urls[:3],
+                reference_urls,
                 extra_detail="low",
             )
             verify_ms = int(round((time.perf_counter() - verify_started) * 1000))
@@ -3196,6 +3383,13 @@ def identify():
             if verify_result.get("ok"):
                 verify_used = True
                 verification = _parse_verification(_extract_text(verify_result["data"]), candidates)
+                if verification_mismatch(verification):
+                    verification = {
+                        "decision": "NO_MATCH",
+                        "certainty": "unsure",
+                        "trait": verification.get("trait") or "",
+                        "scientific_name": "",
+                    }
                 if verification.get("trait"):
                     for candidate in candidates:
                         if candidate["scientific_name"].lower() == (verification.get("scientific_name") or "").lower():
@@ -3213,7 +3407,11 @@ def identify():
                 verify_skipped = _verify_skip_reason(verify_result)
     for candidate in candidates:
         candidate.pop("_reference_urls", None)
-    certainty = certainty_for(candidates, verification if verify_used else None)
+    certainty = certainty_for(candidates, verification if passing_verification(verification) else None)
+    if not passing_verification(verification):
+        cap_unconfirmed_confidence(candidates)
+    if verify_attempted and not passing_verification(verification):
+        certainty = "unsure"
     shown = public_candidates(candidates, species)
     discovery = None
     notable_note = ""
@@ -3277,6 +3475,8 @@ def identify():
                 "records_in_region": record_count,
                 "radius_km": rule["radius_km"],
                 "nearest_records": nearest,
+                "nearest_known_record_km": nearest[0]["distance_km"] if nearest else None,
+                "nearest_known_record_source": "iNaturalist" if nearest else "",
                 "traits": [trait for trait in traits if trait][:3],
                 "rule": rule,
             }
@@ -3289,6 +3489,9 @@ def identify():
                 "but this photo is not strong enough to flag a range extension."
             )
             evidence.append("notable_if_confirmed")
+    focus_off_list = bool(shown and shown[0].get("off_list"))
+    if focus_off_list and not (discovery and discovery.get("type") == "possible_range_extension"):
+        certainty = "unsure"
     total_ms = int(round((time.monotonic() - request_started) * 1000))
     meta = _identification_meta(
         mode, sent, available, truncated, source, list_fetch_ms, model_ms,
@@ -3299,7 +3502,7 @@ def identify():
     meta["discovery_checked"] = discovery_checked
     if not (verify_used and passing_verification(verification)):
         if certainty == "confident":
-            certainty = "likely" if shown else "unsure"
+            certainty = "unsure" if verify_attempted else ("likely" if shown else "unsure")
         if discovery and discovery.get("type") == "possible_range_extension":
             discovery = None
             evidence.append("discovery_blocked_without_verification")
@@ -3313,6 +3516,7 @@ def identify():
     meta["verify_succeeded"] = bool(verify_used and passing_verification(verification))
     meta["verify_success_rate"] = verification_success_rate()
     meta["verify_timeout_s"] = verify_timeout_cap()
+    meta["budget_s"] = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
     _log_identification(region["id"], meta)
     return jsonify({
         "result_text": text or "No response",
@@ -3329,11 +3533,6 @@ def identify():
 @app.errorhandler(RequestEntityTooLarge)
 def too_large(_exc):
     return jsonify({"error": "That photo is too large. Please choose a smaller one."}), 413
-
-
-@app.route("/favicon.ico")
-def favicon():
-    return ("", 204)
 
 
 @app.errorhandler(Exception)
