@@ -212,8 +212,11 @@ class IdentifyTests(unittest.TestCase):
             return FakeResponse({"error": "upstream"}, status=self.fail_status[model])
         if self.captured.get("delay"):
             time.sleep(self.captured["delay"])
+        by_model = self.captured.get("model_text_by_model") or {}
         if "OFFLIST_FOLLOWUP" in prompt and self.captured.get("offlist_text"):
             text = self.captured["offlist_text"]
+        elif model in by_model and "The first image is the animal" not in prompt:
+            text = by_model[model]
         elif "The first image is the animal" in prompt and self.captured.get("verify_raises") == "timeout":
             raise requests.Timeout("verify slow")
         elif "The first image is the animal" in prompt and self.captured.get("verify_text"):
@@ -307,8 +310,10 @@ class IdentifyTests(unittest.TestCase):
         self.assertIn("propose up to 2 off_list species", prompt)
         self.assertEqual(self.captured["json"]["temperature"], 0)
         self.assertEqual(self.captured["json"]["seed"], 0)
-        self.assertEqual(self.captured["json"]["model"], "grok-4.7")
-        self.assertEqual(body["meta"]["model"], "grok-4.7")
+        self.assertEqual({call["model"] for call in self.captured["calls"] if not call.get("verify")}, {"grok-4", "grok-4.7"})
+        self.assertEqual(body["meta"]["final_source"], "both")
+        self.assertTrue(body["meta"]["agreement"])
+        self.assertEqual(body["meta"]["models_run"], ["grok-4", "grok-4.7"])
         self.assertEqual(body["meta"]["image_px"], "80x60")
         self.assertEqual(body["certainty"], "likely")
         self.assertEqual(body["meta"]["verify_skipped"], "no_photos")
@@ -532,7 +537,7 @@ class IdentifyTests(unittest.TestCase):
             content_type="multipart/form-data",
         )
         self.assertEqual(response.get_json()["meta"]["image_px"], "1024x512")
-        self.assertEqual(self.captured["json"]["model"], "grok-4.7")
+        self.assertIn("grok-4.7", {call["model"] for call in self.captured["calls"]})
 
         os.environ["MAX_IMAGE_PX"] = "800"
         os.environ["XAI_MODEL"] = "grok-4.5"
@@ -606,22 +611,24 @@ class IdentifyTests(unittest.TestCase):
         self.assertLess(time.perf_counter() - started, 0.1)
         self.assertEqual(cached["Zanclus imaginatus"], "Common imaginatus")
 
-    def test_primary_timeout_falls_back_within_budget(self):
+    def test_slow_model_timeout_keeps_the_fast_candidates(self):
         self.fail_timeout = {"grok-4.7"}
         response = self.post_photo()
         body = response.get_json()
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(body["meta"]["model"], "grok-4")
-        self.assertTrue(body["meta"]["fallback_used"])
-        self.assertEqual([item["model"] for item in body["meta"]["attempts"]], ["grok-4.7", "grok-4"])
-        self.assertFalse(body["meta"]["attempts"][0]["ok"])
-        self.assertEqual(body["meta"]["attempts"][0]["error"], "timeout")
-        self.assertTrue(body["meta"]["attempts"][1]["ok"])
-        self.assertGreaterEqual(self.captured["calls"][0]["timeout"], 60)
-        self.assertLessEqual(self.captured["calls"][0]["timeout"], 78)
-        self.assertLessEqual(self.captured["calls"][1]["timeout"], 25)
-        self.assertEqual(self.captured["calls"][0]["temperature"], 0)
-        self.assertEqual(self.captured["calls"][0]["seed"], 0)
+        self.assertEqual(body["meta"]["final_source"], "grok-4")
+        self.assertFalse(body["meta"]["agreement"])
+        self.assertFalse(body["meta"]["fallback_used"])
+        by_model = {item["model"]: item for item in body["meta"]["attempts"]}
+        self.assertFalse(by_model["grok-4.7"]["ok"])
+        self.assertEqual(by_model["grok-4.7"]["error"], "timeout")
+        self.assertTrue(by_model["grok-4"]["ok"])
+        slow = next(call for call in self.captured["calls"] if call["model"] == "grok-4.7")
+        fast = next(call for call in self.captured["calls"] if call["model"] == "grok-4")
+        self.assertGreaterEqual(slow["timeout"], 60)
+        self.assertLessEqual(fast["timeout"], 30)
+        self.assertEqual(fast["temperature"], 0)
+        self.assertEqual(fast["seed"], 0)
         self.assertIn("Cortez Rainbow Wrasse", body["result_text"])
 
     def test_both_models_timing_out_stays_json(self):
@@ -638,21 +645,22 @@ class IdentifyTests(unittest.TestCase):
         self.assertEqual(body["meta"]["verify_pass_rate"], 0)
         self.assertEqual(body["meta"]["verify_success_rate"], 0)
 
-    def test_client_error_does_not_fall_back(self):
+    def test_one_model_http_400_does_not_drop_the_other(self):
         self.fail_status = {"grok-4.7": 400}
         response = self.post_photo()
-        self.assertEqual(response.status_code, 502)
-        self.assertEqual(len(self.captured["calls"]), 1)
-        self.assertFalse(response.get_json()["meta"]["fallback_used"])
-        self.assertIn("try another", response.get_json()["error"])
+        body = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("error", body)
+        self.assertEqual(body["meta"]["final_source"], "grok-4")
+        self.assertFalse(body["meta"]["model_candidates"]["grok-4.7"]["ok"])
 
-    def test_fallback_model_can_be_disabled(self):
-        os.environ["XAI_FALLBACK_MODEL"] = ""
+    def test_single_model_list_can_replace_the_pair(self):
+        os.environ["XAI_MODELS"] = "grok-4.7"
         self.fail_timeout = {"grok-4.7"}
         try:
             response = self.post_photo()
         finally:
-            os.environ.pop("XAI_FALLBACK_MODEL", None)
+            os.environ.pop("XAI_MODELS", None)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(self.captured["calls"]), 1)
         self.assertFalse(response.get_json()["meta"]["fallback_used"])
@@ -1415,8 +1423,9 @@ class IdentifyTests(unittest.TestCase):
             "Decision: Thalassoma lucasanum\nCertainty: confident\nTrait: a yellow tail unlike the red head\n"
         )
         body = self.post_photo(lat="24.2", lng="-110.3").get_json()
-        self.assertTrue(body["meta"]["fallback_used"])
-        self.assertNotEqual(body["certainty"], "confident")
+        self.assertEqual(body["meta"]["final_source"], "grok-4")
+        self.assertFalse(body["meta"]["fallback_used"])
+        self.assertEqual(body["certainty"], "confident")
         self.assertFalse(finfindr_server.passing_verification({
             "decision": "Thalassoma lucasanum",
             "scientific_name": "Thalassoma lucasanum",
@@ -1816,7 +1825,8 @@ class IdentifyTests(unittest.TestCase):
             "Decision: NO_MATCH\nCertainty: unsure\nTrait: the shell ridges are hard to see\n"
         )
         body = self.post_photo(lat="24.2", lng="-110.3").get_json()
-        self.assertTrue(body["meta"]["fallback_used"])
+        self.assertEqual(body["meta"]["final_source"], "grok-4")
+        self.assertFalse(body["meta"]["fallback_used"])
         self.assertNotEqual((body.get("discovery") or {}).get("type"), "no_match")
         self.assertEqual(body["candidates"][0]["scientific_name"], "Nerita scabricosta")
 
@@ -1944,7 +1954,8 @@ class IdentifyTests(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertEqual(body["commit"], "abc123")
         self.assertEqual(body["model"], "grok-4.7")
-        self.assertEqual(body["fallback_model"], "grok-4")
+        self.assertEqual(body["models"], ["grok-4", "grok-4.7"])
+        self.assertEqual(body["fallback_model"], "")
         self.assertEqual(identified["meta"]["commit"], "abc123")
         self.assertIn("verify_pass_rate", identified["meta"])
         self.assertIn("verify_success_rate", identified["meta"])
@@ -2072,6 +2083,29 @@ class IdentifyTests(unittest.TestCase):
         self.assertNotIn("error", body)
         self.assertIsInstance(body["meta"], dict)
         self.assertIn("total_ms", body["meta"])
+
+    def test_disagreement_shows_both_species_until_verify_separates_them(self):
+        self.captured["model_text_by_model"] = {
+            "grok-4": (
+                "Photo quality: good\n"
+                "Scientific name: Abudefduf troschelii\n"
+                "Confidence: high\n"
+                "Candidate 1: Abudefduf troschelii | Panamic sergeant major | high | 5 bars\n"
+            ),
+            "grok-4.7": (
+                "Photo quality: good\n"
+                "Scientific name: Abudefduf saxatilis\n"
+                "Confidence: high\n"
+                "Candidate 1: Abudefduf saxatilis | Sergeant major | high | a yellow back\n"
+            ),
+        }
+        body = self.post_photo().get_json()
+        names = [item["scientific_name"] for item in body["candidates"]]
+        self.assertEqual(names[:2], ["Abudefduf troschelii", "Abudefduf saxatilis"])
+        self.assertFalse(body["meta"]["agreement"])
+        self.assertNotEqual(body["certainty"], "confident")
+        self.assertFalse(body["meta"]["fallback_used"])
+        self.assertIn(body["meta"]["final_source"], ("grok-4", "grok-4.7", "both"))
 
     def test_parallel_grok4_does_not_count_as_fallback_used(self):
         self.assertFalse(finfindr_server.answer_used_fallback(
@@ -2251,8 +2285,9 @@ class IdentifyTests(unittest.TestCase):
         finally:
             os.environ.pop("XAI_PRIMARY_TIMEOUT", None)
             self.fail_timeout = set()
-        self.assertGreaterEqual(self.captured["calls"][0]["timeout"], 90)
-        self.assertLessEqual(self.captured["calls"][0]["timeout"], 95)
+        slow = next(call for call in self.captured["calls"] if call["model"] == "grok-4.7")
+        self.assertGreaterEqual(slow["timeout"], 90)
+        self.assertLessEqual(slow["timeout"], 95)
 
     def test_fromia_contradiction_is_still_no_match(self):
         self.inat_handler = self._taxon_photos

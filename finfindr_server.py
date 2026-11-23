@@ -2811,18 +2811,32 @@ def _env_seconds(name, default, low, high):
     return min(float(high), max(float(low), value))
 
 
-def resolve_fallback_model(primary):
-    """Faster model used once if the primary call times out or the server errors.
+def configured_models(requested=None, debug=False):
+    """The models that identify every photo.
 
-    XAI_FALLBACK_MODEL defaults to grok-4. An empty value disables the fallback.
+    XAI_MODELS defaults to grok-4,grok-4.7. They run together. XAI_MODEL, or a
+    debug form value, runs that one model instead. XAI_FALLBACK_AFTER is unused.
     """
-    if "XAI_FALLBACK_MODEL" in os.environ:
-        raw = os.environ.get("XAI_FALLBACK_MODEL", "").strip()
-    else:
-        raw = "grok-4"
-    if not _safe_model_name(raw) or raw == primary:
-        return None
-    return raw
+    if debug:
+        candidate = (requested or "").strip()
+        if _safe_model_name(candidate):
+            return [candidate]
+    single = (os.environ.get("XAI_MODEL") or "").strip()
+    if _safe_model_name(single):
+        return [single]
+    raw = os.environ.get("XAI_MODELS", "grok-4,grok-4.7")
+    models = []
+    for part in raw.split(","):
+        name = part.strip()
+        if _safe_model_name(name) and name not in models:
+            models.append(name)
+    return models[:2] or ["grok-4", "grok-4.7"]
+
+
+def resolve_fallback_model(primary):
+    """Retired. The pair in XAI_MODELS replaces the fallback race."""
+    del primary
+    return None
 
 
 def _identification_meta(mode, sent, available, truncated, source, list_ms, model_ms, tokens, token_source, model, image_px, fallback_used=False, attempts=None, verify_used=False, verify_ms=0, reference_fetch_ms=0, total_ms=None, verify_skipped=""):
@@ -3082,84 +3096,83 @@ def _record_parallel_fallback(fallback_thread, holder, fallback_model, attempts)
     ))
 
 
-def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, extra_reserve=0, extra_images=None, use_cache=True):
-    """Primary keeps most of its window. Fallback starts in parallel if it runs long.
+def _model_deadlines(request_started):
+    """When to stop waiting for grok-4.7, leaving time for the reference check.
 
-    grok-4.7 still gets its cap (XAI_PRIMARY_TIMEOUT). If it is still running
-    after XAI_FALLBACK_AFTER (default 40s), grok-4 starts beside it. The second
-    wait is until the primary deadline, not another full timeout on top of the
-    first wait. A fast failure still falls back immediately. Verification uses
-    whatever budget remains.
+    XAI_SLOW_DEADLINE is that wait. XAI_PRIMARY_TIMEOUT is accepted as the same
+    number so an older staging setting still applies. The fast model uses
+    XAI_FAST_TIMEOUT and is not held until the slow deadline.
     """
-    del extra_reserve
-    worker_budget = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
-    primary_cap = _env_seconds("XAI_PRIMARY_TIMEOUT", 70, 5, 110)
-    fallback_cap = _env_seconds("XAI_FALLBACK_TIMEOUT", 20, 5, 40)
-    fallback_after = _env_seconds("XAI_FALLBACK_AFTER", 40, 5, 80)
-    deadline = request_started + worker_budget
-    attempts = []
-
-    def remaining():
-        return deadline - time.monotonic()
-
-    def timed_out(name, elapsed):
-        return {"ok": False, "retryable": True, "model": name, "ms": int(elapsed), "error": "timeout", "status": 504}
-
-    fallback_model = resolve_fallback_model(model)
-    # Do not hold verify time back from the primary. Verification uses what is left.
-    primary_timeout = min(primary_cap, max(8.0, remaining() - 3.0))
-    holder = {}
-
-    def run_primary():
-        holder["primary"] = _call_vision_model(
-            jpeg_bytes, prompt, model, primary_timeout, api_key, extra_images, use_cache=use_cache
-        )
-
-    primary_started = time.monotonic()
-    primary_deadline = primary_started + primary_timeout
-    primary_thread = _start_thread(run_primary, "finfindr-primary")
-    primary_thread.join(min(fallback_after, max(0.0, primary_deadline - time.monotonic())))
-    fallback_thread = None
-    if primary_thread.is_alive() and fallback_model and remaining() >= fallback_cap + 8:
-        fallback_timeout = min(fallback_cap, max(5.0, remaining() - 3.0))
-
-        def run_fallback():
-            holder["fallback"] = _call_vision_model(
-                jpeg_bytes, prompt, fallback_model, fallback_timeout, api_key, extra_images, use_cache=use_cache
-            )
-
-        fallback_thread = _start_thread(run_fallback, "finfindr-fallback")
-    left_primary = primary_deadline - time.monotonic()
-    if left_primary > 0:
-        primary_thread.join(left_primary)
-    if primary_thread.is_alive():
-        result = timed_out(model, int(round((time.monotonic() - primary_started) * 1000)))
+    budget_end = request_started + _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
+    if (os.environ.get("XAI_SLOW_DEADLINE") or "").strip():
+        cap = _env_seconds("XAI_SLOW_DEADLINE", 70, 15, 90)
     else:
-        result = holder.get("primary") or timed_out(model, primary_timeout * 1000)
-    attempts.append(_attempt_record(model, result["ms"], result["ok"], None if result["ok"] else result.get("error")))
-    if result.get("ok"):
-        _record_parallel_fallback(fallback_thread, holder, fallback_model, attempts)
-        return result, attempts
-    if fallback_thread is not None:
-        fallback_thread.join(max(0.2, remaining() - 1.0))
-        fallback = holder.get("fallback")
-        if fallback:
-            attempts.append(_attempt_record(
-                fallback_model, fallback["ms"], fallback["ok"], None if fallback["ok"] else fallback.get("error")
-            ))
-            return fallback, attempts
-        return result, attempts
-    if fallback_model and should_fallback(result, remaining(), fallback_cap):
-        fallback_timeout = min(fallback_cap, max(1.0, remaining() - 2.0))
-        if fallback_timeout >= 5.0:
-            fallback = _call_vision_model(
-                jpeg_bytes, prompt, fallback_model, fallback_timeout, api_key, extra_images, use_cache=use_cache
+        cap = _env_seconds("XAI_PRIMARY_TIMEOUT", 70, 15, 95)
+    slow_deadline = min(request_started + cap, budget_end - 15.0)
+    fast_cap = _env_seconds("XAI_FAST_TIMEOUT", 25, 8, 40)
+    return slow_deadline, fast_cap
+
+
+def _run_paired_models(jpeg_bytes, prompt, models, api_key, request_started, use_cache=True, on_fast=None):
+    """Run grok-4 and grok-4.7 together. Do not cancel the slow model early.
+
+    grok-4's candidates are handed to on_fast as soon as they arrive so the
+    reference photos can be fetched while grok-4.7 is still thinking. If
+    grok-4.7 is still running at the slow deadline, the caller continues
+    with whoever has finished.
+    """
+    slow_deadline, fast_cap = _model_deadlines(request_started)
+    holder = {}
+    threads = {}
+    fast_name = "grok-4" if "grok-4" in models else models[0]
+
+    def launch(name):
+        role = "fast" if name == fast_name and len(models) > 1 else "slow"
+        timeout = fast_cap if role == "fast" else max(8.0, slow_deadline - time.monotonic())
+
+        def run(name=name, timeout=timeout, role=role):
+            holder[name] = _call_vision_model(
+                jpeg_bytes, prompt, name, timeout, api_key, use_cache=use_cache
             )
-            attempts.append(_attempt_record(
-                fallback_model, fallback["ms"], fallback["ok"], None if fallback["ok"] else fallback.get("error")
-            ))
-            return fallback, attempts
-    return result, attempts
+            if role == "fast" and holder[name].get("ok") and on_fast:
+                try:
+                    on_fast(holder[name])
+                except Exception:
+                    app.logger.warning("early reference prefetch failed", exc_info=True)
+
+        threads[name] = _start_thread(run, "finfindr-" + name)
+
+    for name in models:
+        launch(name)
+    for name in models:
+        if name == fast_name and len(models) > 1:
+            threads[name].join(min(fast_cap + 0.5, max(0.2, slow_deadline - time.monotonic())))
+        else:
+            left = slow_deadline - time.monotonic()
+            if left > 0:
+                threads[name].join(left)
+    reports = []
+    attempts = []
+    for name in models:
+        result = holder.get(name) or {
+            "ok": False, "retryable": True, "model": name, "ms": 0, "error": "timeout", "status": 504,
+        }
+        attempts.append(_attempt_record(
+            name, result.get("ms") or 0, result.get("ok"), None if result.get("ok") else result.get("error"),
+        ))
+        text = _extract_text(result["data"]) if result.get("ok") and result.get("data") else ""
+        candidates = parse_model_candidates(text) if text else []
+        reports.append({
+            "model": name,
+            "ok": bool(result.get("ok")),
+            "error": result.get("error") or "",
+            "retryable": result.get("retryable", True),
+            "ms": result.get("ms") or 0,
+            "text": text,
+            "data": result.get("data") if result.get("ok") else None,
+            "candidates": candidates,
+        })
+    return _bundle_model_reports(models, reports, attempts)
 
 
 _CANDIDATE_LINE = re.compile(r"^candidate\s*\d+\s*:\s*(.+)$", re.IGNORECASE)
@@ -3423,6 +3436,157 @@ def parse_model_candidates(text):
             "reference_photo": None,
         })
     return found + off_list
+
+
+def merge_model_candidates(reports):
+    """One list from every model, remembering who proposed each name and at what rank."""
+    pool = {}
+    tops = {}
+    for report in reports:
+        if not report.get("ok"):
+            continue
+        candidates = report.get("candidates") or []
+        if candidates:
+            tops[report["model"]] = candidates[0]["scientific_name"].lower()
+        for rank, cand in enumerate(candidates, start=1):
+            key = (cand.get("scientific_name") or "").lower()
+            if not key:
+                continue
+            slot = pool.get(key)
+            if slot is None:
+                slot = {
+                    "scientific_name": cand["scientific_name"],
+                    "common_name": cand.get("common_name") or "",
+                    "confidence": cand.get("confidence") or "medium",
+                    "trait": cand.get("trait") or "",
+                    "off_list": bool(cand.get("off_list")),
+                    "reference_photo": None,
+                    "proposed_by": [],
+                }
+                pool[key] = slot
+            slot["proposed_by"].append({
+                "model": report["model"],
+                "rank": rank,
+                "confidence": cand.get("confidence") or "medium",
+            })
+            if _CONFIDENCE_RANK.get(cand.get("confidence") or "medium", 1) < _CONFIDENCE_RANK.get(slot.get("confidence") or "medium", 1):
+                slot["confidence"] = cand.get("confidence") or "medium"
+            if cand.get("trait") and not slot.get("trait"):
+                slot["trait"] = cand["trait"]
+            if cand.get("common_name") and not slot.get("common_name"):
+                slot["common_name"] = cand["common_name"]
+            if cand.get("off_list"):
+                slot["off_list"] = True
+    fast_top = tops.get("grok-4")
+    slow_top = tops.get("grok-4.7")
+    agreement = bool(fast_top and slow_top and fast_top == slow_top)
+
+    def sort_key(item):
+        name = item["scientific_name"].lower()
+        lead = 0 if name in (fast_top, slow_top) and name else 1
+        best_rank = min(entry["rank"] for entry in item["proposed_by"])
+        return (lead, best_rank, -len(item["proposed_by"]), _CONFIDENCE_RANK.get(item.get("confidence") or "medium", 1))
+
+    merged = sorted(pool.values(), key=sort_key)
+    return merged, agreement
+
+
+def _report_is_usable(report):
+    if not report.get("ok"):
+        return False
+    return photo_is_usable(parse_photo_quality(report.get("text")), _field_value(report.get("text"), "Photo issue"))
+
+
+def _bundle_model_reports(models, reports, attempts):
+    model_candidates = {}
+    for report in reports:
+        listed = []
+        for rank, cand in enumerate(report.get("candidates") or [], start=1):
+            listed.append({
+                "scientific_name": cand.get("scientific_name") or "",
+                "rank": rank,
+                "confidence": cand.get("confidence") or "medium",
+            })
+        model_candidates[report["model"]] = {
+            "ms": report.get("ms") or 0,
+            "ok": bool(report.get("ok")),
+            "error": report.get("error") or "",
+            "top": listed[0]["scientific_name"] if listed else "",
+            "candidates": listed,
+        }
+    usable = [report for report in reports if _report_is_usable(report)]
+    narrative = None
+    for preferred in ("grok-4.7", "grok-4"):
+        for report in usable:
+            if report["model"] == preferred:
+                narrative = report
+                break
+        if narrative:
+            break
+    if narrative is None and usable:
+        narrative = usable[0]
+    any_ok = any(report.get("ok") for report in reports)
+    if not any_ok:
+        errors = [report.get("error") or "failed" for report in reports]
+        if errors and all(error == "rate_limited" for error in errors):
+            error, retryable = "rate_limited", True
+        elif reports and all(report.get("retryable") is False for report in reports):
+            error, retryable = "http_400", False
+        else:
+            error, retryable = "timeout", True
+        return {
+            "ok": False,
+            "retryable": retryable,
+            "error": error,
+            "model": models[-1] if models else "",
+            "reports": reports,
+            "attempts": attempts,
+            "models_run": list(models),
+            "model_candidates": model_candidates,
+            "agreement": False,
+            "text": "",
+            "candidates": [],
+            "photo_usable": False,
+        }
+    if narrative is None:
+        narrative = next(report for report in reports if report.get("ok"))
+    merged, agreement = merge_model_candidates(reports)
+    return {
+        "ok": True,
+        "retryable": False,
+        "error": "",
+        "model": narrative["model"],
+        "reports": reports,
+        "attempts": attempts,
+        "models_run": list(models),
+        "model_candidates": model_candidates,
+        "agreement": agreement,
+        "text": narrative.get("text") or "",
+        "candidates": merged,
+            "photo_usable": bool(usable),
+        }
+
+
+def final_source_for(candidate):
+    """'both', 'grok-4', or 'grok-4.7', from who proposed the species we kept."""
+    proposers = {entry.get("model") for entry in (candidate or {}).get("proposed_by") or []}
+    if "grok-4" in proposers and "grok-4.7" in proposers:
+        return "both"
+    if "grok-4.7" in proposers:
+        return "grok-4.7"
+    if "grok-4" in proposers:
+        return "grok-4"
+    return ""
+
+
+def _apply_model_bundle(meta, bundle, final_source=""):
+    bundle = bundle or {}
+    meta["models_run"] = bundle.get("models_run") or []
+    meta["model_candidates"] = bundle.get("model_candidates") or {}
+    meta["agreement"] = bool(bundle.get("agreement"))
+    meta["final_source"] = final_source or ""
+    meta["fallback_used"] = False
+    return meta
 
 
 def _medium_photo_url(url):
@@ -3869,6 +4033,7 @@ def public_candidates(candidates, species):
             "trait": item.get("trait") or "",
             "off_list": bool(item.get("off_list")),
             "reference_photo": photo,
+            "proposed_by": item.get("proposed_by") or [],
         })
     return cleaned
 
@@ -4764,13 +4929,13 @@ def _ensure_meta(response, started):
 
 @app.route("/health", methods=["GET", "HEAD"])
 def health():
-    primary = resolve_model()
-    fallback = resolve_fallback_model(primary)
+    models = configured_models()
     return jsonify({
         "ok": True,
         "commit": app_commit(),
-        "model": primary,
-        "fallback_model": fallback or "",
+        "model": models[-1] if models else "",
+        "models": models,
+        "fallback_model": "",
     })
 
 
@@ -4879,14 +5044,28 @@ def _identify_http():
     truncated = prompt_trimmed or (mode == "full" and not species_payload.get("complete"))
     source = species_payload.get("source") or "none"
 
-    result, attempts = _run_model_attempts(
-        jpeg_bytes, prompt, model, xai_key, request_started,
-        extra_reserve=verify_timeout_cap() if verify else 0,
+    models = configured_models(fields.get("model"), debug)
+
+    def _warm_fast_references(fast_result):
+        early = parse_model_candidates(_extract_text(fast_result.get("data") or {}))
+
+        def warm():
+            for item in early[:3]:
+                fetch_reference_photos(
+                    item["scientific_name"], lat, lng, exclude_observation or None
+                )
+
+        _start_thread(warm, "finfindr-early-refs")
+
+    result = _run_paired_models(
+        jpeg_bytes, prompt, models, xai_key, request_started,
         use_cache=use_cache,
+        on_fast=_warm_fast_references if verify else None,
     )
+    attempts = result.get("attempts") or []
     model_ms = sum(item["ms"] for item in attempts)
-    answered = result.get("model") or model
-    fallback_used = answer_used_fallback(result, model)
+    answered = result.get("model") or (models[-1] if models else model)
+    fallback_used = False
     if not result.get("ok"):
         if not result.get("retryable"):
             status = 502
@@ -4921,19 +5100,23 @@ def _identify_http():
             False, 0, 0, total_ms, "model_timeout" if result.get("error") == "timeout" else "model_failed",
         )
         apply_verify_rates(meta, False, False, 0, 0, meta["verify_skipped"])
+        _apply_model_bundle(meta, result)
         meta = stamp_meta(meta, request_started)
         _log_identification(region["id"], meta)
         body["meta"] = meta
         return jsonify(body), status
 
-    data = result["data"]
-    tokens, token_source = _prompt_tokens(data, prompt)
-    text = apply_standard_names(_extract_text(data), species)
+    narrative_data = {}
+    for report in result.get("reports") or []:
+        if report.get("model") == answered and report.get("data"):
+            narrative_data = report["data"]
+    tokens, token_source = _prompt_tokens(narrative_data, prompt)
+    text = apply_standard_names(result.get("text") or "", species)
     photo_quality = parse_photo_quality(text)
     photo_issue = _field_value(text, "Photo issue")
-    parsed_candidates = _prefer_bull_shark(parse_model_candidates(text), text)
+    parsed_candidates = _prefer_bull_shark(result.get("candidates") or parse_model_candidates(text), text)
     # Gate 1. A no stops here. A yes does not mark the identification down.
-    if not photo_is_usable(photo_quality, photo_issue):
+    if not result.get("photo_usable", photo_is_usable(photo_quality, photo_issue)):
         meta = _identification_meta(
             mode, sent, available, truncated, source, list_fetch_ms, model_ms,
             tokens, token_source, answered, image_px, fallback_used, attempts,
@@ -4945,6 +5128,7 @@ def _identify_http():
         meta["range_max"] = range_record_limit()
         meta["range_rule"] = range_rule_text()
         apply_verify_rates(meta, False, False, 0, 0, "photo_unusable")
+        _apply_model_bundle(meta, result, final_source_for(parsed_candidates[0] if parsed_candidates else None))
         meta = stamp_meta(meta, request_started)
         _log_identification(region["id"], meta)
         return jsonify(_result_payload(
@@ -4973,6 +5157,7 @@ def _identify_http():
         meta["off_list_kept"] = off_list_kept
         meta["evidence"] = ["not_marine"]
         apply_verify_rates(meta, False, False, 0, 0, "not_marine")
+        _apply_model_bundle(meta, result, final_source_for(candidates[0] if candidates else None))
         meta = stamp_meta(meta, request_started)
         _log_identification(region["id"], meta)
         return jsonify(_result_payload(
@@ -5065,13 +5250,13 @@ def _identify_http():
         follow = _call_vision_model(
             jpeg_bytes,
             _offlist_followup_prompt(locality, candidates),
-            model if not fallback_used else answered,
+            "grok-4" if "grok-4" in (result.get("models_run") or []) else answered,
             follow_timeout,
             xai_key,
             use_cache=use_cache,
         )
         attempts.append(_attempt_record(
-            model if not fallback_used else answered,
+            "grok-4" if "grok-4" in (result.get("models_run") or []) else answered,
             follow.get("ms") or 0,
             follow.get("ok"),
             None if follow.get("ok") else follow.get("error"),
@@ -5152,7 +5337,6 @@ def _identify_http():
         shown = public_candidates(candidates, species)
     strong_id = (
         not no_match
-        and not fallback_used
         and certainty == "confident"
         and verify_used
         and passing_verification(verification)
@@ -5286,11 +5470,6 @@ def _identify_http():
     )
     meta["photo_quality"] = photo_quality
     meta["discovery_checked"] = discovery_checked
-    if fallback_used and certainty == "confident":
-        certainty = "likely"
-        if discovery and discovery.get("type") == "possible_range_extension":
-            discovery = None
-            evidence.append("fallback_not_confident")
     if not (verify_used and passing_verification(verification)):
         if certainty == "confident":
             certainty = "likely" if shown else "unsure"
@@ -5306,7 +5485,7 @@ def _identify_http():
     checked = len(candidates) if verify_attempted else 0
     passed = 1 if verify_used and passing_verification(verification) and verification_chose_top(verification, candidates) else 0
     verified_id = bool(
-        verify_used and passing_verification(verification) and verification_chose_top(verification, candidates) and not fallback_used
+        verify_used and passing_verification(verification) and verification_chose_top(verification, candidates)
     )
     if verified_id and not no_match:
         certainty = "confident"
@@ -5334,6 +5513,8 @@ def _identify_http():
     meta["verify_timeout_s"] = verify_timeout_cap()
     meta["off_list_proposed"] = off_list_proposed
     meta["off_list_kept"] = off_list_kept
+    source_candidate = (shown[0] if shown else None) or (candidates[0] if candidates else None)
+    _apply_model_bundle(meta, result, final_source_for(source_candidate))
     meta = stamp_meta(meta, request_started)
     _log_identification(region["id"], meta)
     return jsonify(_result_payload(
