@@ -3,9 +3,11 @@
 import io
 import json
 import os
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ["FINFINDR_PREFETCH"] = "0"
@@ -15,6 +17,7 @@ import requests
 from PIL import Image
 
 import finfindr_server
+import scripts.eval_region as eval_region
 
 
 def epithet(index):
@@ -133,9 +136,15 @@ class IdentifyTests(unittest.TestCase):
         os.environ.pop("XAI_FALLBACK_TIMEOUT", None)
         os.environ.pop("FINFINDR_TIME_BUDGET", None)
         os.environ.pop("MAX_IMAGE_PX", None)
+        os.environ.pop("FINFINDR_DISCOVERY", None)
+        os.environ.pop("FINFINDR_RANGE_KM", None)
+        os.environ.pop("FINFINDR_RANGE_MAX", None)
+        os.environ.pop("FINFINDR_VERIFY", None)
         finfindr_server._SPECIES_CACHE.clear()
         finfindr_server._SPECIES_INFLIGHT.clear()
         finfindr_server._inat_cache.clear()
+        finfindr_server._PHOTO_CACHE.clear()
+        self.inat_handler = None
         self.client = finfindr_server.app.test_client()
         self.captured = {}
         self.fail_timeout = set()
@@ -157,6 +166,10 @@ class IdentifyTests(unittest.TestCase):
             with self._calls_lock:
                 self.species_calls.append(params)
             return FakeResponse(species_payload(params))
+        if self.inat_handler:
+            handled = self.inat_handler(url, params)
+            if handled is not None:
+                return handled
         return FakeResponse({"results": []})
 
     def fake_post(self, url, json=None, **kwargs):
@@ -167,16 +180,25 @@ class IdentifyTests(unittest.TestCase):
             "timeout": kwargs.get("timeout"),
         })
         model = (json or {}).get("model")
+        prompt = ""
+        try:
+            content = (json or {})["input"][0]["content"]
+            prompt = next(part.get("text", "") for part in content if part.get("type") == "input_text")
+        except (KeyError, IndexError, StopIteration, TypeError):
+            prompt = ""
         if model in self.fail_timeout:
             raise requests.Timeout("slow")
         if model in self.fail_status:
             return FakeResponse({"error": "upstream"}, status=self.fail_status[model])
-        text = self.captured.get(
-            "model_text",
-            "Common name: Wrong\nScientific name: Thalassoma lucasanum\n"
-            "Group: wrasse\nAlternative group considered: none\n"
-            "Confidence: high\nNotes: A reef wrasse.",
-        )
+        if "The first image is the animal" in prompt and self.captured.get("verify_text"):
+            text = self.captured["verify_text"]
+        else:
+            text = self.captured.get(
+                "model_text",
+                "Common name: Wrong\nScientific name: Thalassoma lucasanum\n"
+                "Group: wrasse\nAlternative group considered: none\n"
+                "Confidence: high\nNotes: A reef wrasse.",
+            )
         body = {
             "output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}],
             "usage": {"input_tokens": 4321, "output_tokens": 30, "total_tokens": 4351},
@@ -755,6 +777,463 @@ class IdentifyTests(unittest.TestCase):
         self.assertIn("error", body)
         self.assertEqual(body["region_label"], "Sea of Cortez / La Paz")
         self.assertNotIn("json", self.captured)
+
+    def test_photo_quality_blocks_discovery(self):
+        self.captured["model_text"] = (
+            "Photo quality: invalid\n"
+            "Photo issue: it is a drawing, not a living animal\n"
+            "Scientific name: Thalassoma lucasanum\n"
+            "Confidence: high\n"
+        )
+        response = self.post_photo(lat="24.2", lng="-110.3")
+        body = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["photo_quality"], "invalid")
+        self.assertEqual(body["message"], "Can't identify from this photo.")
+        self.assertIsNone(body["discovery"])
+        self.assertEqual(body["candidates"], [])
+        self.assertEqual(body["certainty"], "unsure")
+        self.assertIn("photo_invalid", body["meta"]["evidence"])
+        prompt = self.prompt()
+        self.assertIn("Never reject a species only because it is unrecorded", prompt)
+        self.assertIn("Photo quality:", prompt)
+
+    def test_range_extension_requires_no_records_within_100_km_and_verification(self):
+        self.obs_calls = []
+
+        def handler(url, params):
+            if "observations" in url:
+                self.obs_calls.append(params)
+                if str(params.get("per_page")) == "1":
+                    return FakeResponse({"total_results": 0, "results": []})
+                return FakeResponse({"total_results": 1, "results": [{
+                    "id": 321,
+                    "geojson": {"coordinates": [-109.2, 26.4]},
+                    "place_guess": "Bahia de los Angeles",
+                    "observed_on": "2019-06-01",
+                }]})
+            if "taxa" in url:
+                name = params.get("q") or "Zebrasoma xanthurum"
+                return FakeResponse({"results": [{
+                    "name": name,
+                    "rank": "species",
+                    "preferred_common_name": "Yellowtail tang",
+                    "default_photo": {
+                        "id": 4,
+                        "url": "https://inaturalist-open-data.s3.amazonaws.com/photos/4/square.jpg",
+                        "attribution": "Riley Example",
+                        "license_code": "cc-by",
+                    },
+                }]})
+            return None
+
+        self.inat_handler = handler
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Photo issue: none\n"
+            "Common name: Yellowtail tang\n"
+            "Scientific name: Zebrasoma xanthurum\n"
+            "Group: surgeonfish\n"
+            "Alternative group considered: none\n"
+            "Confidence: high\n"
+            "Notes: A surgeonfish.\n"
+            "Candidate 1: Zebrasoma xanthurum | Yellowtail tang | high | yellow tail\n"
+            "Candidate 2: Acanthurus nigricans | Whitecheek surgeonfish | medium | pale cheek\n"
+        )
+        self.captured["verify_text"] = (
+            "Decision: Zebrasoma xanthurum\n"
+            "Certainty: confident\n"
+            "Trait: yellow tail on a round body\n"
+        )
+        response = self.post_photo(lat="24.2", lng="-110.3", region="sea-of-cortez")
+        body = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        discovery = body["discovery"]
+        self.assertEqual(discovery["type"], "possible_range_extension")
+        self.assertEqual(discovery["scientific_name"], "Zebrasoma xanthurum")
+        self.assertEqual(discovery["records_in_region"], 0)
+        self.assertEqual(discovery["radius_km"], 100)
+        self.assertEqual(discovery["rule"]["max_records"], 0)
+        self.assertIn("within 100 km", discovery["rule"]["text"])
+        self.assertTrue(discovery["traits"])
+        self.assertEqual(discovery["nearest_records"][0]["place"], "Bahia de los Angeles")
+        self.assertGreater(discovery["nearest_records"][0]["distance_km"], 0)
+        self.assertIn("https://www.inaturalist.org/observations/321", discovery["nearest_records"][0]["url"])
+        self.assertEqual(body["meta"]["range_km"], 100)
+        self.assertEqual(body["meta"]["range_max"], 0)
+        count_calls = [call for call in self.obs_calls if str(call.get("per_page")) == "1"]
+        self.assertTrue(count_calls)
+        self.assertEqual(int(float(count_calls[0]["radius"])), 100)
+        page = self.client.get("/").get_data(as_text=True)
+        self.assertIn("Possible range extension", page)
+        self.assertIn("Submit to iNaturalist for expert confirmation", page)
+        self.assertIn("Can't identify from this photo", page)
+        self.assertIn("Range rule:", page)
+
+    def test_records_inside_the_radius_are_not_a_range_extension(self):
+        def handler(url, params):
+            if "observations" in url and str(params.get("per_page")) == "1":
+                return FakeResponse({"total_results": 6, "results": []})
+            if "taxa" in url:
+                return FakeResponse({"results": [{
+                    "name": params.get("q") or "Zebrasoma xanthurum",
+                    "rank": "species",
+                    "preferred_common_name": "Yellowtail tang",
+                    "default_photo": {
+                        "id": 4,
+                        "url": "https://inaturalist-open-data.s3.amazonaws.com/photos/4/square.jpg",
+                        "attribution": "Riley Example",
+                        "license_code": "cc-by",
+                    },
+                }]})
+            return None
+
+        self.inat_handler = handler
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Zebrasoma xanthurum\n"
+            "Confidence: high\n"
+            "Candidate 1: Zebrasoma xanthurum | Yellowtail tang | high | yellow tail\n"
+            "Candidate 2: Acanthurus nigricans | Whitecheek surgeonfish | medium | pale cheek\n"
+        )
+        self.captured["verify_text"] = (
+            "Decision: Zebrasoma xanthurum\nCertainty: confident\nTrait: yellow tail\n"
+        )
+        body = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertIsNone(body["discovery"])
+        self.assertEqual(body["certainty"], "confident")
+        self.assertEqual(body["notable_note"], "")
+
+    def test_weak_evidence_does_not_flag_a_range_extension(self):
+        def handler(url, params):
+            if "observations" in url and str(params.get("per_page")) == "1":
+                return FakeResponse({"total_results": 0, "results": []})
+            return None
+
+        self.inat_handler = handler
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Common name: Yellowtail tang\n"
+            "Scientific name: Zebrasoma xanthurum\n"
+            "Confidence: high\n"
+            "Notes: A surgeonfish.\n"
+        )
+        body = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertIsNone(body["discovery"])
+        self.assertEqual(body["certainty"], "unsure")
+        self.assertIn("notable if the identification is confirmed", body["notable_note"])
+        self.assertTrue(body["candidates"])
+
+    def test_no_match_does_not_force_a_species(self):
+        def handler(url, params):
+            if "taxa" in url:
+                return FakeResponse({"results": [{
+                    "name": params.get("q") or "Zebrasoma xanthurum",
+                    "rank": "species",
+                    "preferred_common_name": "Yellowtail tang",
+                    "default_photo": {
+                        "id": 4,
+                        "url": "https://inaturalist-open-data.s3.amazonaws.com/photos/4/square.jpg",
+                        "attribution": "Riley Example",
+                        "license_code": "cc-by",
+                    },
+                }]})
+            return None
+
+        self.inat_handler = handler
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Zebrasoma xanthurum\n"
+            "Confidence: medium\n"
+            "Candidate 1: Zebrasoma xanthurum | Yellowtail tang | medium | yellow tail\n"
+            "Candidate 2: Acanthurus nigricans | Whitecheek surgeonfish | medium | pale cheek\n"
+        )
+        self.captured["verify_text"] = (
+            "Decision: NO_MATCH\nCertainty: unsure\nTrait: the tail spine is different from both\n"
+        )
+        body = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertEqual(body["discovery"]["type"], "no_match")
+        self.assertEqual(body["discovery"]["genus"], "Zebrasoma")
+        self.assertTrue(body["discovery"]["closest_relatives"])
+        self.assertEqual(body["candidates"], [])
+        self.assertEqual(body["certainty"], "unsure")
+        self.assertIsNone(body["message"] if "message" in body else None)
+
+    def test_discovery_can_be_turned_off(self):
+        def handler(url, params):
+            if "observations" in url and str(params.get("per_page")) == "1":
+                return FakeResponse({"total_results": 0, "results": []})
+            if "taxa" in url:
+                return FakeResponse({"results": [{
+                    "name": params.get("q") or "Zebrasoma xanthurum",
+                    "rank": "species",
+                    "default_photo": {
+                        "id": 4,
+                        "url": "https://static.inaturalist.org/photos/4/square.jpg",
+                        "attribution": "Riley Example",
+                        "license_code": "cc-by",
+                    },
+                }]})
+            return None
+
+        self.inat_handler = handler
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Zebrasoma xanthurum\n"
+            "Confidence: high\n"
+            "Candidate 1: Zebrasoma xanthurum | Yellowtail tang | high | yellow tail\n"
+            "Candidate 2: Acanthurus nigricans | Whitecheek surgeonfish | medium | pale cheek\n"
+        )
+        self.captured["verify_text"] = (
+            "Decision: Zebrasoma xanthurum\nCertainty: confident\nTrait: yellow tail\n"
+        )
+        body = self.post_photo(lat="24.2", lng="-110.3", debug="1", discovery="0").get_json()
+        self.assertIsNone(body["discovery"])
+        self.assertEqual(body["certainty"], "confident")
+        self.assertFalse(body["meta"]["discovery_checked"])
+
+    def test_range_radius_follows_the_environment(self):
+        os.environ["FINFINDR_RANGE_KM"] = "40"
+        os.environ["FINFINDR_RANGE_MAX"] = "0"
+        self.obs_calls = []
+
+        def handler(url, params):
+            if "observations" in url:
+                self.obs_calls.append(params)
+                return FakeResponse({"total_results": 3, "results": []})
+            return None
+
+        self.inat_handler = handler
+        try:
+            self.assertEqual(finfindr_server.range_km(), 40)
+            self.assertEqual(finfindr_server.range_record_limit(), 0)
+            self.post_photo(lat="24.2", lng="-110.3")
+        finally:
+            os.environ.pop("FINFINDR_RANGE_KM", None)
+            os.environ.pop("FINFINDR_RANGE_MAX", None)
+        count_calls = [call for call in self.obs_calls if str(call.get("per_page")) == "1"]
+        self.assertTrue(count_calls)
+        self.assertEqual(int(float(count_calls[0]["radius"])), 40)
+
+
+class EvalScoreTests(unittest.TestCase):
+    def test_default_targets_are_the_stricter_gates(self):
+        targets, path = eval_region.load_targets()
+        self.assertTrue(path.endswith("eval_targets.json"))
+        self.assertEqual(targets["confident_precision"]["min"], 0.99)
+        self.assertEqual(targets["false_accepts_per_100"]["max"], 1)
+        self.assertEqual(targets["correct_reject_rate"]["min"], 0.98)
+        self.assertEqual(targets["false_reject_rate"]["max"], 0.05)
+        self.assertEqual(targets["decoy_false_flag_rate"]["max"], 0.02)
+        self.assertEqual(targets["discovery_precision"]["min"], 0.99)
+        self.assertEqual(targets["discovery_recall"]["min"], 0.80)
+        self.assertEqual(targets["range_rule"]["radius_km"], 100)
+        self.assertEqual(targets["range_rule"]["max_records"], 0)
+
+    def test_manifest_reads_optional_range_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            csv_path = Path(directory) / "qa.csv"
+            csv_path.write_text(
+                "photo_path,true_taxon,true_common,expected_outcome,lat,lng,region,source_url,license,key_confidence,notes,range_sources,nearest_known_record_km,nearest_known_record_source,expected_traits\n"
+                "a.jpg,Zebrasoma xanthurum,Yellowtail tang,range_extension,24.2,-110.3,sea-of-cortez,https://example.test/a,cc-by,verified,local,inat;obis,180,obis,yellow tail;round body\n",
+                encoding="utf-8",
+            )
+            items, _folder = eval_region.load_manifest(csv_path)
+            json_path = Path(directory) / "qa.json"
+            json_path.write_text(json.dumps([{
+                "photo_path": "a.jpg",
+                "true_taxon": "Zebrasoma xanthurum",
+                "true_common": "Yellowtail tang",
+                "expected_outcome": "range_extension",
+                "lat": 24.2,
+                "lng": -110.3,
+                "region": "sea-of-cortez",
+                "key_confidence": "verified",
+                "range_sources": "inat;obis",
+                "nearest_known_record_km": 180,
+                "nearest_known_record_source": "obis",
+                "expected_traits": "yellow tail;round body",
+            }]), encoding="utf-8")
+            again, _folder = eval_region.load_manifest(json_path)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["range_sources"], ["inat", "obis"])
+        self.assertEqual(items[0]["nearest_known_record_km"], 180)
+        self.assertEqual(items[0]["nearest_known_record_source"], "obis")
+        self.assertEqual(items[0]["expected_traits"], ["yellow tail", "round body"])
+        self.assertEqual(again[0]["expected_outcome"], "range_extension")
+        self.assertEqual(again[0]["key_confidence"], "verified")
+
+    def _item(self, **overrides):
+        item = {
+            "photo_path": "a.jpg",
+            "true_taxon": "Zebrasoma xanthurum",
+            "true_common": "Yellowtail tang",
+            "expected_outcome": "match",
+            "lat": 24.2,
+            "lng": -110.3,
+            "region": "sea-of-cortez",
+            "source_url": "",
+            "license": "",
+            "key_confidence": "verified",
+            "notes": "",
+            "range_sources": ["inat"],
+            "nearest_known_record_km": None,
+            "nearest_known_record_source": "",
+            "expected_traits": [],
+        }
+        item.update(overrides)
+        return item
+
+    def _body(self, **overrides):
+        body = {
+            "certainty": "confident",
+            "photo_quality": "good",
+            "candidates": [{
+                "scientific_name": "Zebrasoma xanthurum",
+                "common_name": "Yellowtail tang",
+                "trait": "yellow tail",
+            }],
+            "discovery": None,
+            "meta": {"range_km": 100, "range_max": 0, "range_rule": finfindr_server.range_rule_text(), "evidence": []},
+        }
+        body.update(overrides)
+        return body
+
+    def test_verified_scores_pass_and_uncertain_stays_separate(self):
+        range_body = self._body(discovery={
+            "type": "possible_range_extension",
+            "scientific_name": "Zebrasoma xanthurum",
+            "common_name": "Yellowtail tang",
+            "traits": ["yellow tail", "round body"],
+            "nearest_records": [{"distance_km": 175, "url": "https://www.inaturalist.org/observations/1"}],
+        })
+        rows = [
+            eval_region.answer_from_response(self._body(), self._item(), 1, 1000),
+            eval_region.answer_from_response(
+                {"photo_quality": "invalid", "message": "Can't identify from this photo.", "candidates": [], "discovery": None},
+                self._item(photo_path="bad.jpg", expected_outcome="reject", true_taxon="", true_common="", range_sources=[]),
+                1,
+                400,
+            ),
+            eval_region.answer_from_response(
+                range_body,
+                self._item(
+                    photo_path="range.jpg",
+                    expected_outcome="range_extension",
+                    nearest_known_record_km=180,
+                    nearest_known_record_source="obis",
+                    expected_traits=["yellow tail", "round body"],
+                    range_sources=["inat", "obis"],
+                ),
+                1,
+                1500,
+            ),
+            eval_region.answer_from_response(
+                self._body(),
+                self._item(photo_path="decoy.jpg", notes="look-alike of a western Pacific tang"),
+                1,
+                900,
+            ),
+            eval_region.answer_from_response(
+                self._body(candidates=[{
+                    "scientific_name": "Acanthurus nigricans",
+                    "common_name": "Whitecheek surgeonfish",
+                    "trait": "pale cheek",
+                }]),
+                self._item(photo_path="unsure-photo.jpg", key_confidence="uncertain"),
+                1,
+                800,
+            ),
+        ]
+        targets, path = eval_region.load_targets()
+        report = eval_region.build_report(rows, "qa", targets, path, 1)
+        self.assertEqual(report["targets_result"]["overall"], "pass")
+        verified = report["verified"]
+        self.assertEqual(verified["confident_precision"], 1)
+        self.assertEqual(verified["false_accepts_per_100"], 0)
+        self.assertEqual(verified["correct_reject_rate"], 1)
+        self.assertEqual(verified["false_reject_rate"], 0)
+        self.assertEqual(verified["decoy_false_flag_rate"], 0)
+        self.assertEqual(verified["discovery_precision"], 1)
+        self.assertEqual(verified["discovery_recall"], 1)
+        self.assertEqual(verified["headline_accuracy"], 1)
+        self.assertEqual(verified["nearest_record_error"]["mean_abs_km"], 5)
+        self.assertEqual(verified["trait_overlap"]["mean_overlap"], 1)
+        self.assertIn("inat", verified["by_range_source"])
+        self.assertIn("obis", verified["by_range_source"])
+        self.assertEqual(verified["by_range_source"]["obis"]["nearest_record_error"]["mean_abs_km"], 5)
+        self.assertEqual(report["uncertain"]["confident_precision"], 0)
+        self.assertEqual(report["uncertain"]["false_accepts_per_100"], 100)
+        rendered = eval_region.markdown_report(report)
+        self.assertIn("| confident_precision | >= 99% | 100.0% | pass |", rendered)
+        self.assertIn("Range rule:", rendered)
+
+    def test_wrong_discovery_flag_is_a_false_accept_and_fails_precision(self):
+        flagged = self._body(discovery={
+            "type": "possible_range_extension",
+            "scientific_name": "Zebrasoma xanthurum",
+            "common_name": "Yellowtail tang",
+            "traits": ["yellow tail"],
+            "nearest_records": [{"distance_km": 40, "url": "https://www.inaturalist.org/observations/9"}],
+        })
+        row = eval_region.answer_from_response(
+            flagged,
+            self._item(notes="decoy look-alike", nearest_known_record_km=20),
+            1,
+            1000,
+        )
+        self.assertTrue(row["false_accept"])
+        self.assertIn("not a range extension", row["false_accept_reason"])
+        self.assertEqual(row["headline_credit"], 0)
+        self.assertFalse(row["flag_fully_correct"])
+        targets, path = eval_region.load_targets()
+        report = eval_region.build_report([row], "qa", targets, path, 1)
+        self.assertEqual(report["targets_result"]["overall"], "fail")
+        self.assertEqual(report["verified"]["discovery_precision"], 0)
+        self.assertEqual(report["targets_result"]["checks"]["decoy_false_flag_rate"]["result"], "fail")
+        self.assertEqual(len(report["verified"]["false_accepts"]), 1)
+
+    def test_incomplete_range_flag_is_not_fully_correct(self):
+        flagged = self._body(discovery={
+            "type": "possible_range_extension",
+            "scientific_name": "Zebrasoma xanthurum",
+            "common_name": "Yellowtail tang",
+            "traits": [],
+            "nearest_records": [],
+        })
+        row = eval_region.answer_from_response(
+            flagged,
+            self._item(photo_path="range.jpg", expected_outcome="range_extension", expected_traits=["yellow tail"]),
+            1,
+            1000,
+        )
+        self.assertFalse(row["flag_fully_correct"])
+        self.assertEqual(row["headline_credit"], 0)
+        targets, path = eval_region.load_targets()
+        report = eval_region.build_report([row], "qa", targets, path, 1)
+        self.assertEqual(report["verified"]["discovery_recall"], 1)
+        self.assertEqual(report["verified"]["discovery_precision"], 0)
+
+    def test_discovery_flip_between_runs_is_reported(self):
+        quiet = eval_region.answer_from_response(self._body(), self._item(photo_path="same.jpg", expected_outcome="range_extension"), 1, 10)
+        flagged = eval_region.answer_from_response(
+            self._body(discovery={
+                "type": "possible_range_extension",
+                "scientific_name": "Zebrasoma xanthurum",
+                "common_name": "Yellowtail tang",
+                "traits": ["yellow tail"],
+                "nearest_records": [{"distance_km": 10, "url": "https://www.inaturalist.org/observations/2"}],
+            }),
+            self._item(photo_path="same.jpg", expected_outcome="range_extension", expected_traits=["yellow tail"]),
+            2,
+            12,
+        )
+        targets, path = eval_region.load_targets()
+        report = eval_region.build_report([quiet, flagged], "qa", targets, path, 2)
+        self.assertEqual(report["verified"]["discovery_flip_rate"], 1)
+        self.assertEqual(len(report["verified"]["discovery_flips"]), 1)
+        self.assertEqual(report["verified"]["discovery_precision"], 1)
+        self.assertLess(report["verified"]["consistency"], 1)
 
 
 if __name__ == "__main__":

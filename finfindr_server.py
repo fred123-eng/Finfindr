@@ -6,6 +6,7 @@ FinFindr – Marine species identification
 import base64
 import fcntl
 import logging
+import math
 import os
 import random
 import re
@@ -76,14 +77,12 @@ HTML = """
   .candidate .attr { margin-top: 0.45rem; font-size: 0.75rem; opacity: 0.8; overflow-wrap: anywhere; }
   .candidate a { color: var(--aqua); }
   .unsure-title { color: #fde68a; }
-  .candidates { display: flex; flex-direction: column; gap: 0.75rem; margin-top: 0.75rem; }
-  .candidate { border: 1px solid rgba(255,255,255,0.16); border-radius: 12px; overflow: hidden; background: rgba(0,0,0,0.22); }
-  .candidate img { width: 100%; max-height: 180px; object-fit: cover; display: block; background: rgba(0,0,0,0.25); }
-  .candidate .cap { padding: 0.65rem 0.75rem 0.8rem; }
-  .candidate h4 { font-size: 1.05rem; margin-bottom: 0.15rem; }
-  .candidate .attr { margin-top: 0.45rem; font-size: 0.75rem; opacity: 0.8; overflow-wrap: anywhere; }
-  .candidate a { color: var(--aqua); }
-  .unsure-title { color: #fde68a; }
+  .discovery-card { margin-top: 0.75rem; padding: 0.9rem 0.85rem; border-radius: 12px; border: 1px solid rgba(255,255,255,0.18); background: rgba(255,255,255,0.04); }
+  .discovery-card h3 { font-size: 1.15rem; margin-bottom: 0.35rem; }
+  .discovery-card p, .discovery-card li { line-height: 1.45; }
+  .discovery-card ul { margin: 0.45rem 0 0.2rem 1.1rem; }
+  .discovery-card a { color: var(--aqua); }
+  .quiet-note { margin-top: 0.55rem; opacity: 0.85; }
   #fileInput { display: block; width: 100%; max-width: 100%; margin: 1rem auto; font-size: 1rem; color: var(--white); }
   #results { max-width: 800px; margin: 0 auto; }
   .result-card { background: rgba(0,0,0,0.35); border-radius: 16px; margin-bottom: 1.25rem; border: 1px solid rgba(255,255,255,0.1); overflow: hidden; }
@@ -151,6 +150,12 @@ HTML = """
     </select>
     <label for="modelInput">Model</label>
     <input id="modelInput" type="text" placeholder="Server default" autocomplete="off" spellcheck="false">
+    <label for="discoverySelect">Discovery flags</label>
+    <select id="discoverySelect">
+      <option value="">Server default</option>
+      <option value="1">On</option>
+      <option value="0">Off</option>
+    </select>
     <label for="verifySelect">Reference check</label>
     <select id="verifySelect">
       <option value="">Server default</option>
@@ -183,6 +188,7 @@ const regionSelect = document.getElementById("regionSelect");
 const speciesListSelect = document.getElementById("speciesListSelect");
 const modelInput = document.getElementById("modelInput");
 const verifySelect = document.getElementById("verifySelect");
+const discoverySelect = document.getElementById("discoverySelect");
 const locationStatus = document.getElementById("locationStatus");
 const MIN_DIMENSION = 32;
 const MAX_BYTES = 20 * 1024 * 1024;
@@ -464,6 +470,108 @@ function addRetry(card) {
   card.appendChild(wrap);
 }
 
+function inatSubmitLink() {
+  const link = document.createElement("a");
+  link.href = "https://www.inaturalist.org/observations/upload";
+  link.target = "_blank";
+  link.rel = "noopener";
+  link.textContent = "Submit to iNaturalist for expert confirmation";
+  return link;
+}
+
+function showPhotoRejection(card, data) {
+  card.querySelector("h3").textContent = "Can't identify from this photo";
+  const sciWrap = card.querySelector(".scientific");
+  if (sciWrap) sciWrap.hidden = true;
+  const conf = card.querySelector(".confidence");
+  if (conf) conf.textContent = "";
+  const note = document.createElement("p");
+  note.textContent = data.photo_issue || "The animal is not clear enough to identify.";
+  card.querySelector(".result-body").appendChild(note);
+}
+
+function showDiscovery(card, data) {
+  const discovery = data.discovery;
+  const body = card.querySelector(".result-body");
+  const sciWrap = card.querySelector(".scientific");
+  if (sciWrap) sciWrap.hidden = true;
+  const conf = card.querySelector(".confidence");
+  if (conf) conf.textContent = "";
+  const box = document.createElement("div");
+  box.className = "discovery-card";
+  const heading = document.createElement("h3");
+  const lead = document.createElement("p");
+  const why = document.createElement("p");
+  why.textContent = "Why we think so";
+  const list = document.createElement("ul");
+  if (discovery.type === "possible_range_extension") {
+    card.querySelector("h3").textContent = discovery.common_name || discovery.scientific_name || "Result";
+    heading.textContent = "Possible range extension";
+    const area = discovery.radius_km ? "within " + discovery.radius_km + " km" : "in the selected region";
+    lead.textContent = (discovery.scientific_name || "This species") + " has " + discovery.records_in_region + " research-grade iNaturalist records " + area + ". The identification matches reference photos, so this may be outside the recorded range.";
+    (discovery.traits || []).forEach(function (trait) {
+      const item = document.createElement("li");
+      item.textContent = trait;
+      list.appendChild(item);
+    });
+    if (discovery.nearest_records && discovery.nearest_records.length) {
+      const near = document.createElement("p");
+      near.textContent = "Nearest known records";
+      box.appendChild(heading);
+      box.appendChild(lead);
+      if (list.childNodes.length) {
+        box.appendChild(why);
+        box.appendChild(list);
+      }
+      box.appendChild(near);
+      const records = document.createElement("ul");
+      discovery.nearest_records.forEach(function (record) {
+        const item = document.createElement("li");
+        const link = document.createElement("a");
+        link.href = record.url;
+        link.target = "_blank";
+        link.rel = "noopener";
+        const place = record.place || "location not listed";
+        link.textContent = record.distance_km + " km — " + place + (record.date ? " (" + record.date + ")" : "");
+        item.appendChild(link);
+        records.appendChild(item);
+      });
+      box.appendChild(records);
+    } else {
+      box.appendChild(heading);
+      box.appendChild(lead);
+      if (list.childNodes.length) {
+        box.appendChild(why);
+        box.appendChild(list);
+      }
+    }
+  } else {
+    card.querySelector("h3").textContent = discovery.genus ? "Closest group: " + discovery.genus : "No matching species";
+    heading.textContent = "No matching species";
+    lead.textContent = discovery.note || "The photo does not match the reference photos of the closest named species.";
+    (discovery.closest_relatives || []).forEach(function (item) {
+      const row = document.createElement("li");
+      const name = item.common_name ? item.common_name + " (" + item.scientific_name + ")" : item.scientific_name;
+      row.textContent = name + (item.trait ? " — " + item.trait : "");
+      list.appendChild(row);
+    });
+    box.appendChild(heading);
+    box.appendChild(lead);
+    if (list.childNodes.length) {
+      box.appendChild(why);
+      box.appendChild(list);
+    }
+  }
+  if (discovery.type === "possible_range_extension" && discovery.rule && discovery.rule.text) {
+    const rule = document.createElement("p");
+    rule.className = "quiet-note";
+    rule.textContent = "Range rule: " + discovery.rule.text + ".";
+    box.appendChild(rule);
+  }
+  box.appendChild(inatSubmitLink());
+  body.appendChild(box);
+}
+
 function showError(card, message) {
   card.classList.remove("is-loading");
   card.classList.add("is-error");
@@ -628,6 +736,9 @@ async function handleFile(file) {
       if (verifySelect && (verifySelect.value === "0" || verifySelect.value === "1")) {
         formData.append("verify", verifySelect.value);
       }
+      if (discoverySelect && (discoverySelect.value === "0" || discoverySelect.value === "1")) {
+        formData.append("discovery", discoverySelect.value);
+      }
     }
 
     const resp = await fetch("/identify", { method: "POST", body: formData });
@@ -646,6 +757,16 @@ async function handleFile(file) {
     const spinner = card.querySelector(".spinner");
     if (spinner) spinner.remove();
 
+    if (data.photo_quality === "poor" || data.photo_quality === "invalid") {
+      showPhotoRejection(card, data);
+      addRetry(card);
+      return;
+    }
+    if (data.discovery && (data.discovery.type === "possible_range_extension" || data.discovery.type === "no_match")) {
+      showDiscovery(card, data);
+      addRetry(card);
+      return;
+    }
     const text = data.result_text || "No response";
     const lines = resultLines(text);
     let common = "", scientific = "", group = "", altGroup = "", confidence = "", notes = "";
@@ -669,6 +790,12 @@ async function handleFile(file) {
       const conf = card.querySelector(".confidence");
       if (conf) conf.textContent = "";
       showCandidates(card, data.candidates);
+      if (data.notable_note) {
+        const note = document.createElement("p");
+        note.className = "quiet-note";
+        note.textContent = data.notable_note;
+        card.querySelector(".result-body").appendChild(note);
+      }
     } else {
       card.querySelector("h3").textContent = common || "Result";
       card.querySelector(".sci").textContent = scientific;
@@ -1557,6 +1684,7 @@ def assemble_prompt(locality, species, lookalikes, lat, lng):
         "- A clearly rounded or globular body with long spines and no arms means a sea urchin.",
         "- Prefer a species known from this region when the visible features fit one.",
         "- The regional species list is a hint, not a menu. Name an unlisted species when the features call for it. Do not replace that animal with a listed species that lacks those features.",
+        "- A species with no records in this area can still be the right identification. Never reject a species only because it is unrecorded here.",
     ])
     if lookalikes:
         lines.append("")
@@ -1584,6 +1712,8 @@ def assemble_prompt(locality, species, lookalikes, lat, lng):
     lines.extend([
         "",
         "Reply in this exact format, with each field on its own line:",
+        "Photo quality: <good / poor / invalid>",
+        "Photo issue: <none, or a short reason if the photo is poor or not a real animal>",
         "Common name: <name>",
         "Scientific name: <name>",
         "Group: <group>",
@@ -2487,6 +2617,7 @@ def _verification_prompt(candidates):
         "The first image is the animal to identify.",
         "Each later image is a research-grade reference photo of one candidate. Compare diagnostic traits you can see. Do not pick a candidate just because it was listed first.",
         "If the photos do not separate the candidates, say you cannot decide.",
+        "If the animal matches none of the reference photos, the decision is NO_MATCH. Do not force the closest name.",
         "",
     ]
     for index, candidate in enumerate(candidates, start=1):
@@ -2501,7 +2632,7 @@ def _verification_prompt(candidates):
     lines.extend([
         "",
         "Reply in this exact format:",
-        "Decision: <scientific name of the matching candidate, or UNSURE>",
+        "Decision: <scientific name of the matching candidate, UNSURE, or NO_MATCH>",
         "Certainty: <confident / likely / unsure>",
         "Trait: <the visible trait that separates the choice, or what is missing>",
     ])
@@ -2515,8 +2646,10 @@ def _parse_verification(text, candidates):
     trait = _field_value(normalized, "Trait")
     if certainty not in ("confident", "likely", "unsure"):
         certainty = "unsure"
-    if not decision or decision.upper() == "UNSURE":
-        return {"decision": "UNSURE", "certainty": "unsure", "trait": trait, "scientific_name": ""}
+    normalized_decision = (decision or "").upper().replace(" ", "_")
+    if normalized_decision in ("", "UNSURE", "NO_MATCH"):
+        kind = "NO_MATCH" if normalized_decision == "NO_MATCH" else "UNSURE"
+        return {"decision": kind, "certainty": "unsure", "trait": trait, "scientific_name": ""}
     scientific = exact_scientific_name(decision)
     if not scientific:
         return {"decision": "UNSURE", "certainty": "unsure", "trait": trait, "scientific_name": ""}
@@ -2582,6 +2715,159 @@ def public_candidates(candidates, species):
     return cleaned
 
 
+def discovery_enabled(debug, raw):
+    """On by default. A debug discovery=0/1 field overrides FINFINDR_DISCOVERY."""
+    if debug and (raw or "").strip() in ("0", "1"):
+        return raw.strip() == "1"
+    flag = (os.environ.get("FINFINDR_DISCOVERY", "1") or "1").strip().lower()
+    return flag not in ("0", "false", "off", "no")
+
+
+def range_km():
+    """Radius for the range-extension rule. FINFINDR_RANGE_KM overrides 100."""
+    raw = (os.environ.get("FINFINDR_RANGE_KM") or "").strip()
+    if not raw:
+        return 100
+    try:
+        value = float(raw)
+    except ValueError:
+        return 100
+    return min(500, max(1, int(round(value))))
+
+
+def range_record_limit():
+    """Maximum research-grade records inside the radius that still count as unrecorded.
+
+    The default is 0: no research-grade iNaturalist records within FINFINDR_RANGE_KM.
+    Set FINFINDR_RANGE_MAX to allow a very small count.
+    """
+    raw = (os.environ.get("FINFINDR_RANGE_MAX") or "").strip()
+    if not raw:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError:
+        return 0
+    return min(10, max(0, value))
+
+
+def range_rule_text():
+    limit = range_record_limit()
+    distance = range_km()
+    if limit <= 0:
+        return f"no research-grade iNaturalist records of the species within {distance} km"
+    return f"at most {limit} research-grade iNaturalist records of the species within {distance} km"
+
+
+def range_rule():
+    return {
+        "max_records": range_record_limit(),
+        "radius_km": range_km(),
+        "text": range_rule_text(),
+    }
+
+
+def parse_photo_quality(text):
+    value = _field_value(_result_lines(text or ""), "Photo quality").lower()
+    if value in ("good", "poor", "invalid"):
+        return value
+    return "good"
+
+
+def haversine_km(lat1, lng1, lat2, lng2):
+    radius = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * radius * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _obs_coordinates(obs):
+    geo = (obs.get("geojson") or {}).get("coordinates") or []
+    if len(geo) == 2 and geo[0] is not None and geo[1] is not None:
+        return float(geo[1]), float(geo[0])
+    location = obs.get("location") or ""
+    if isinstance(location, str) and "," in location:
+        lat_text, lng_text = location.split(",", 1)
+        try:
+            return float(lat_text), float(lng_text)
+        except ValueError:
+            return None, None
+    return None, None
+
+
+def count_research_records(scientific, lat, lng, radius, place_id=None, bbox=None):
+    """How many research-grade records iNaturalist has in this radius or place. None if the lookup fails."""
+    params = {
+        "taxon_name": scientific,
+        "quality_grade": "research",
+        "verifiable": "true",
+        "per_page": 1,
+        "locale": "en",
+    }
+    if lat is not None and lng is not None:
+        params.update({"lat": lat, "lng": lng, "radius": radius})
+    elif place_id:
+        params["place_id"] = place_id
+    elif bbox:
+        params.update(bbox)
+    else:
+        return None
+    payload = _inat_json(_OBS_URL, params, (1.0, 2.0))
+    if not payload or "total_results" not in payload:
+        return None
+    try:
+        return int(payload.get("total_results") or 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def nearest_research_records(scientific, lat, lng, limit=3):
+    """Nearest research-grade observations, sorted by distance so the order is stable."""
+    if lat is None or lng is None:
+        return []
+    payload = _inat_json(_OBS_URL, {
+        "taxon_name": scientific,
+        "quality_grade": "research",
+        "geo": "true",
+        "lat": lat,
+        "lng": lng,
+        "radius": 500,
+        "per_page": 20,
+        "order_by": "observed_on",
+        "order": "desc",
+        "locale": "en",
+    }, (1.0, 2.0))
+    rows = list((payload or {}).get("results") or [])
+    if not rows:
+        payload = _inat_json(_OBS_URL, {
+            "taxon_name": scientific,
+            "quality_grade": "research",
+            "geo": "true",
+            "per_page": 20,
+            "order_by": "observed_on",
+            "order": "desc",
+            "locale": "en",
+        }, (1.0, 2.0))
+        rows = list((payload or {}).get("results") or [])
+    found = []
+    for obs in rows:
+        if not isinstance(obs, dict) or not obs.get("id"):
+            continue
+        olat, olng = _obs_coordinates(obs)
+        if olat is None:
+            continue
+        found.append({
+            "distance_km": round(haversine_km(lat, lng, olat, olng), 1),
+            "place": obs.get("place_guess") or "",
+            "date": obs.get("observed_on") or "",
+            "url": f"https://www.inaturalist.org/observations/{obs['id']}",
+        })
+    found.sort(key=lambda item: (item["distance_km"], item["url"]))
+    return found[:limit]
+
+
 def _result_text_for(candidate, group, alt, notes, confidence):
     return "\n".join([
         f"Common name: {candidate.get('common_name') or ''}",
@@ -2624,6 +2910,7 @@ def identify():
     debug = (request.form.get("debug") or "").strip() == "1"
     model = resolve_model(request.form.get("model"), debug=debug)
     verify = verification_enabled(debug, request.form.get("verify"))
+    discover = discovery_enabled(debug, request.form.get("discovery"))
     exclude_observation = (request.form.get("exclude_observation_id") or "").strip()
 
     xai_key = os.environ.get("XAI_API_KEY")
@@ -2682,6 +2969,32 @@ def identify():
     data = result["data"]
     tokens, token_source = _prompt_tokens(data, prompt)
     text = apply_standard_names(_extract_text(data), species)
+    photo_quality = parse_photo_quality(text)
+    photo_issue = _field_value(text, "Photo issue")
+    if photo_quality in ("poor", "invalid"):
+        total_ms = int(round((time.monotonic() - request_started) * 1000))
+        meta = _identification_meta(
+            mode, sent, available, truncated, source, list_fetch_ms, model_ms,
+            tokens, token_source, answered, image_px, fallback_used, attempts,
+            False, 0, 0, total_ms, "photo_quality",
+        )
+        meta["photo_quality"] = photo_quality
+        meta["evidence"] = [f"photo_{photo_quality}"]
+        meta["range_km"] = range_km()
+        meta["range_max"] = range_record_limit()
+        meta["range_rule"] = range_rule_text()
+        _log_identification(region["id"], meta)
+        return jsonify({
+            "result_text": text,
+            "region_label": region_label,
+            "certainty": "unsure",
+            "photo_quality": photo_quality,
+            "photo_issue": photo_issue or "The animal is not clear enough to identify.",
+            "message": "Can't identify from this photo.",
+            "candidates": [],
+            "discovery": None,
+            "meta": meta,
+        })
     candidates = parse_model_candidates(text)
     verify_used = False
     verify_ms = 0
@@ -2724,7 +3037,7 @@ def identify():
                     for candidate in candidates:
                         if candidate["scientific_name"].lower() == (verification.get("scientific_name") or "").lower():
                             candidate["trait"] = verification["trait"]
-                if verification.get("decision") not in ("", "UNSURE"):
+                if verification.get("decision") not in ("", "UNSURE", "NO_MATCH"):
                     candidates = _order_candidates(candidates, verification["scientific_name"])
                     group = _field_value(text, "Group")
                     alt = _field_value(text, "Alternative group considered")
@@ -2740,18 +3053,101 @@ def identify():
     else:
         certainty = certainty_for(candidates, verification)
     shown = public_candidates(candidates, species)
+    discovery = None
+    notable_note = ""
+    evidence = [f"photo_{photo_quality}"]
+    if verify_used:
+        evidence.append("verification_used")
+    if verification and verification.get("decision") == "NO_MATCH":
+        evidence.append("verification_no_match")
+    discovery_checked = False
+    record_count = None
+    focus = shown[0]["scientific_name"] if shown else ""
+    no_match = bool(verification and verification.get("decision") == "NO_MATCH")
+    strong_id = (
+        photo_quality == "good"
+        and certainty == "confident"
+        and verify_used
+        and verification
+        and verification.get("certainty") == "confident"
+        and verification.get("scientific_name")
+        and focus
+        and verification["scientific_name"].lower() == focus.lower()
+    )
+    rule = range_rule()
+    if discover and no_match and photo_quality == "good":
+        relatives = []
+        for item in shown:
+            genus = item["scientific_name"].split()[0]
+            relatives.append({
+                "scientific_name": item["scientific_name"],
+                "common_name": item.get("common_name") or "",
+                "genus": genus,
+                "trait": item.get("trait") or verification.get("trait") or "",
+            })
+        genus = relatives[0]["genus"] if relatives else ""
+        discovery = {
+            "type": "no_match",
+            "closest_relatives": relatives,
+            "genus": genus,
+            "family": "",
+            "note": "The photo does not match the reference photos of the closest named species. A genus-level guess is not a species identification.",
+            "rule": rule,
+        }
+        certainty = "unsure"
+        evidence.append("no_species_match")
+    elif discover and focus and photo_quality == "good" and lat is not None and lng is not None and _time_left(request_started) >= 3:
+        record_count = count_research_records(focus, lat, lng, rule["radius_km"])
+        discovery_checked = record_count is not None
+        evidence.append(f"range_rule={rule['text']}")
+        if record_count is not None:
+            evidence.append(f"records_in_radius={record_count}")
+        unrecorded = record_count is not None and record_count <= rule["max_records"]
+        if unrecorded and strong_id:
+            nearest = nearest_research_records(focus, lat, lng)
+            traits = [item.get("trait") for item in shown if item.get("trait")]
+            if verification and verification.get("trait"):
+                traits = [verification["trait"]] + [trait for trait in traits if trait != verification["trait"]]
+            discovery = {
+                "type": "possible_range_extension",
+                "scientific_name": focus,
+                "common_name": shown[0].get("common_name") or "",
+                "records_in_region": record_count,
+                "radius_km": rule["radius_km"],
+                "nearest_records": nearest,
+                "traits": [trait for trait in traits if trait][:3],
+                "rule": rule,
+            }
+            evidence.append("verification_agreed")
+        elif unrecorded and not strong_id:
+            certainty = "unsure"
+            notable_note = (
+                f"{shown[0].get('common_name') or focus} has {record_count} research-grade "
+                f"iNaturalist records within {rule['radius_km']} km. That would be notable if the identification is confirmed, "
+                "but this photo is not strong enough to flag a range extension."
+            )
+            evidence.append("notable_if_confirmed")
     total_ms = int(round((time.monotonic() - request_started) * 1000))
     meta = _identification_meta(
         mode, sent, available, truncated, source, list_fetch_ms, model_ms,
         tokens, token_source, answered, image_px, fallback_used, attempts,
         verify_used, verify_ms, reference_fetch_ms, total_ms, verify_skipped,
     )
+    meta["photo_quality"] = photo_quality
+    meta["discovery_checked"] = discovery_checked
+    meta["evidence"] = evidence
+    meta["range_km"] = rule["radius_km"]
+    meta["range_max"] = rule["max_records"]
+    meta["range_rule"] = rule["text"]
     _log_identification(region["id"], meta)
     return jsonify({
         "result_text": text or "No response",
         "region_label": region_label,
         "certainty": certainty,
-        "candidates": shown,
+        "photo_quality": photo_quality,
+        "candidates": [] if no_match else shown,
+        "discovery": discovery,
+        "notable_note": notable_note,
         "meta": meta,
     })
 
