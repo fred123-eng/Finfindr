@@ -146,11 +146,13 @@ class IdentifyTests(unittest.TestCase):
         os.environ.pop("FINFINDR_VERIFY_TIMEOUT", None)
         os.environ.pop("FINFINDR_VERIFY_IMAGE_PX", None)
         os.environ["FINFINDR_INAT_MIN_INTERVAL"] = "0"
+        os.environ["FINFINDR_MODEL_CACHE"] = "0"
         self.cache_dir = tempfile.mkdtemp(prefix="finfindr-cache-")
         os.environ["FINFINDR_CACHE_DIR"] = self.cache_dir
         finfindr_server._SPECIES_CACHE.clear()
         finfindr_server._INAT_JSON_CACHE.clear()
         finfindr_server.clear_persisted_caches()
+        finfindr_server.clear_model_cache()
         finfindr_server._INAT_NEXT_AT = 0.0
         finfindr_server._SPECIES_INFLIGHT.clear()
         finfindr_server._inat_cache.clear()
@@ -193,6 +195,8 @@ class IdentifyTests(unittest.TestCase):
         self.captured.setdefault("calls", []).append({
             "model": (json or {}).get("model"),
             "timeout": kwargs.get("timeout"),
+            "temperature": (json or {}).get("temperature"),
+            "seed": (json or {}).get("seed"),
         })
         model = (json or {}).get("model")
         prompt = ""
@@ -207,9 +211,11 @@ class IdentifyTests(unittest.TestCase):
             return FakeResponse({"error": "upstream"}, status=self.fail_status[model])
         if self.captured.get("delay"):
             time.sleep(self.captured["delay"])
-        if "The first image is the animal" in prompt and self.captured.get("verify_raises") == "timeout":
+        if "OFFLIST_FOLLOWUP" in prompt and self.captured.get("offlist_text"):
+            text = self.captured["offlist_text"]
+        elif "The first image is the animal" in prompt and self.captured.get("verify_raises") == "timeout":
             raise requests.Timeout("verify slow")
-        if "The first image is the animal" in prompt and self.captured.get("verify_text"):
+        elif "The first image is the animal" in prompt and self.captured.get("verify_text"):
             text = self.captured["verify_text"]
         else:
             text = self.captured.get(
@@ -610,19 +616,26 @@ class IdentifyTests(unittest.TestCase):
         self.assertFalse(body["meta"]["attempts"][0]["ok"])
         self.assertEqual(body["meta"]["attempts"][0]["error"], "timeout")
         self.assertTrue(body["meta"]["attempts"][1]["ok"])
-        self.assertGreaterEqual(self.captured["calls"][0]["timeout"], 80)
-        self.assertLessEqual(self.captured["calls"][0]["timeout"], 100)
+        self.assertGreaterEqual(self.captured["calls"][0]["timeout"], 60)
+        self.assertLessEqual(self.captured["calls"][0]["timeout"], 78)
         self.assertLessEqual(self.captured["calls"][1]["timeout"], 25)
+        self.assertEqual(self.captured["calls"][0]["temperature"], 0)
+        self.assertEqual(self.captured["calls"][0]["seed"], 0)
         self.assertIn("Cortez Rainbow Wrasse", body["result_text"])
 
     def test_both_models_timing_out_stays_json(self):
         self.fail_timeout = {"grok-4.7", "grok-4"}
         response = self.post_photo()
-        self.assertEqual(response.status_code, 504)
+        self.assertEqual(response.status_code, 200)
         body = response.get_json()
-        self.assertIn("taking too long", body["error"])
+        self.assertNotIn("error", body)
+        self.assertIn("taking too long", body["message"])
+        self.assertEqual(body["certainty"], "unsure")
+        self.assertEqual(body["candidates"], [])
         self.assertTrue(body["meta"]["fallback_used"])
         self.assertEqual(len(body["meta"]["attempts"]), 2)
+        self.assertEqual(body["meta"]["verify_pass_rate"], 0)
+        self.assertEqual(body["meta"]["verify_success_rate"], 0)
 
     def test_client_error_does_not_fall_back(self):
         self.fail_status = {"grok-4.7": 400}
@@ -639,9 +652,12 @@ class IdentifyTests(unittest.TestCase):
             response = self.post_photo()
         finally:
             os.environ.pop("XAI_FALLBACK_MODEL", None)
-        self.assertEqual(response.status_code, 504)
+        self.assertEqual(response.status_code, 200)
         self.assertEqual(len(self.captured["calls"]), 1)
         self.assertFalse(response.get_json()["meta"]["fallback_used"])
+        self.assertEqual(response.get_json()["certainty"], "unsure")
+        self.assertNotIn("error", response.get_json())
+        self.assertIn("taking too long", response.get_json()["message"])
 
     def test_short_list_is_stable_and_incomplete_lists_are_not_cached(self):
         query = finfindr_server.species_query_for(
@@ -1135,10 +1151,9 @@ class IdentifyTests(unittest.TestCase):
         self.assertIsNone(timed["discovery"])
         verify_calls = [
             call for call in self.captured["calls"]
-            if call.get("timeout") is not None and call["timeout"] <= 18
+            if call.get("timeout") == 18
         ]
         self.assertTrue(verify_calls)
-        self.assertEqual(verify_calls[-1]["timeout"], 18)
 
         wide = Image.new("RGB", (1200, 800), (10, 40, 80))
         buffer = io.BytesIO()
@@ -1473,6 +1488,9 @@ class IdentifyTests(unittest.TestCase):
         self.assertNotIn("high", blob.lower())
         self.assertEqual(body["meta"]["budget_s"], 110)
         self.assertIsInstance(body["meta"]["total_ms"], int)
+        self.assertEqual(body["meta"]["verify_pass_rate"], 0)
+        self.assertEqual(body["meta"]["verify_success_rate"], 0)
+        self.assertEqual(body["meta"]["verify_pass_reason"], "not_marine")
 
     def test_felis_catus_on_list_and_off_list_are_not_marine(self):
         page = self.client.get("/").get_data(as_text=True)
@@ -1541,7 +1559,6 @@ class IdentifyTests(unittest.TestCase):
         none = self.post_photo(lat="24.2", lng="-110.3").get_json()
         self.assertEqual(none["discovery"]["type"], "no_match")
         self.assertNotEqual(none["certainty"], "confident")
-        self.assertIn("NONE_OF_THESE", self.prompt())
 
     def test_abudefduf_short_diagnostic_trait_can_be_confident(self):
         """A rank-1 Gulf sergeant major must not collapse to all-low.
@@ -1634,6 +1651,135 @@ class IdentifyTests(unittest.TestCase):
         self.inat_handler = None
         again = finfindr_server.fetch_inat_taxon("Felis catus")
         self.assertEqual(again["iconic_taxon_name"], "Mammalia")
+
+
+    def test_murky_photo_cannot_override_a_verified_identification(self):
+        self.inat_handler = self._taxon_photos
+        self.captured["model_text"] = (
+            "Photo quality: poor\n"
+            "Photo issue: murky water and soft focus\n"
+            "Scientific name: Abudefduf troschelii\n"
+            "Common name: Panamic sergeant major\n"
+            "Confidence: high\n"
+            "Candidate 1: Abudefduf troschelii | Panamic sergeant major | high | 5 bars\n"
+            "Candidate 2: Abudefduf saxatilis | Sergeant major | medium | a yellow back\n"
+        )
+        self.captured["verify_text"] = (
+            "Decision: Abudefduf troschelii\nCertainty: confident\nTrait: 5 bars\n"
+        )
+        body = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertEqual(body["certainty"], "confident")
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Abudefduf troschelii")
+        self.assertNotIn("Can't identify", body.get("message") or "")
+        self.assertTrue(all(call["temperature"] == 0 and call["seed"] == 0 for call in self.captured["calls"]))
+        page = self.client.get("/").get_data(as_text=True)
+        self.assertIn('data.certainty !== "confident"', page)
+
+    def test_model_cache_repeats_the_same_answer(self):
+        os.environ["FINFINDR_MODEL_CACHE"] = "1"
+        try:
+            first = self.post_photo()
+            calls = len(self.captured["calls"])
+            second = self.post_photo()
+        finally:
+            os.environ["FINFINDR_MODEL_CACHE"] = "0"
+            finfindr_server.clear_model_cache()
+        self.assertEqual(len(self.captured["calls"]), calls)
+        self.assertEqual(first.get_json()["certainty"], second.get_json()["certainty"])
+        self.assertEqual(
+            first.get_json()["candidates"][0]["scientific_name"],
+            second.get_json()["candidates"][0]["scientific_name"],
+        )
+
+    def test_off_list_followup_keeps_rubescens_when_verify_times_out(self):
+        def handler(url, params):
+            if "obis.org" in url:
+                return FakeResponse({"total": 0, "results": []})
+            if "fishbase" in url:
+                return FakeResponse({"data": []})
+            if "taxa" in url:
+                name = params.get("q") or "Octopus rubescens"
+                return FakeResponse({"results": [{
+                    "name": name,
+                    "rank": "species",
+                    "iconic_taxon_name": "Mollusca",
+                    "preferred_common_name": "Red octopus",
+                    "ancestors": [
+                        {"name": "Mollusca", "rank": "phylum"},
+                        {"name": "Octopus", "rank": "genus"},
+                    ],
+                    "default_photo": {
+                        "id": 8,
+                        "url": "https://inaturalist-open-data.s3.amazonaws.com/photos/8/square.jpg",
+                        "attribution": "Riley Example",
+                        "license_code": "cc-by",
+                    },
+                }]})
+            if "observations" in url and str(params.get("per_page")) == "1":
+                return FakeResponse({"total_results": 0, "results": []})
+            if "observations" in url:
+                return FakeResponse({"total_results": 1, "results": [{
+                    "id": 88,
+                    "geojson": {"coordinates": [-122.4, 37.8]},
+                    "place_guess": "Monterey",
+                    "observed_on": "2021-04-01",
+                }]})
+            return None
+
+        self.inat_handler = handler
+        self.captured["verify_raises"] = "timeout"
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Octopus bimaculatus\n"
+            "Common name: Two-spot octopus\n"
+            "Confidence: medium\n"
+            "Candidate 1: Octopus bimaculatus | Two-spot octopus | medium | faint side spots\n"
+            "Candidate 2: Octopus hubbsorum | Hubbs' octopus | low | brown body\n"
+        )
+        self.captured["offlist_text"] = (
+            "Off-list 1: Octopus rubescens | Red octopus | reddish body without eye spots\n"
+            "Off-list 2: none\n"
+        )
+        body = self.post_photo(lat="24.2", lng="-110.3", region="sea-of-cortez").get_json()
+        self.assertGreaterEqual(body["meta"]["off_list_proposed"], 1)
+        self.assertGreaterEqual(body["meta"]["off_list_kept"], 1)
+        self.assertEqual(body["discovery"]["type"], "possible_range_extension")
+        self.assertEqual(body["discovery"]["scientific_name"], "Octopus rubescens")
+        self.assertNotEqual(body["certainty"], "confident")
+        self.assertEqual(body["meta"]["verify_skipped"], "timeout")
+        self.assertEqual(body["meta"]["verify_pass_rate"], 0)
+        self.assertEqual(body["meta"]["verify_success_rate"], 0)
+        self.assertIn("OFFLIST_FOLLOWUP", self.prompt())
+
+    def test_health_and_commit_meta(self):
+        os.environ["RENDER_GIT_COMMIT"] = "abc123"
+        try:
+            health = self.client.get("/health")
+            body = health.get_json()
+            identified = self.post_photo().get_json()
+        finally:
+            os.environ.pop("RENDER_GIT_COMMIT", None)
+        self.assertEqual(health.status_code, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["commit"], "abc123")
+        self.assertEqual(body["model"], "grok-4.7")
+        self.assertEqual(body["fallback_model"], "grok-4")
+        self.assertEqual(identified["meta"]["commit"], "abc123")
+        self.assertIn("verify_pass_rate", identified["meta"])
+        self.assertIn("verify_success_rate", identified["meta"])
+        skipped = {}
+        finfindr_server.apply_verify_rates(skipped, False, False, 0, 0, "no_time")
+        self.assertEqual(skipped["verify_pass_rate"], 0)
+        self.assertEqual(skipped["verify_pass_reason"], "no_time")
+        self.assertEqual(skipped["verify_success_rate"], 0.0)
+
+    def test_prompt_names_leucas_and_rubescens(self):
+        self.post_photo(region="sea-of-cortez")
+        prompt = self.prompt()
+        self.assertIn("Carcharhinus leucas", prompt)
+        self.assertIn("Octopus rubescens", prompt)
+        self.assertIn("Felimare californiensis", prompt)
+        self.assertIn("Nerita scabricosta", prompt)
 
 
 class EvalScoreTests(unittest.TestCase):

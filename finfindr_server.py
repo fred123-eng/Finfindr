@@ -6,6 +6,7 @@ FinFindr – Marine species identification
 import base64
 import contextvars
 import fcntl
+import hashlib
 import json
 import logging
 import math
@@ -18,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 
 import requests
-from flask import Flask, g, jsonify, render_template_string, request
+from flask import Flask, Response, copy_current_request_context, g, jsonify, render_template_string, request
 from requests.adapters import HTTPAdapter
 from PIL import Image, ImageOps
 from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
@@ -812,7 +813,7 @@ async function handleFile(file) {
       addRetry(card);
       return;
     }
-    if (data.photo_quality === "poor" || data.photo_quality === "invalid") {
+    if ((data.photo_quality === "poor" || data.photo_quality === "invalid") && data.certainty !== "confident") {
       showPhotoRejection(card, data);
       addRetry(card);
       return;
@@ -1560,6 +1561,9 @@ CORTEZ_LOOKALIKE_LINES = (
     "- Blue sea star (Phataria unifascialis), Panamic cushion star (Pentaceraster cumingi), or chocolate-chip star (Nidorellia armata): a small disc with long slender cylindrical arms and no large conical spines means Phataria unifascialis, even when the color is tan, orange, or blue. A thick inflated body with short broad arms and large conical knobs means a cushion star, not Phataria. Among cushion stars, a pale body with very short, almost webbed arms and evenly sized dark-brown spines means Nidorellia armata. A larger cushion star whose knobs are red or orange and often linked in a network means Pentaceraster cumingi. Do not call a slender-armed star a cushion star, and do not call a knobby inflated star Phataria.",
     "- Cortez rainbow wrasse (Thalassoma lucasanum) or Mexican hogfish (Bodianus diplotaenia): a small cigar-shaped fish with horizontal yellow and red stripes, or a blue head with a broad yellow saddle just behind it, is the rainbow wrasse. A pointed hog-like snout with two dark side stripes on a yellow or reddish body, a yellow tail on the reddish fish, or a forehead hump and a yellow mid-body bar on a large fish, is the Mexican hogfish. Yellow with red stripes is not the hogfish. Two dark stripes and a hog snout are not the rainbow wrasse.",
     "- Bullseye puffer (Sphoeroides annulatus) or a porcupinefish (Diodon): long spines that can stand erect mean a porcupinefish, even when the body is spotted. Only short prickles, a more elongated body, and a double concentric oval on the back with narrow yellowish lines mean the bullseye puffer. Spots without long spines are not a porcupinefish. Long spines are not the bullseye puffer. A puffer that lacks the concentric oval is a different puffer, not Sphoeroides annulatus.",
+    "- Bull shark (Carcharhinus leucas) or silky shark (Carcharhinus falciformis): a stocky body, broad blunt snout, small eyes, and no ridge between the dorsal fins mean the bull shark, Carcharhinus leucas. A slender body, longer rounded snout, and a low ridge between the dorsal fins mean the silky shark. Do not name falciformis when the snout is blunt and the body is stocky. Put leucas in the candidate list whenever both are plausible.",
+    "- Two-spot octopus (Octopus bimaculatus), Hubbs' octopus (Octopus hubbsorum), or red octopus (Octopus rubescens): a pair of false eye spots (ocelli) under the eyes means bimaculatus. A brown-gray octopus without those eye spots can be hubbsorum. A reddish octopus without eye spots, with a stout body and pale papillae, is Octopus rubescens even when it is not on the regional list. Do not leave rubescens off the off-list lines when the regional octopus species lack that reddish color and papillae.",
+    "- California blue dorid (Felimare californiensis) or a rough nerite (Nerita scabricosta): a dark blue mantle with yellow spots or rings is Felimare californiensis. A thick dark shell with rough spiral ridges in the intertidal is Nerita scabricosta. Name the one whose spots or shell ridges you can see, and say that trait explicitly.",
 )
 EASTERN_PACIFIC_BBOX = (-6.0, -118.0, 33.0, -77.0)
 
@@ -2865,8 +2869,78 @@ def _call_vision_model_once(jpeg_bytes, prompt, model, timeout, api_key, extra_i
     return {"ok": True, "retryable": False, "model": model, "ms": elapsed, "data": data, "status": 200}
 
 
+_MODEL_CACHE = {}
+_MODEL_CACHE_LOCK = threading.Lock()
+MODEL_CACHE_TTL = 6 * 60 * 60
+
+
+def model_cache_enabled():
+    """FINFINDR_MODEL_CACHE=0 turns off the image-hash cache. Default is on."""
+    return (os.environ.get("FINFINDR_MODEL_CACHE", "1") or "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def _model_cache_key(jpeg_bytes, prompt, model, extra_images):
+    digest = hashlib.sha256()
+    digest.update(jpeg_bytes or b"")
+    digest.update(b"|")
+    digest.update((model or "").encode())
+    digest.update(b"|")
+    digest.update(str(XAI_TEMPERATURE).encode())
+    digest.update(b"|")
+    digest.update(str(resolve_seed()).encode())
+    for image in extra_images or []:
+        digest.update(b"|")
+        digest.update((image or "").encode())
+    digest.update(b"|")
+    digest.update((prompt or "").encode())
+    return digest.hexdigest()
+
+
+def clear_model_cache():
+    with _MODEL_CACHE_LOCK:
+        _MODEL_CACHE.clear()
+    try:
+        path = os.path.join(cache_dir(), "model.json")
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _model_cache_get(key):
+    now = time.monotonic()
+    with _MODEL_CACHE_LOCK:
+        hit = _MODEL_CACHE.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+        _MODEL_CACHE.pop(key, None)
+    persisted = _disk_cache_get("model", key)
+    if not isinstance(persisted, dict) or not persisted.get("ok"):
+        return None
+    with _MODEL_CACHE_LOCK:
+        _MODEL_CACHE[key] = (time.monotonic() + 60, persisted)
+    return persisted
+
+
+def _model_cache_put(key, result):
+    if not isinstance(result, dict) or not result.get("ok"):
+        return
+    with _MODEL_CACHE_LOCK:
+        if len(_MODEL_CACHE) > 128 and key not in _MODEL_CACHE:
+            _MODEL_CACHE.clear()
+        _MODEL_CACHE[key] = (time.monotonic() + MODEL_CACHE_TTL, result)
+    _disk_cache_put("model", key, result, MODEL_CACHE_TTL)
+
+
 def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key, extra_images=None, extra_detail="low"):
     """One model attempt, stopped when the wall clock runs out even if the socket keeps trickling."""
+    cache_key = _model_cache_key(jpeg_bytes, prompt, model, extra_images)
+    if model_cache_enabled():
+        cached = _model_cache_get(cache_key)
+        if cached is not None:
+            replay = dict(cached)
+            replay["cached"] = True
+            return replay
     started = time.perf_counter()
     holder = {}
 
@@ -2881,11 +2955,14 @@ def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key, extra_images
         elapsed = int(round((time.perf_counter() - started) * 1000))
         app.logger.warning("xAI wall-clock timeout model=%s after %sms", model, elapsed)
         return {"ok": False, "retryable": True, "model": model, "ms": elapsed, "error": "timeout", "status": 504}
-    return holder.get("result") or {
+    result = holder.get("result") or {
         "ok": False, "retryable": True, "model": model,
         "ms": int(round((time.perf_counter() - started) * 1000)),
         "error": "failed", "status": 502,
     }
+    if model_cache_enabled():
+        _model_cache_put(cache_key, result)
+    return result
 
 
 def plan_model_timeouts(remaining, primary_cap, fallback_cap, verify_reserve, fallback_enabled):
@@ -2922,42 +2999,73 @@ def should_fallback(result, remaining, fallback_cap):
 
 
 def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, extra_reserve=0, extra_images=None):
-    """Primary model gets about XAI_PRIMARY_TIMEOUT (default 80s).
+    """Primary keeps most of its window. Fallback starts in parallel if it runs long.
 
-    grok-4 runs only after a connection error, a 5xx, or a timeout that still
-    leaves room for it. Wall time stays under FINFINDR_TIME_BUDGET (default
-    110s) so a 120s worker can return JSON instead of an HTML 504.
-    extra_reserve is ignored: verification is trimmed later, not held against
-    the primary call.
+    grok-4.7 still gets about 70s (XAI_PRIMARY_TIMEOUT). If it is still running
+    after XAI_FALLBACK_AFTER (default 40s), grok-4 starts beside it so a full
+    primary timeout does not consume the verify window. A fast failure still
+    falls back immediately. About 16s stays reserved for verification.
     """
     del extra_reserve
     worker_budget = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
-    primary_cap = _env_seconds("XAI_PRIMARY_TIMEOUT", 80, 5, 100)
-    fallback_cap = _env_seconds("XAI_FALLBACK_TIMEOUT", 25, 5, 60)
+    primary_cap = _env_seconds("XAI_PRIMARY_TIMEOUT", 70, 5, 90)
+    fallback_cap = _env_seconds("XAI_FALLBACK_TIMEOUT", 20, 5, 40)
+    fallback_after = _env_seconds("XAI_FALLBACK_AFTER", 40, 5, 80)
+    verify_hold = 16.0
     deadline = request_started + worker_budget
     attempts = []
 
     def remaining():
         return deadline - time.monotonic()
 
-    fallback_model = resolve_fallback_model(model)
-    primary_timeout, _fallback_timeout = plan_model_timeouts(
-        remaining(), primary_cap, fallback_cap, 0, bool(fallback_model)
-    )
-    primary_timeout = min(primary_timeout, max(0.5, remaining() - 2.0))
-    primary_timeout = max(0.5, primary_timeout)
-    result = _call_vision_model(jpeg_bytes, prompt, model, primary_timeout, api_key, extra_images)
-    attempts.append(_attempt_record(model, result["ms"], result["ok"], None if result["ok"] else result.get("error")))
-    if result["ok"] or not should_fallback(result, remaining(), fallback_cap) or not fallback_model:
-        return result, attempts
+    def timed_out(name, elapsed):
+        return {"ok": False, "retryable": True, "model": name, "ms": int(elapsed), "error": "timeout", "status": 504}
 
-    fallback_timeout = min(fallback_cap, max(1.0, remaining() - 2.0))
-    if fallback_timeout < 5.0:
+    fallback_model = resolve_fallback_model(model)
+    primary_timeout = min(primary_cap, max(8.0, remaining() - verify_hold))
+    holder = {}
+
+    def run_primary():
+        holder["primary"] = _call_vision_model(
+            jpeg_bytes, prompt, model, primary_timeout, api_key, extra_images
+        )
+
+    primary_thread = _start_thread(run_primary, "finfindr-primary")
+    primary_thread.join(min(fallback_after, primary_timeout))
+    fallback_thread = None
+    if primary_thread.is_alive() and fallback_model and remaining() >= fallback_cap + 8:
+        fallback_timeout = min(fallback_cap, max(5.0, remaining() - verify_hold))
+
+        def run_fallback():
+            holder["fallback"] = _call_vision_model(
+                jpeg_bytes, prompt, fallback_model, fallback_timeout, api_key, extra_images
+            )
+
+        fallback_thread = _start_thread(run_fallback, "finfindr-fallback")
+    primary_thread.join(max(0.2, primary_timeout))
+    result = holder.get("primary") or timed_out(model, primary_timeout * 1000)
+    attempts.append(_attempt_record(model, result["ms"], result["ok"], None if result["ok"] else result.get("error")))
+    if result.get("ok"):
         return result, attempts
-    result = _call_vision_model(
-        jpeg_bytes, prompt, fallback_model, fallback_timeout, api_key, extra_images,
-    )
-    attempts.append(_attempt_record(fallback_model, result["ms"], result["ok"], None if result["ok"] else result.get("error")))
+    if fallback_thread is not None:
+        fallback_thread.join(max(0.2, remaining() - 1.0))
+        fallback = holder.get("fallback")
+        if fallback:
+            attempts.append(_attempt_record(
+                fallback_model, fallback["ms"], fallback["ok"], None if fallback["ok"] else fallback.get("error")
+            ))
+            return fallback, attempts
+        return result, attempts
+    if fallback_model and should_fallback(result, remaining(), fallback_cap):
+        fallback_timeout = min(fallback_cap, max(1.0, remaining() - 2.0))
+        if fallback_timeout >= 5.0:
+            fallback = _call_vision_model(
+                jpeg_bytes, prompt, fallback_model, fallback_timeout, api_key, extra_images
+            )
+            attempts.append(_attempt_record(
+                fallback_model, fallback["ms"], fallback["ok"], None if fallback["ok"] else fallback.get("error")
+            ))
+            return fallback, attempts
     return result, attempts
 
 
@@ -3256,14 +3364,22 @@ def _inat_json(url, params, timeout):
 
 
 def confirm_species_name(scientific):
-    """True when iNaturalist has this exact species name. Failures count as unconfirmed."""
+    """True when iNaturalist has this exact species name.
+
+    None means the lookup did not answer (timeout or no time left). Callers
+    keep an off-list proposal in that case instead of dropping it.
+    """
     if not scientific:
         return False
+    if call_time_left() is not None and call_time_left() < 1.0:
+        return None
     payload = _inat_json(
         _TAXA_URL,
         {"q": scientific, "rank": "species", "per_page": 5, "locale": "en"},
         INAT_TIMEOUT,
     )
+    if payload is None:
+        return None
     for item in (payload or {}).get("results") or []:
         if (
             isinstance(item, dict)
@@ -3290,8 +3406,10 @@ def _prepare_off_list_candidates(candidates, species):
         if checked >= 2:
             continue
         checked += 1
-        if confirm_species_name(item["scientific_name"]):
-            kept.append(item)
+        status = confirm_species_name(item["scientific_name"])
+        if status is False:
+            continue
+        kept.append(item)
     return kept
 
 
@@ -3473,7 +3591,9 @@ _DIAGNOSTIC_TRAIT = re.compile(
     r"\b(?:bars?|barred|stripes?|striped|spots?|spotted|bands?|banded|spines?|"
     r"arms?|fins?|rays?|tails?|snouts?|discs?|knobs?|lattices?|mesh|tiles?|"
     r"scales?|tentacles?|shells?|eyes?|dorsal|pectoral|saddle|hump|cirri|"
-    r"prickles?|oval|reticulat\w*|cylindrical|inflated|slender|globular)\b",
+    r"prickles?|oval|reticulat\w*|cylindrical|inflated|slender|globular|"
+    r"mantles?|rhinophores?|gills?|ocelli|ocellus|papillae|papilla|ridges?|"
+    r"shells?|whorls?|apertures?|blunt|stocky)\b",
     re.IGNORECASE,
 )
 
@@ -3672,6 +3792,41 @@ def parse_photo_quality(text):
     if value in ("good", "poor", "invalid"):
         return value
     return "good"
+
+
+_UNUSABLE_PHOTO = re.compile(
+    r"\b(?:blank|empty frame|tiny|too small|no animal|not an animal|not a living|"
+    r"not a real animal|no visible animal|drawing|illustration|cartoon|painting|"
+    r"nothing visible|no subject)\b",
+    re.IGNORECASE,
+)
+
+
+def photo_truly_unusable(quality, issue):
+    """Murky or soft photos can still be identified. Blank, tiny, or no-animal frames cannot."""
+    if quality != "invalid":
+        return False
+    return bool(_UNUSABLE_PHOTO.search(issue or ""))
+
+
+def app_commit():
+    return (os.environ.get("RENDER_GIT_COMMIT") or os.environ.get("GIT_COMMIT") or "").strip()
+
+
+def apply_verify_rates(meta, attempted, ok, checked, passed, skipped):
+    """Per-request rates. A skipped check is 0 with a reason, never null."""
+    reason = skipped or ""
+    meta["verify_skipped"] = reason
+    meta["verify_attempted"] = bool(attempted)
+    if attempted and checked:
+        meta["verify_pass_rate"] = round(passed / checked, 4)
+        meta["verify_pass_reason"] = reason
+    else:
+        meta["verify_pass_rate"] = 0
+        meta["verify_pass_reason"] = reason or "not_run"
+    meta["verify_success_rate"] = (1.0 if ok else 0.0) if attempted else 0.0
+    meta["commit"] = app_commit()
+    return meta
 
 
 def haversine_km(lat1, lng1, lat2, lng2):
@@ -4135,11 +4290,115 @@ def stamp_meta(meta, request_started):
         stamped["total_ms"] = int(round((time.monotonic() - request_started) * 1000))
     stamped["external_calls"] = request_stat("external_calls")
     stamped["inat_throttled"] = request_stat("inat_throttled")
+    stamped["commit"] = app_commit()
     return stamped
+
+
+def _offlist_followup_prompt(locality, candidates):
+    names = ", ".join(
+        item["scientific_name"] for item in candidates if not item.get("off_list")
+    ) or "none"
+    return "\n".join([
+        f"The animal was photographed in {locality}.",
+        "The regional candidates were not confirmed. They are low or medium confidence, or the reference check did not accept them.",
+        f"Regional candidates already considered: {names}.",
+        "Propose up to 2 species that are not on the regional list and that match the visible animal better.",
+        "Do not repeat a regional candidate. Do not invent a name.",
+        "If the animal is a reddish octopus without eye spots, propose Octopus rubescens when it fits better than the regional octopus species.",
+        "If the shark is stocky with a blunt snout, propose Carcharhinus leucas when falciformis was the only shark named.",
+        "OFFLIST_FOLLOWUP",
+        "Reply with only these lines:",
+        "Off-list 1: <scientific name or none> | <common name> | <trait>",
+        "Off-list 2: <scientific name or none> | <common name> | <trait>",
+    ])
+
+
+def _needs_offlist_followup(candidates, verification, verify_skipped):
+    """Ask again when the regional list did not produce a confirmed identification."""
+    if not candidates or any(item.get("off_list") for item in candidates):
+        return False
+    if verify_skipped in ("timeout", "no_time"):
+        return True
+    if verification is not None and not passing_verification(verification):
+        return True
+    on_list = [item for item in candidates if not item.get("off_list")]
+    if not on_list:
+        return True
+    return all((item.get("confidence") or "medium") in ("low", "medium") for item in on_list)
+
+
+def _unsure_crash_body():
+    return jsonify({
+        "result_text": "",
+        "certainty": "unsure",
+        "photo_quality": "good",
+        "candidates": [],
+        "discovery": None,
+        "message": "Could not identify this photo. Please try again.",
+        "meta": apply_verify_rates(
+            stamp_meta({"verify_skipped": "error"}, getattr(g, "identify_started", None)),
+            False, False, 0, 0, "error",
+        ),
+    }), 200
+
+
+@app.route("/health", methods=["GET", "HEAD"])
+def health():
+    primary = resolve_model()
+    fallback = resolve_fallback_model(primary)
+    return jsonify({
+        "ok": True,
+        "commit": app_commit(),
+        "model": primary,
+        "fallback_model": fallback or "",
+    })
 
 
 @app.route("/identify", methods=["POST"])
 def identify():
+    """Run identification on a worker thread and send bytes before a proxy gives up.
+
+    A silent response longer than about 30s becomes a Cloudflare 520. Fast
+    answers return normally. Longer ones stream whitespace, which JSON parsers
+    ignore, and then the JSON body.
+    """
+    holder = {}
+
+    @copy_current_request_context
+    def run():
+        try:
+            holder["out"] = _identify_http()
+        except Exception as exc:
+            holder["error"] = exc
+
+    worker = threading.Thread(target=run, name="finfindr-identify", daemon=True)
+    worker.start()
+    worker.join(15)
+    if not worker.is_alive():
+        if holder.get("error"):
+            raise holder["error"]
+        return holder.get("out") or _unsure_crash_body()
+
+    def generate():
+        while worker.is_alive():
+            yield b" \n"
+            worker.join(5)
+        response = holder.get("out") or _unsure_crash_body()
+        payload = response[0] if isinstance(response, tuple) else response
+        yield payload.get_data()
+
+    return Response(
+        generate(),
+        status=200,
+        mimetype="application/json",
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache, no-transform",
+        },
+    )
+
+
+def _identify_http():
     g.identify_started = time.monotonic()
     begin_request_stats()
     saw_image, image_bytes, fields = read_identify_request()
@@ -4212,39 +4471,53 @@ def identify():
         if not result.get("retryable"):
             status = 502
             message = "Could not identify this photo. Please try another one."
-        elif result.get("error") == "timeout":
-            status = 504
-            message = "Identification is taking too long. Please try again."
+            body = {"error": message, "region_label": region_label}
         else:
-            status = 502
-            message = "Could not identify this photo. Please try again."
+            status = 200
+            message = (
+                "Identification is taking too long. Please try again."
+                if result.get("error") == "timeout"
+                else "Could not identify this photo. Please try again."
+            )
+            body = {
+                "result_text": "",
+                "region_label": region_label,
+                "certainty": "unsure",
+                "photo_quality": "good",
+                "candidates": [],
+                "discovery": None,
+                "message": message,
+            }
         total_ms = int(round((time.monotonic() - request_started) * 1000))
         meta = _identification_meta(
             mode, sent, available, truncated, source, list_fetch_ms, model_ms,
             None, "unavailable", answered, image_px, fallback_used, attempts,
-            False, 0, 0, total_ms, "",
+            False, 0, 0, total_ms, "model_timeout" if result.get("error") == "timeout" else "model_failed",
         )
+        apply_verify_rates(meta, False, False, 0, 0, meta["verify_skipped"])
         meta = stamp_meta(meta, request_started)
         _log_identification(region["id"], meta)
-        return jsonify({"error": message, "region_label": region_label, "meta": meta}), status
+        body["meta"] = meta
+        return jsonify(body), status
 
     data = result["data"]
     tokens, token_source = _prompt_tokens(data, prompt)
     text = apply_standard_names(_extract_text(data), species)
     photo_quality = parse_photo_quality(text)
     photo_issue = _field_value(text, "Photo issue")
-    if photo_quality in ("poor", "invalid"):
+    if photo_truly_unusable(photo_quality, photo_issue):
         total_ms = int(round((time.monotonic() - request_started) * 1000))
         meta = _identification_meta(
             mode, sent, available, truncated, source, list_fetch_ms, model_ms,
             tokens, token_source, answered, image_px, fallback_used, attempts,
-            False, 0, 0, total_ms, "photo_quality",
+            False, 0, 0, total_ms, "photo_unusable",
         )
         meta["photo_quality"] = photo_quality
         meta["evidence"] = [f"photo_{photo_quality}"]
         meta["range_km"] = range_km()
         meta["range_max"] = range_record_limit()
         meta["range_rule"] = range_rule_text()
+        apply_verify_rates(meta, False, False, 0, 0, "photo_unusable")
         meta = stamp_meta(meta, request_started)
         _log_identification(region["id"], meta)
         return jsonify({
@@ -4273,6 +4546,7 @@ def identify():
         meta["off_list_proposed"] = off_list_proposed
         meta["off_list_kept"] = off_list_kept
         meta["evidence"] = ["not_marine"]
+        apply_verify_rates(meta, False, False, 0, 0, "not_marine")
         meta = stamp_meta(meta, request_started)
         _log_identification(region["id"], meta)
         return jsonify({
@@ -4316,7 +4590,7 @@ def identify():
             photo_order = [item for item in candidates if item.get("off_list")] + [item for item in candidates if not item.get("off_list")]
             for candidate in photo_order:
                 reference_urls.extend((candidate.get("_reference_urls") or [])[:1])
-            reference_urls = reference_urls[:4]
+            reference_urls = reference_urls[:2]
         reference_fetch_ms = int(round((time.perf_counter() - fetch_started) * 1000))
         call_timeout = verify_call_budget(request_started)
         if verify_skipped == "no_time":
@@ -4366,6 +4640,44 @@ def identify():
                 verify_skipped = _verify_skip_reason(verify_result)
     for candidate in candidates:
         candidate.pop("_reference_urls", None)
+    if _needs_offlist_followup(candidates, verification, verify_skipped) and _time_left(request_started) >= 12:
+        follow_timeout = min(16.0, max(5.0, _time_left(request_started) - 4.0))
+        follow = _call_vision_model(
+            jpeg_bytes,
+            _offlist_followup_prompt(locality, candidates),
+            model if not fallback_used else answered,
+            follow_timeout,
+            xai_key,
+        )
+        attempts.append(_attempt_record(
+            model if not fallback_used else answered,
+            follow.get("ms") or 0,
+            follow.get("ok"),
+            None if follow.get("ok") else follow.get("error"),
+        ))
+        if follow.get("ok"):
+            proposed = [
+                item for item in parse_model_candidates(_extract_text(follow["data"]))
+                if item.get("off_list")
+            ]
+            off_list_proposed += len(proposed)
+            prepared = _prepare_off_list_candidates(proposed, species)
+            prepared = [
+                item for item in prepared
+                if item.get("off_list") and taxon_in_scope(item["scientific_name"]) is not False
+            ]
+            seen_names = {(item.get("scientific_name") or "").lower() for item in candidates}
+            for item in prepared:
+                if item["scientific_name"].lower() in seen_names:
+                    continue
+                candidates.append(item)
+                seen_names.add(item["scientific_name"].lower())
+            off_list_kept = sum(1 for item in candidates if item.get("off_list"))
+            if not passing_verification(verification):
+                off_items = [item for item in candidates if item.get("off_list")]
+                on_items = [item for item in candidates if not item.get("off_list")]
+                if off_items:
+                    candidates = off_items + on_items
     verification_disagreed = bool(
         verify_used and verification is not None and not passing_verification(verification)
     )
@@ -4403,7 +4715,7 @@ def identify():
     strong_id = (
         not no_match
         and not fallback_used
-        and photo_quality == "good"
+        and not photo_truly_unusable(photo_quality, photo_issue)
         and certainty == "confident"
         and verify_used
         and passing_verification(verification)
@@ -4443,10 +4755,12 @@ def identify():
         if record_count is not None:
             evidence.append(f"records_in_radius={record_count}")
         unrecorded = record_count is not None and record_count <= rule["max_records"]
-        range_status = external_range_status(focus, lat, lng, rule["radius_km"]) if unrecorded and strong_id else ""
+        off_list_focus = bool(shown and shown[0].get("off_list"))
+        range_ready = strong_id or (off_list_focus and not passing_verification(verification))
+        range_status = external_range_status(focus, lat, lng, rule["radius_km"]) if unrecorded and range_ready else ""
         if range_status:
             evidence.append(f"external_range={range_status}")
-        if unrecorded and strong_id and range_status == "absent":
+        if unrecorded and range_ready and range_status == "absent":
             if _time_left(request_started) >= 2:
                 nearest = nearest_research_records(focus, lat, lng)
             else:
@@ -4466,7 +4780,9 @@ def identify():
                 "traits": [trait for trait in traits if trait][:3],
                 "rule": rule,
             }
-            evidence.append("verification_agreed")
+            evidence.append("verification_agreed" if strong_id else "off_list_range_unverified")
+            if not strong_id:
+                certainty = "unsure"
         elif unrecorded and strong_id and range_status == "unknown":
             certainty = "unsure"
             notable_note = (
@@ -4502,7 +4818,11 @@ def identify():
     if not (verify_used and passing_verification(verification)):
         if certainty == "confident":
             certainty = "likely" if shown else "unsure"
-        if discovery and discovery.get("type") == "possible_range_extension":
+        if (
+            discovery
+            and discovery.get("type") == "possible_range_extension"
+            and "off_list_range_unverified" not in evidence
+        ):
             discovery = None
             evidence.append("discovery_blocked_without_verification")
     if discovery and discovery.get("type") == "no_match" and not (rejected_all or trait_conflict):
@@ -4515,14 +4835,39 @@ def identify():
             text = _set_field(text, "Confidence", "low" if certainty == "unsure" else "medium")
     checked = len(candidates) if verify_attempted else 0
     passed = 1 if verify_used and passing_verification(verification) and verification_chose_top(verification, candidates) else 0
+    verified_id = bool(
+        verify_used and passing_verification(verification) and verification_chose_top(verification, candidates) and not fallback_used
+    )
+    if photo_quality in ("poor", "invalid") and not verified_id and not photo_truly_unusable(photo_quality, photo_issue):
+        meta["evidence"] = evidence + ["photo_quality_unconfirmed"]
+        meta["photo_quality"] = photo_quality
+        apply_verify_rates(meta, verify_attempted, verify_used, checked, passed, verify_skipped or "photo_quality")
+        meta["verify_succeeded"] = False
+        meta["verify_timeout_s"] = verify_timeout_cap()
+        meta["off_list_proposed"] = off_list_proposed
+        meta["off_list_kept"] = off_list_kept
+        meta["range_km"] = rule["radius_km"]
+        meta["range_max"] = rule["max_records"]
+        meta["range_rule"] = rule["text"]
+        meta = stamp_meta(meta, request_started)
+        _log_identification(region["id"], meta)
+        return jsonify({
+            "result_text": "",
+            "region_label": region_label,
+            "certainty": "unsure",
+            "photo_quality": photo_quality,
+            "photo_issue": photo_issue or "The animal is not clear enough to identify.",
+            "message": "Can't identify from this photo.",
+            "candidates": [],
+            "discovery": None,
+            "meta": meta,
+        })
     meta["evidence"] = evidence
     meta["range_km"] = rule["radius_km"]
     meta["range_max"] = rule["max_records"]
     meta["range_rule"] = rule["text"]
-    meta["verify_attempted"] = verify_attempted
-    meta["verify_succeeded"] = bool(verify_used and passing_verification(verification) and verification_chose_top(verification, candidates))
-    meta["verify_success_rate"] = verification_success_rate()
-    meta["verify_pass_rate"] = round(passed / checked, 4) if checked else None
+    meta["verify_succeeded"] = verified_id
+    apply_verify_rates(meta, verify_attempted, verify_used, checked, passed, verify_skipped)
     meta["verify_timeout_s"] = verify_timeout_cap()
     meta["off_list_proposed"] = off_list_proposed
     meta["off_list_kept"] = off_list_kept
