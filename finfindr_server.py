@@ -9,6 +9,7 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 
 import requests
@@ -52,6 +53,7 @@ HTML = """
   .location-status { min-height: 1.25rem; margin-top: 0.45rem; font-size: 0.92rem; opacity: 0.9; overflow-wrap: anywhere; }
   .location-status:empty { display: none; }
   .test-options { margin-top: 0.75rem; font-size: 0.85rem; opacity: 0.8; }
+  .test-options[hidden] { display: none; }
   .test-options summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; }
   .region-line { margin: 0.15rem 0 0.45rem; color: var(--aqua); font-weight: 600; overflow-wrap: anywhere; }
   #fileInput { display: block; width: 100%; max-width: 100%; margin: 1rem auto; font-size: 1rem; color: var(--white); }
@@ -111,7 +113,7 @@ HTML = """
     <option value="my-location">Use my location</option>
   </select>
   <p id="locationStatus" class="location-status" role="status"></p>
-  <details class="test-options">
+  <details id="speciesListOptions" class="test-options" hidden>
     <summary>Testing: species list size</summary>
     <label for="speciesListSelect">List sent with the photo</label>
     <select id="speciesListSelect">
@@ -188,7 +190,7 @@ function requestLocation() {
     setLocationStatus("Using your location (" + saved.lat.toFixed(2) + ", " + saved.lng.toFixed(2) + ").");
   }
   if (!navigator.geolocation) {
-    setLocationStatus("Location isn't available in this browser. Photo GPS will be used if the picture has it.");
+    setLocationStatus("Location is not available in this browser. Pick a region, or photos will be identified as Sea of Cortez / La Paz. Photo GPS is still used when the picture has it.");
     return;
   }
   if (browserLat == null) setLocationStatus("Finding your location…");
@@ -201,7 +203,7 @@ function requestLocation() {
     setLocationStatus("Using your location (" + browserLat.toFixed(2) + ", " + browserLng.toFixed(2) + ").");
   }, function () {
     if (browserLat == null) {
-      setLocationStatus("Couldn't read your location. You can still identify; photo GPS will be used if present.");
+      setLocationStatus("Could not read your location. Pick a region, or photos will be identified as Sea of Cortez / La Paz.");
     }
   }, { enableHighAccuracy: false, timeout: 8000, maximumAge: 300000 });
 }
@@ -212,15 +214,19 @@ function restoreRegionChoice() {
   if (stored && Array.prototype.some.call(regionSelect.options, function (option) { return option.value === stored; })) {
     regionSelect.value = stored;
   }
-  let listMode = null;
-  try { listMode = sessionStorage.getItem(LIST_KEY); } catch (err) { listMode = null; }
   const params = new URLSearchParams(window.location.search);
+  const debugMode = params.get("debug") === "1";
+  const speciesListOptions = document.getElementById("speciesListOptions");
+  if (debugMode && speciesListOptions) speciesListOptions.hidden = false;
+  let listMode = null;
+  if (debugMode) {
+    try { listMode = sessionStorage.getItem(LIST_KEY); } catch (err) { listMode = null; }
+  }
   const fromUrl = params.get("species_list");
   if (fromUrl === "short" || fromUrl === "full") listMode = fromUrl;
   if (listMode === "short" || listMode === "full") {
     speciesListSelect.value = listMode;
-    const details = speciesListSelect.closest("details");
-    if (details) details.open = true;
+    if (debugMode && speciesListOptions) speciesListOptions.open = true;
   }
   if (regionSelect.value === "my-location") requestLocation();
 }
@@ -1035,6 +1041,21 @@ _SPECIES_HEADERS = {
     "Accept": "application/json",
 }
 SHORT_LIMIT = 250
+# Short lists are per-group quotas, not the global top 250. Observation counts
+# are dominated by fishes, which previously pushed sea snakes, urchins, and
+# other non-fish groups out of the hint list. Quotas sum to SHORT_LIMIT.
+# Non-fish groups are listed first so a token trim keeps them.
+SHORT_GROUPS = (
+    {"label": "Marine reptiles", "taxon_ids": (372234, 492346), "quota": 20},
+    {"label": "Echinoderms", "taxon_ids": (47549,), "quota": 30},
+    {"label": "Sharks and rays", "taxon_ids": (196614,), "quota": 25},
+    {"label": "Marine mammals", "taxon_ids": (152871, 41736, 41687, 46306), "quota": 20},
+    {"label": "Cnidarians", "taxon_ids": (47534,), "quota": 20},
+    {"label": "Crustaceans", "taxon_ids": (47186,), "quota": 20, "exclude": "51731,51074"},
+    {"label": "Molluscs", "taxon_ids": (47115,), "quota": 25, "exclude": "47485,54927"},
+    {"label": "Sponges", "taxon_ids": (48824,), "quota": 10},
+    {"label": "Ray-finned fishes", "taxon_ids": (47178,), "quota": 80},
+)
 SPECIES_PAGE_SIZE = 500
 LOCATION_RADIUS_KM = 100
 # Leave room for the image and a 256k context window, and stay under the
@@ -1046,13 +1067,15 @@ _SPECIES_LOCK = threading.Lock()
 _SPECIES_CACHE = {}
 _SPECIES_INFLIGHT = {}
 
-# Distinguishing features for pairs that were confused in Sea of Cortez tests.
+# Feature pairs that were confused in Sea of Cortez tests. Each note names the
+# features that select either animal, so mentioning one species does not pull
+# the other identification toward it.
 CORTEZ_LOOKALIKE_LINES = (
-    "Regional look-alikes in the eastern Pacific, including the Sea of Cortez:",
-    "- Giant hawkfish (Cirrhitus rivulatus) versus groupers: the hawkfish has a tuft of cirri on the tip of each dorsal spine, a wide pectoral fin whose lower rays are thick and unbranched, and olive-brown bars made of maze-like golden-brown marks edged in black and a thin blue line. It often sits propped on those pectoral fins. Groupers lack the dorsal-spine cirri, have a larger mouth, and have three spines on the gill cover rather than the hawkfish's two flat spines. A stout fish with those blue-edged bars is the giant hawkfish, not a grouper.",
-    "- Panamic cushion star (Pentaceraster cumingi) versus chocolate-chip star (Nidorellia armata): Nidorellia is the smaller one, to about 15 cm, with a thick inflated disc and very short arms that look almost webbed. Its cream, gray, green, or tan surface carries dark-brown conical spines of fairly even size, like chocolate chips, including a row down the middle of each arm. Pentaceraster is larger, often well past 15 cm and up to about 30 cm, with longer tapering arms. Its conical spines are usually red or orange on a beige, orange, green, or gray body and often trace a bright network, rather than sitting as scattered dark chips.",
-    "- Cortez rainbow wrasse (Thalassoma lucasanum) versus Mexican hogfish (Bodianus diplotaenia): the rainbow wrasse stays small, to about 15 cm, and is cigar-shaped. Initial-phase fish have horizontal yellow and red stripes and often school over the reef; terminal males have a blue head and a broad yellow saddle just behind it. The Mexican hogfish gets much larger, to about 76 cm, and has a pointed hog-like snout. Juveniles are bright yellow with two dark stripes along the side (the smallest may lack the stripes); females are reddish with two dark stripes and a yellow tail; large males grow a fleshy forehead hump, long filamentous fin tips, and a yellow bar near mid-body.",
-    "- Bullseye puffer (Sphoeroides annulatus) versus porcupinefish (Diodon): porcupinefish are covered in long spines that can stand erect. The bullseye puffer has only short prickles, a more elongated body, and a double concentric oval, the bullseye, on the back, plus narrow yellowish lines and small dark spots. Long spines mean a porcupinefish. If the mouth is clear, the puffer's beak has a central suture in each jaw and the porcupinefish beak does not.",
+    "Regional look-alikes in the eastern Pacific, including the Sea of Cortez. Decide from the features below, not from which name is more familiar:",
+    "- Giant hawkfish (Cirrhitus rivulatus) or a grouper: tufts of cirri on the dorsal-spine tips, thick unbranched lower pectoral rays, and olive bars made of maze-like golden-brown marks edged in black and a thin blue line mean the giant hawkfish. No dorsal-spine cirri, a larger mouth, three spines on the gill cover, and spots or blotches without those blue-edged maze bars mean a grouper. A stout body alone does not decide.",
+    "- Blue sea star (Phataria unifascialis), Panamic cushion star (Pentaceraster cumingi), or chocolate-chip star (Nidorellia armata): a small disc with long slender cylindrical arms and no large conical spines means Phataria unifascialis, even when the color is tan, orange, or blue. A thick inflated body with short broad arms and large conical knobs means a cushion star, not Phataria. Among cushion stars, a pale body with very short, almost webbed arms and evenly sized dark-brown spines means Nidorellia armata. A larger cushion star whose knobs are red or orange and often linked in a network means Pentaceraster cumingi. Do not call a slender-armed star a cushion star, and do not call a knobby inflated star Phataria.",
+    "- Cortez rainbow wrasse (Thalassoma lucasanum) or Mexican hogfish (Bodianus diplotaenia): a small cigar-shaped fish with horizontal yellow and red stripes, or a blue head with a broad yellow saddle just behind it, is the rainbow wrasse. A pointed hog-like snout with two dark side stripes on a yellow or reddish body, a yellow tail on the reddish fish, or a forehead hump and a yellow mid-body bar on a large fish, is the Mexican hogfish. Yellow with red stripes is not the hogfish. Two dark stripes and a hog snout are not the rainbow wrasse.",
+    "- Bullseye puffer (Sphoeroides annulatus) or a porcupinefish (Diodon): long spines that can stand erect mean a porcupinefish, even when the body is spotted. Only short prickles, a more elongated body, and a double concentric oval on the back with narrow yellowish lines mean the bullseye puffer. Spots without long spines are not a porcupinefish. Long spines are not the bullseye puffer. A puffer that lacks the concentric oval is a different puffer, not Sphoeroides annulatus.",
 )
 EASTERN_PACIFIC_BBOX = (-6.0, -118.0, 33.0, -77.0)
 
@@ -1134,7 +1157,16 @@ def species_query_for(region, lat, lng):
     return None
 
 
-def display_region_label(region, lat, lng):
+def apply_location_fallback(region, lat, lng):
+    """Use the default region when Use my location produced no coordinates."""
+    if region["id"] == "my-location" and (lat is None or lng is None):
+        return _REGIONS_BY_ID["sea-of-cortez"], True
+    return region, False
+
+
+def display_region_label(region, lat, lng, location_fallback=False):
+    if location_fallback:
+        return "Sea of Cortez / La Paz (location unavailable)"
     if region["id"] == "my-location":
         if lat is None:
             return "Use my location"
@@ -1307,6 +1339,7 @@ def assemble_prompt(locality, species, lookalikes, lat, lng):
         "- Arms or rays from a central disc means a starfish, not a sea urchin.",
         "- A clearly rounded or globular body with long spines and no arms means a sea urchin.",
         "- Prefer a species known from this region when the visible features fit one.",
+        "- The regional species list is a hint, not a menu. Name an unlisted species when the features call for it. Do not replace that animal with a listed species that lacks those features.",
     ])
     if lookalikes:
         lines.append("")
@@ -1314,11 +1347,15 @@ def assemble_prompt(locality, species, lookalikes, lat, lng):
     if species:
         lines.append("")
         lines.append(
-            "Species recorded in this area, most frequently observed first. "
-            "Treat the list as a prior, not a limit: choose a listed species when it fits "
-            "the visible features, and name a different species when they do not."
+            "Species recorded in this area, as a hint. "
+            "If none of them match the visible features, name the species that does, listed or not."
         )
+        current_group = None
         for item in species:
+            group = item.get("group")
+            if group and group != current_group:
+                lines.append(f"{group}:")
+                current_group = group
             common = item.get("common")
             if common:
                 lines.append(f"- {item['scientific']} ({common})")
@@ -1419,7 +1456,32 @@ def _merge_species_rows(rows):
     return sorted(best.values(), key=lambda item: (-item["count"], item["scientific"]))
 
 
-def _inat_species_page(query, page, per_page, taxon_id, timeout):
+def assemble_quota_list(group_results):
+    """Keep each group's most-observed species, up to that group's quota.
+
+    group_results is ordered dicts of label, quota, and raw iNaturalist rows.
+    A rare sea snake stays even when fishes have far more observations.
+    """
+    chosen = []
+    seen = set()
+    for group in group_results:
+        merged = _merge_species_rows(group.get("rows") or [])
+        kept = 0
+        for item in merged:
+            key = item["scientific"].lower()
+            if key in seen:
+                continue
+            if kept >= group["quota"]:
+                break
+            copied = dict(item)
+            copied["group"] = group["label"]
+            chosen.append(copied)
+            seen.add(key)
+            kept += 1
+    return chosen
+
+
+def _inat_species_page(query, page, per_page, taxon_id, timeout, exclude=None):
     params = {
         "locale": "en",
         "rank": "species",
@@ -1430,6 +1492,8 @@ def _inat_species_page(query, page, per_page, taxon_id, timeout):
     }
     if taxon_id:
         params["taxon_id"] = taxon_id
+        if exclude:
+            params["without_taxon_id"] = exclude
     else:
         params["iconic_taxa"] = MARINE_ICONIC
         params["without_taxon_id"] = EXCLUDED_TAXA
@@ -1461,7 +1525,7 @@ def _inat_species_page(query, page, per_page, taxon_id, timeout):
     return payload
 
 
-def _collect_species_rows(query, taxon_id, per_page, max_pages, deadline):
+def _collect_species_rows(query, taxon_id, per_page, max_pages, deadline, exclude=None):
     rows = []
     total = 0
     got_page = False
@@ -1473,7 +1537,9 @@ def _collect_species_rows(query, taxon_id, per_page, max_pages, deadline):
         if time.monotonic() >= deadline:
             break
         remaining = max(0.4, deadline - time.monotonic())
-        data = _inat_species_page(query, page, per_page, taxon_id, (1.0, min(2.5, remaining)))
+        data = _inat_species_page(
+            query, page, per_page, taxon_id, (1.0, min(2.5, remaining)), exclude=exclude
+        )
         if data is None:
             break
         got_page = True
@@ -1492,27 +1558,69 @@ def _collect_species_rows(query, taxon_id, per_page, max_pages, deadline):
     return rows, total, exhausted and got_page
 
 
+def _fetch_short_species_list(query, deadline):
+    """One page per quota group, in parallel, so a cold request stays short."""
+    buckets = {group["label"]: [] for group in SHORT_GROUPS}
+    totals = {group["label"]: 0 for group in SHORT_GROUPS}
+    failed = {group["label"]: False for group in SHORT_GROUPS}
+
+    def fetch_taxon(group, taxon_id):
+        if time.monotonic() >= deadline:
+            return group["label"], [], 0, False
+        rows, total, done = _collect_species_rows(
+            query,
+            taxon_id,
+            max(group["quota"], 30),
+            1,
+            deadline,
+            exclude=group.get("exclude"),
+        )
+        return group["label"], rows, total, done
+
+    calls = [(group, taxon_id) for group in SHORT_GROUPS for taxon_id in group["taxon_ids"]]
+    with ThreadPoolExecutor(max_workers=len(calls) or 1) as pool:
+        futures = [pool.submit(fetch_taxon, group, taxon_id) for group, taxon_id in calls]
+        for future in futures:
+            label, rows, total, done = future.result()
+            buckets[label].extend(rows)
+            totals[label] += total
+            if not done:
+                failed[label] = True
+
+    if not any(buckets.values()):
+        if query.get("curated_fallback"):
+            return _curated_species_payload()
+        return _empty_species()
+    species = assemble_quota_list(
+        {"label": group["label"], "quota": group["quota"], "rows": buckets[group["label"]]}
+        for group in SHORT_GROUPS
+    )
+    return {
+        "species": species,
+        "available": sum(totals.values()),
+        "complete": not any(failed.values()),
+        "source": "inaturalist",
+    }
+
+
 def _fetch_species_list(query, mode, deadline, on_progress):
-    short = mode == "short"
+    if mode == "short":
+        payload = _fetch_short_species_list(query, deadline)
+        on_progress(payload)
+        return payload
     main_rows, main_total, main_done = _collect_species_rows(
         query,
         None,
-        300 if short else SPECIES_PAGE_SIZE,
-        1 if short else 20,
+        SPECIES_PAGE_SIZE,
+        20,
         deadline,
     )
     if not main_rows and not main_done:
         payload = _curated_species_payload() if query.get("curated_fallback") else _empty_species()
         on_progress(payload)
         return payload
-    # Short mode only asks for the first page. That page is the whole short list.
-    if short and main_rows:
-        main_done = True
-    early = _merge_species_rows(main_rows)
-    if short:
-        early = early[:SHORT_LIMIT]
     on_progress({
-        "species": early,
+        "species": _merge_species_rows(main_rows),
         "available": main_total,
         "complete": False,
         "source": "inaturalist",
@@ -1528,7 +1636,7 @@ def _fetch_species_list(query, mode, deadline, on_progress):
             query,
             taxon_id,
             200,
-            1 if short else 5,
+            5,
             deadline,
         )
         if not supplement_done:
@@ -1536,8 +1644,6 @@ def _fetch_species_list(query, mode, deadline, on_progress):
         extra_rows.extend(supplement_rows)
         extra_total += supplement_total
     species = _merge_species_rows(main_rows + extra_rows)
-    if short:
-        species = species[:SHORT_LIMIT]
     payload = {
         "species": species,
         "available": main_total + extra_total,
@@ -1723,7 +1829,8 @@ def identify():
 
     region = resolve_region(request.form.get("region"))
     lat, lng, coord_source = _choose_coordinates(image_bytes)
-    region_label = display_region_label(region, lat, lng)
+    region, location_fallback = apply_location_fallback(region, lat, lng)
+    region_label = display_region_label(region, lat, lng, location_fallback)
     mode = resolve_species_mode(request.form.get("species_list"))
 
     xai_key = os.environ.get("XAI_API_KEY")
@@ -1738,12 +1845,18 @@ def identify():
     species_payload = load_species_list(
         species_query_for(region, lat, lng),
         mode,
-        2.5 if mode == "short" else 12.0,
+        4.0 if mode == "short" else 12.0,
     )
     list_fetch_ms = int(round((time.perf_counter() - started) * 1000))
     species = species_payload.get("species") or []
+    locality = locality_text(region, lat, lng, coord_source)
+    if location_fallback:
+        locality += (
+            ". The photographer asked to use their location, but no coordinates were available, "
+            "so this default region is used"
+        )
     prompt, sent, prompt_trimmed = prompt_for_species(
-        locality_text(region, lat, lng, coord_source),
+        locality,
         species,
         cortez_lookalikes_apply(region, lat, lng),
         lat,
