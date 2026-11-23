@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -65,23 +66,36 @@ class FakeResponse:
             raise requests.HTTPError(response=self)
 
 
+def _one_species(name, common, count):
+    return {
+        "total_results": 1,
+        "results": [
+            {
+                "count": count,
+                "taxon": {
+                    "name": name,
+                    "rank": "species",
+                    "preferred_common_name": common,
+                },
+            }
+        ],
+    }
+
+
 def species_payload(params):
     per_page = int(params.get("per_page") or 1)
     page = int(params.get("page") or 1)
-    if params.get("taxon_id"):
-        return {
-            "total_results": 1,
-            "results": [
-                {
-                    "count": 9000,
-                    "taxon": {
-                        "name": "Chelonia mydas",
-                        "rank": "species",
-                        "preferred_common_name": "not the curated name",
-                    },
-                }
-            ],
-        }
+    taxon_id = params.get("taxon_id")
+    if taxon_id:
+        taxon_id = int(taxon_id)
+        if taxon_id == 492346:
+            return _one_species("Hydrophis platurus", "Yellow-bellied Sea Snake", 2)
+        if taxon_id == 372234:
+            return _one_species("Chelonia mydas", "not the curated name", 40)
+        if taxon_id == 47549:
+            return _one_species("Phataria unifascialis", "not the curated name", 5)
+        if taxon_id != 47178:
+            return _one_species(f"Groupus {epithet(taxon_id)}", f"Group {taxon_id}", 3)
     total = 600
     start = (page - 1) * per_page
     results = []
@@ -118,6 +132,7 @@ class IdentifyTests(unittest.TestCase):
         self.client = finfindr_server.app.test_client()
         self.captured = {}
         self.species_calls = []
+        self._calls_lock = threading.Lock()
         self.get_patch = patch("finfindr_server.requests.get", side_effect=self.fake_get)
         self.post_patch = patch("finfindr_server.requests.post", side_effect=self.fake_post)
         self.get_patch.start()
@@ -130,7 +145,8 @@ class IdentifyTests(unittest.TestCase):
     def fake_get(self, url, params=None, **kwargs):
         params = params or {}
         if "species_counts" in url:
-            self.species_calls.append(params)
+            with self._calls_lock:
+                self.species_calls.append(params)
             return FakeResponse(species_payload(params))
         return FakeResponse({"results": []})
 
@@ -173,6 +189,9 @@ class IdentifyTests(unittest.TestCase):
         self.assertIn("finfindr.region", page)
         self.assertIn("function resultLines", page)
         self.assertIn("Testing: species list size", page)
+        self.assertIn('id="speciesListOptions"', page)
+        self.assertIn('class="test-options" hidden', page)
+        self.assertIn('params.get("debug") === "1"', page)
 
     def test_missing_and_invalid_photos_stay_json(self):
         missing = self.client.post("/identify", data={})
@@ -204,6 +223,11 @@ class IdentifyTests(unittest.TestCase):
         self.assertIn("Sphoeroides annulatus", prompt)
         self.assertIn("Thalassoma lucasanum (Cortez Rainbow Wrasse)", prompt)
         self.assertIn("Chelonia mydas (Green Sea Turtle)", prompt)
+        self.assertIn("Hydrophis platurus", prompt)
+        self.assertIn("Phataria unifascialis", prompt)
+        self.assertIn("slender cylindrical arms", prompt)
+        self.assertIn("thick inflated body", prompt)
+        self.assertIn("hint, not a menu", prompt)
         self.assertEqual(self.captured["json"]["temperature"], 0)
         self.assertEqual(self.captured["json"]["model"], "grok-4")
         self.assertEqual(body["region_label"], "Sea of Cortez / La Paz")
@@ -211,19 +235,20 @@ class IdentifyTests(unittest.TestCase):
         self.assertNotIn("Wrong", body["result_text"])
         meta = body["meta"]
         self.assertEqual(meta["species_list_mode"], "short")
-        self.assertEqual(meta["species_sent"], 250)
-        self.assertEqual(meta["species_available"], 606)
+        self.assertLessEqual(meta["species_sent"], 250)
+        self.assertGreater(meta["species_available"], meta["species_sent"])
         self.assertFalse(meta["species_truncated"])
         self.assertEqual(meta["list_source"], "inaturalist")
         self.assertEqual(meta["prompt_tokens"], 4321)
         self.assertEqual(meta["prompt_tokens_source"], "usage")
         self.assertGreaterEqual(meta["list_fetch_ms"], 0)
         self.assertGreaterEqual(meta["model_call_ms"], 0)
-        main_calls = [call for call in self.species_calls if "taxon_id" not in call]
-        self.assertTrue(main_calls)
-        self.assertEqual(main_calls[0]["place_id"], 122897)
-        self.assertEqual(int(main_calls[0]["per_page"]), 300)
-        self.assertTrue(all(int(call.get("page") or 1) == 1 for call in main_calls))
+        fish_calls = [call for call in self.species_calls if int(call.get("taxon_id") or 0) == 47178]
+        self.assertTrue(fish_calls)
+        self.assertEqual(fish_calls[0]["place_id"], 122897)
+        self.assertLessEqual(int(fish_calls[0]["per_page"]), 80)
+        snake_calls = [call for call in self.species_calls if int(call.get("taxon_id") or 0) == 492346]
+        self.assertTrue(snake_calls)
 
     def test_caribbean_skips_cortez_lookalikes_and_uses_its_bounds(self):
         response = self.post_photo(region="caribbean")
@@ -232,10 +257,12 @@ class IdentifyTests(unittest.TestCase):
         self.assertIn("Caribbean Sea", prompt)
         self.assertNotIn("Cirrhitus rivulatus", prompt)
         self.assertNotIn("Sphoeroides annulatus", prompt)
+        self.assertNotIn("slender cylindrical arms", prompt)
         self.assertEqual(response.get_json()["region_label"], "Caribbean")
-        main = next(call for call in self.species_calls if "taxon_id" not in call)
-        self.assertEqual(float(main["swlat"]), 9.0)
-        self.assertNotIn("place_id", main)
+        located = [call for call in self.species_calls if "swlat" in call]
+        self.assertTrue(located)
+        self.assertEqual(float(located[0]["swlat"]), 9.0)
+        self.assertNotIn("place_id", located[0])
 
     def test_species_list_full_pages_and_env_default(self):
         response = self.post_photo(species_list="full")
@@ -270,10 +297,10 @@ class IdentifyTests(unittest.TestCase):
         self.assertIn("21.3000", prompt)
         self.assertIn("-157.8000", prompt)
         self.assertIn("Hawaii", response.get_json()["region_label"])
-        main = next(call for call in self.species_calls if "taxon_id" not in call)
-        self.assertEqual(float(main["lat"]), 21.3)
-        self.assertEqual(float(main["lng"]), -157.8)
-        self.assertEqual(int(main["radius"]), 100)
+        located = next(call for call in self.species_calls if "radius" in call)
+        self.assertEqual(float(located["lat"]), 21.3)
+        self.assertEqual(float(located["lng"]), -157.8)
+        self.assertEqual(int(located["radius"]), 100)
 
         finfindr_server._SPECIES_CACHE.clear()
         self.species_calls.clear()
@@ -289,9 +316,8 @@ class IdentifyTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("Sea of Cortez", response.get_json()["region_label"])
         self.assertIn("Cirrhitus rivulatus", self.prompt())
-        main = next(call for call in self.species_calls if "taxon_id" not in call)
-        self.assertIn("radius", main)
-        self.assertNotIn("place_id", main)
+        located = next(call for call in self.species_calls if "radius" in call)
+        self.assertNotIn("place_id", located)
 
     def test_selected_region_wins_when_photo_gps_is_elsewhere(self):
         photo = jpeg_bytes(gps=(21.3, -157.8))
@@ -304,8 +330,8 @@ class IdentifyTests(unittest.TestCase):
         prompt = self.prompt()
         self.assertIn("outside this region", prompt)
         self.assertIn("Cirrhitus rivulatus", prompt)
-        main = next(call for call in self.species_calls if "taxon_id" not in call)
-        self.assertEqual(main["place_id"], 122897)
+        located = next(call for call in self.species_calls if call.get("place_id"))
+        self.assertEqual(located["place_id"], 122897)
 
     def test_inaturalist_failure_falls_back_without_blocking_identification(self):
         self.get_patch.stop()
@@ -372,6 +398,44 @@ class IdentifyTests(unittest.TestCase):
         self.assertIn("unspecified coast or ocean", self.prompt())
         self.assertNotIn("Cirrhitus rivulatus", self.prompt())
         self.assertEqual(self.species_calls, [])
+
+    def test_short_quotas_keep_uncommon_groups(self):
+        fish = [
+            {"count": 5000, "taxon": {"name": "Fishus alpha", "rank": "species", "preferred_common_name": "Alpha"}},
+            {"count": 4000, "taxon": {"name": "Fishus beta", "rank": "species", "preferred_common_name": "Beta"}},
+            {"count": 3000, "taxon": {"name": "Fishus gamma", "rank": "species", "preferred_common_name": "Gamma"}},
+        ]
+        snakes = [
+            {
+                "count": 2,
+                "taxon": {
+                    "name": "Hydrophis platurus",
+                    "rank": "species",
+                    "preferred_common_name": "Yellow-bellied Sea Snake",
+                },
+            }
+        ]
+        species = finfindr_server.assemble_quota_list([
+            {"label": "Ray-finned fishes", "quota": 2, "rows": fish},
+            {"label": "Marine reptiles", "quota": 5, "rows": snakes},
+        ])
+        names = [item["scientific"] for item in species]
+        self.assertEqual(names.count("Fishus alpha") + names.count("Fishus beta"), 2)
+        self.assertNotIn("Fishus gamma", names)
+        self.assertIn("Hydrophis platurus", names)
+        self.assertEqual(sum(group["quota"] for group in finfindr_server.SHORT_GROUPS), finfindr_server.SHORT_LIMIT)
+
+    def test_location_without_coordinates_uses_the_default_region(self):
+        response = self.post_photo(region="my-location")
+        body = response.get_json()
+        self.assertEqual(body["region_label"], "Sea of Cortez / La Paz (location unavailable)")
+        prompt = self.prompt()
+        self.assertIn("Sea of Cortez", prompt)
+        self.assertIn("default region", prompt)
+        self.assertNotIn("unknown spot", prompt)
+        self.assertIn("Hydrophis platurus", prompt)
+        self.assertIn("Cirrhitus rivulatus", prompt)
+        self.assertTrue(any(call.get("place_id") == 122897 for call in self.species_calls))
 
     def test_missing_api_key_is_json(self):
         os.environ.pop("XAI_API_KEY", None)
