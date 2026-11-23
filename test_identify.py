@@ -140,10 +140,15 @@ class IdentifyTests(unittest.TestCase):
         os.environ.pop("FINFINDR_RANGE_KM", None)
         os.environ.pop("FINFINDR_RANGE_MAX", None)
         os.environ.pop("FINFINDR_VERIFY", None)
+        os.environ.pop("FINFINDR_VERIFY_TIMEOUT", None)
+        os.environ.pop("FINFINDR_VERIFY_IMAGE_PX", None)
         finfindr_server._SPECIES_CACHE.clear()
         finfindr_server._SPECIES_INFLIGHT.clear()
         finfindr_server._inat_cache.clear()
         finfindr_server._PHOTO_CACHE.clear()
+        with finfindr_server._VERIFY_STATS_LOCK:
+            finfindr_server._VERIFY_STATS["attempts"] = 0
+            finfindr_server._VERIFY_STATS["ok"] = 0
         self.inat_handler = None
         self.client = finfindr_server.app.test_client()
         self.captured = {}
@@ -190,6 +195,8 @@ class IdentifyTests(unittest.TestCase):
             raise requests.Timeout("slow")
         if model in self.fail_status:
             return FakeResponse({"error": "upstream"}, status=self.fail_status[model])
+        if "The first image is the animal" in prompt and self.captured.get("verify_raises") == "timeout":
+            raise requests.Timeout("verify slow")
         if "The first image is the animal" in prompt and self.captured.get("verify_text"):
             text = self.captured["verify_text"]
         else:
@@ -276,9 +283,10 @@ class IdentifyTests(unittest.TestCase):
         self.assertEqual(self.captured["json"]["model"], "grok-4.7")
         self.assertEqual(body["meta"]["model"], "grok-4.7")
         self.assertEqual(body["meta"]["image_px"], "80x60")
-        self.assertEqual(body["certainty"], "confident")
-        self.assertEqual(body["meta"]["verify_skipped"], "far_apart")
+        self.assertEqual(body["certainty"], "likely")
+        self.assertEqual(body["meta"]["verify_skipped"], "no_photos")
         self.assertFalse(body["meta"]["verify_used"])
+        self.assertFalse(body["meta"]["verify_succeeded"])
         self.assertEqual(body["candidates"][0]["scientific_name"], "Thalassoma lucasanum")
         self.assertEqual(body["region_label"], "Sea of Cortez / La Paz")
         self.assertIn("Cortez Rainbow Wrasse", body["result_text"])
@@ -1014,6 +1022,105 @@ class IdentifyTests(unittest.TestCase):
         count_calls = [call for call in self.obs_calls if str(call.get("per_page")) == "1"]
         self.assertTrue(count_calls)
         self.assertEqual(int(float(count_calls[0]["radius"])), 40)
+
+
+    def _taxon_photos(self, url, params):
+        if "taxa" in url:
+            return FakeResponse({"results": [{
+                "name": params.get("q") or "Zebrasoma xanthurum",
+                "rank": "species",
+                "preferred_common_name": "Yellowtail tang",
+                "default_photo": {
+                    "id": 4,
+                    "url": "https://inaturalist-open-data.s3.amazonaws.com/photos/4/square.jpg",
+                    "attribution": "Riley Example",
+                    "license_code": "cc-by",
+                },
+            }]})
+        if "observations" in url and str(params.get("per_page")) == "1":
+            return FakeResponse({"total_results": 4, "results": []})
+        return None
+
+    def test_confident_requires_a_passing_reference_check(self):
+        """No path may return confident unless verification ran and agreed."""
+        lone = (
+            "Photo quality: good\n"
+            "Common name: Yellowtail tang\n"
+            "Scientific name: Zebrasoma xanthurum\n"
+            "Confidence: high\n"
+            "Notes: A surgeonfish.\n"
+        )
+        self.captured["model_text"] = lone
+        self.inat_handler = None
+        skipped = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertNotEqual(skipped["certainty"], "confident")
+        self.assertEqual(skipped["certainty"], "likely")
+        self.assertFalse(skipped["meta"]["verify_used"])
+        self.assertEqual(skipped["meta"]["verify_skipped"], "no_photos")
+        self.assertIsNone(skipped["discovery"])
+
+        self.inat_handler = self._taxon_photos
+        self.captured["verify_text"] = (
+            "Decision: Zebrasoma xanthurum\nCertainty: confident\nTrait: yellow tail\n"
+        )
+        finfindr_server._PHOTO_CACHE.clear()
+        agreed = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertEqual(agreed["certainty"], "confident")
+        self.assertTrue(agreed["meta"]["verify_used"])
+        self.assertTrue(agreed["meta"]["verify_succeeded"])
+        self.assertEqual(agreed["meta"]["verify_success_rate"], 1)
+        self.assertEqual(agreed["meta"]["verify_timeout_s"], 25)
+        self.assertEqual(agreed["meta"]["verify_skipped"], "")
+
+        self.captured["verify_text"] = (
+            "Decision: Zebrasoma xanthurum\nCertainty: likely\nTrait: yellow tail\n"
+        )
+        finfindr_server._PHOTO_CACHE.clear()
+        hedged = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertEqual(hedged["certainty"], "likely")
+        self.assertTrue(hedged["meta"]["verify_used"])
+        self.assertFalse(hedged["meta"]["verify_succeeded"])
+        self.assertIsNone(hedged["discovery"])
+
+        os.environ["FINFINDR_VERIFY_TIMEOUT"] = "18"
+        self.captured["verify_raises"] = "timeout"
+        finfindr_server._PHOTO_CACHE.clear()
+        try:
+            timed = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        finally:
+            os.environ.pop("FINFINDR_VERIFY_TIMEOUT", None)
+            self.captured.pop("verify_raises", None)
+        self.assertEqual(timed["meta"]["verify_skipped"], "timeout")
+        self.assertTrue(timed["meta"]["verify_attempted"])
+        self.assertFalse(timed["meta"]["verify_used"])
+        self.assertNotEqual(timed["certainty"], "confident")
+        self.assertIsNone(timed["discovery"])
+        verify_calls = [
+            call for call in self.captured["calls"]
+            if call.get("timeout") is not None and call["timeout"] <= 18
+        ]
+        self.assertTrue(verify_calls)
+        self.assertEqual(verify_calls[-1]["timeout"], 18)
+
+        wide = Image.new("RGB", (1200, 800), (10, 40, 80))
+        buffer = io.BytesIO()
+        wide.save(buffer, format="JPEG")
+        smaller = finfindr_server._shrink_jpeg(buffer.getvalue(), 768)
+        with Image.open(io.BytesIO(smaller)) as image:
+            self.assertLessEqual(max(image.size), 768)
+        self.assertFalse(finfindr_server.passing_verification(None))
+        self.assertFalse(finfindr_server.passing_verification({"decision": "UNSURE", "certainty": "confident", "scientific_name": ""}))
+        self.assertTrue(finfindr_server.candidates_far_apart([{
+            "scientific_name": "Zebrasoma xanthurum",
+            "confidence": "high",
+        }]))
+        self.assertEqual(
+            finfindr_server.certainty_for(
+                [{"scientific_name": "Zebrasoma xanthurum", "confidence": "high"}],
+                None,
+            ),
+            "likely",
+        )
 
 
 class EvalScoreTests(unittest.TestCase):

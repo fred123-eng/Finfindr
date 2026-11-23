@@ -2102,6 +2102,38 @@ def load_species_list(query, mode, budget, refresh_incomplete=False, _retry=True
         event.set()
 
 
+def prefetch_reference_limit():
+    """How many Sea of Cortez reference photos to warm. FINFINDR_PREFETCH_REFS=0 disables it."""
+    raw = (os.environ.get("FINFINDR_PREFETCH_REFS") or "").strip()
+    if not raw:
+        return 24
+    if raw.lower() in ("0", "false", "off", "no"):
+        return 0
+    try:
+        return min(80, max(0, int(raw)))
+    except ValueError:
+        return 24
+
+
+def _prefetch_reference_photos(species):
+    """Cache taxon photos for the common local species so the reference check is not waiting on iNaturalist."""
+    limit = prefetch_reference_limit()
+    if limit <= 0:
+        return
+    names = []
+    for item in species or []:
+        name = (item.get("scientific") or "").strip()
+        if name and name not in names:
+            names.append(name)
+        if len(names) >= limit:
+            break
+    for name in names:
+        try:
+            fetch_reference_photos(name, None, None)
+        except Exception:
+            app.logger.warning("reference prefetch failed for %s", name)
+
+
 def _prefetch_species_lists():
     """Warm short lists only. Full mode stays on demand. Failures never propagate."""
     try:
@@ -2119,7 +2151,9 @@ def _prefetch_species_lists():
         for region in named:
             query = species_query_for(region, None, None)
             try:
-                load_species_list(query, "short", 40, refresh_incomplete=True)
+                payload = load_species_list(query, "short", 40, refresh_incomplete=True)
+                if region["id"] == "sea-of-cortez":
+                    _prefetch_reference_photos(payload.get("species") or [])
             except Exception:
                 app.logger.warning("species prefetch failed for %s", region["id"], exc_info=True)
             time.sleep(0.2)
@@ -2172,13 +2206,13 @@ def resolve_model(raw=None, debug=False):
     return DEFAULT_XAI_MODEL
 
 
-def _vision_payload(jpeg_bytes, prompt, model, extra_images=None):
+def _vision_payload(jpeg_bytes, prompt, model, extra_images=None, extra_detail="low"):
     b64 = base64.b64encode(jpeg_bytes).decode("ascii")
     data_url = f"data:image/jpeg;base64,{b64}"
     content = [{"type": "input_image", "image_url": data_url, "detail": "high"}]
     for image_url in extra_images or []:
         if image_url:
-            content.append({"type": "input_image", "image_url": image_url, "detail": "high"})
+            content.append({"type": "input_image", "image_url": image_url, "detail": extra_detail})
     content.append({"type": "input_text", "text": prompt})
     return {
         "model": model,
@@ -2266,7 +2300,8 @@ def _log_identification(region_id, meta):
     app.logger.info(
         "identify region=%s list_mode=%s species_sent=%s species_available=%s "
         "prompt_tokens=%s prompt_tokens_source=%s list_fetch_ms=%s model_call_ms=%s "
-        "list_source=%s truncated=%s model=%s image_px=%s fallback_used=%s attempts=%s",
+        "list_source=%s truncated=%s model=%s image_px=%s fallback_used=%s attempts=%s "
+        "verify_used=%s verify_skipped=%s verify_ms=%s verify_success_rate=%s",
         region_id,
         meta["species_list_mode"],
         meta["species_sent"],
@@ -2281,6 +2316,10 @@ def _log_identification(region_id, meta):
         meta.get("image_px"),
         meta.get("fallback_used"),
         meta.get("attempts"),
+        meta.get("verify_used"),
+        meta.get("verify_skipped"),
+        meta.get("verify_ms"),
+        meta.get("verify_success_rate"),
     )
 
 
@@ -2291,10 +2330,10 @@ def _attempt_record(model, elapsed_ms, ok, error=None):
     return record
 
 
-def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key, extra_images=None):
+def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key, extra_images=None, extra_detail="low"):
     """One model attempt. Retryable covers timeout, connection loss, and HTTP 5xx."""
     started = time.perf_counter()
-    payload = _vision_payload(jpeg_bytes, prompt, model, extra_images)
+    payload = _vision_payload(jpeg_bytes, prompt, model, extra_images, extra_detail=extra_detail)
     try:
         resp = http.post(
             "https://api.x.ai/v1/responses",
@@ -2374,6 +2413,106 @@ def verification_enabled(debug, raw):
         return raw.strip() == "1"
     flag = (os.environ.get("FINFINDR_VERIFY", "1") or "1").strip().lower()
     return flag not in ("0", "false", "off", "no")
+
+
+def verify_timeout_cap():
+    """Seconds allowed for the reference-photo model call. FINFINDR_VERIFY_TIMEOUT overrides 25."""
+    raw = (os.environ.get("FINFINDR_VERIFY_TIMEOUT") or "").strip()
+    if not raw:
+        return 25.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 25.0
+    return min(40.0, max(5.0, value))
+
+
+def verify_image_px():
+    """Longest edge of the photo sent with the reference check. Default 768."""
+    raw = (os.environ.get("FINFINDR_VERIFY_IMAGE_PX") or "").strip()
+    if not raw:
+        return 768
+    try:
+        value = int(raw)
+    except ValueError:
+        return 768
+    return min(1536, max(256, value))
+
+
+def verify_call_budget(request_started):
+    """Seconds left for verification, leaving a few seconds for the range lookup. None if it will not fit."""
+    left = _time_left(request_started) - 3.0
+    if left < 8.0:
+        return None
+    return min(verify_timeout_cap(), left)
+
+
+def _shrink_jpeg(jpeg_bytes, limit):
+    """Smaller JPEG for the reference check so that call can finish inside the budget."""
+    if not jpeg_bytes or limit <= 0:
+        return jpeg_bytes
+    img = None
+    try:
+        img = Image.open(BytesIO(jpeg_bytes))
+        img.load()
+        if max(img.size) <= limit:
+            return jpeg_bytes
+        scale = limit / float(max(img.size))
+        resized = img.resize(
+            (
+                max(1, int(round(img.size[0] * scale))),
+                max(1, int(round(img.size[1] * scale))),
+            ),
+            Image.Resampling.LANCZOS,
+        )
+        if resized is not img:
+            img.close()
+            img = resized
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=75, optimize=True)
+        return out.getvalue()
+    except Exception:
+        app.logger.warning("Could not shrink the verification image", exc_info=True)
+        return jpeg_bytes
+    finally:
+        if img is not None:
+            try:
+                img.close()
+            except Exception:
+                pass
+
+
+_VERIFY_STATS = {"attempts": 0, "ok": 0}
+_VERIFY_STATS_LOCK = threading.Lock()
+
+
+def _record_verification(ok):
+    with _VERIFY_STATS_LOCK:
+        _VERIFY_STATS["attempts"] += 1
+        if ok:
+            _VERIFY_STATS["ok"] += 1
+        attempts = _VERIFY_STATS["attempts"]
+        rate = _VERIFY_STATS["ok"] / attempts if attempts else None
+    return attempts, (None if rate is None else round(rate, 4))
+
+
+def verification_success_rate():
+    with _VERIFY_STATS_LOCK:
+        attempts = _VERIFY_STATS["attempts"]
+        if not attempts:
+            return None
+        return round(_VERIFY_STATS["ok"] / attempts, 4)
+
+
+def _verify_skip_reason(result):
+    error = str((result or {}).get("error") or "failed")
+    if error == "timeout":
+        return "timeout"
+    if error == "connection":
+        return "connection"
+    if error == "invalid_json":
+        return "invalid_json"
+    return error[:40]
 
 
 def _time_left(request_started):
@@ -2605,7 +2744,7 @@ def _attach_reference_photos(candidates, lat, lng, exclude_observation_id, deadl
         attached = []
         for future, candidate in zip(futures, candidates):
             try:
-                attached.append(future.result(timeout=4))
+                attached.append(future.result(timeout=2.5))
             except Exception:
                 app.logger.warning("reference photo timed out for %s", candidate.get("scientific_name"))
                 attached.append(candidate)
@@ -2668,7 +2807,11 @@ def _order_candidates(candidates, scientific):
 
 
 def candidates_far_apart(candidates):
-    """A lone high-confidence pick, or a high pick with only a low alternative."""
+    """A lone high-confidence pick, or a high pick with only a low alternative.
+
+    This used to skip the reference check and mark the answer confident. It no
+    longer changes certainty. A wide gap is not a substitute for reference photos.
+    """
     if not candidates or candidates[0].get("confidence") != "high":
         return False
     if len(candidates) == 1:
@@ -2676,16 +2819,29 @@ def candidates_far_apart(candidates):
     return candidates[1].get("confidence") == "low"
 
 
+def passing_verification(verification):
+    """True only when the reference check names a candidate and is confident."""
+    if not isinstance(verification, dict):
+        return False
+    decision = (verification.get("decision") or "").strip()
+    scientific = (verification.get("scientific_name") or "").strip()
+    if not decision or not scientific or decision.lower() != scientific.lower():
+        return False
+    if decision.upper() in ("UNSURE", "NO_MATCH", "NO MATCH"):
+        return False
+    return verification.get("certainty") == "confident"
+
+
 def certainty_for(candidates, verification):
-    """Confident only after reference photos agree. Otherwise say so."""
+    """Confident only after a passing reference-photo check. Otherwise at most likely."""
     if not candidates:
         return "unsure"
+    if passing_verification(verification):
+        return "confident"
     if verification is None:
         return "unsure" if candidates[0].get("confidence") == "low" else "likely"
-    if verification.get("decision") == "UNSURE" or verification.get("certainty") == "unsure":
+    if verification.get("decision") in ("UNSURE", "NO_MATCH", "") or verification.get("certainty") == "unsure":
         return "unsure"
-    if verification.get("certainty") == "confident":
-        return "confident"
     return "likely"
 
 
@@ -2997,39 +3153,46 @@ def identify():
         })
     candidates = parse_model_candidates(text)
     verify_used = False
+    verify_attempted = False
     verify_ms = 0
     reference_fetch_ms = 0
     verify_skipped = ""
     verification = None
-    far_apart = candidates_far_apart(candidates)
-    if verify and candidates and far_apart:
-        verify_skipped = "far_apart"
-    elif verify and candidates and _time_left(request_started) < 12:
-        verify_skipped = "no_time"
-    elif not verify:
+    if not verify:
         verify_skipped = "disabled"
-    if verify and candidates and not far_apart and _time_left(request_started) >= 12:
+    elif not candidates:
+        verify_skipped = "no_candidates"
+    elif verify_call_budget(request_started) is None:
+        verify_skipped = "no_time"
+    else:
         fetch_started = time.perf_counter()
+        fetch_deadline = time.monotonic() + 3.0
         candidates = _attach_reference_photos(
-            candidates, lat, lng, exclude_observation, request_started + _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115) - 8
+            candidates, lat, lng, exclude_observation, fetch_deadline
         )
         reference_fetch_ms = int(round((time.perf_counter() - fetch_started) * 1000))
         reference_urls = []
         for candidate in candidates:
             reference_urls.extend(candidate.get("_reference_urls") or [])
+        call_timeout = verify_call_budget(request_started)
         if not reference_urls:
             verify_skipped = "no_photos"
-        elif _time_left(request_started) >= 8:
+        elif call_timeout is None:
+            verify_skipped = "no_time"
+        else:
+            verify_attempted = True
             verify_started = time.perf_counter()
             verify_result = _call_vision_model(
-                jpeg_bytes,
+                _shrink_jpeg(jpeg_bytes, verify_image_px()),
                 _verification_prompt(candidates),
                 answered,
-                min(12.0, max(5.0, _time_left(request_started) - 2.0)),
+                call_timeout,
                 xai_key,
                 reference_urls[:3],
+                extra_detail="low",
             )
             verify_ms = int(round((time.perf_counter() - verify_started) * 1000))
+            _record_verification(bool(verify_result.get("ok")))
             if verify_result.get("ok"):
                 verify_used = True
                 verification = _parse_verification(_extract_text(verify_result["data"]), candidates)
@@ -3046,12 +3209,11 @@ def identify():
                         _result_text_for(candidates[0], group, alt, notes, candidates[0].get("confidence") or "medium"),
                         species,
                     )
+            else:
+                verify_skipped = _verify_skip_reason(verify_result)
     for candidate in candidates:
         candidate.pop("_reference_urls", None)
-    if far_apart and verify:
-        certainty = "confident"
-    else:
-        certainty = certainty_for(candidates, verification)
+    certainty = certainty_for(candidates, verification if verify_used else None)
     shown = public_candidates(candidates, species)
     discovery = None
     notable_note = ""
@@ -3135,10 +3297,22 @@ def identify():
     )
     meta["photo_quality"] = photo_quality
     meta["discovery_checked"] = discovery_checked
+    if not (verify_used and passing_verification(verification)):
+        if certainty == "confident":
+            certainty = "likely" if shown else "unsure"
+        if discovery and discovery.get("type") == "possible_range_extension":
+            discovery = None
+            evidence.append("discovery_blocked_without_verification")
+    if discovery and discovery.get("type") == "no_match" and not verify_used:
+        discovery = None
     meta["evidence"] = evidence
     meta["range_km"] = rule["radius_km"]
     meta["range_max"] = rule["max_records"]
     meta["range_rule"] = rule["text"]
+    meta["verify_attempted"] = verify_attempted
+    meta["verify_succeeded"] = bool(verify_used and passing_verification(verification))
+    meta["verify_success_rate"] = verification_success_rate()
+    meta["verify_timeout_s"] = verify_timeout_cap()
     _log_identification(region["id"], meta)
     return jsonify({
         "result_text": text or "No response",
