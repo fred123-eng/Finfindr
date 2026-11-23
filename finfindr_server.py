@@ -3207,19 +3207,13 @@ def verify_image_px():
 def verify_call_budget(request_started):
     """Seconds left for verification. None if fewer than 6 seconds remain.
 
-    A fast primary keeps the configured cap (12s unless FINFINDR_VERIFY_TIMEOUT
-    says otherwise). After a long primary, the leftover budget is used instead,
-    up to 28s, so the reference check is not cut off at 12s.
+    The configured cap is not allowed to end the check while the request still
+    has time. Whatever is left in the budget, up to 40s, is what the call gets.
     """
     left = _time_left(request_started) - 2.0
     if left < 6.0:
         return None
-    cap = verify_timeout_cap()
-    budget = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
-    elapsed = budget - _time_left(request_started)
-    if elapsed >= 45.0:
-        return min(28.0, left)
-    return min(cap, left)
+    return min(40.0, left)
 
 
 def _shrink_jpeg(jpeg_bytes, limit):

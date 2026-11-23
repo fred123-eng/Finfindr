@@ -192,12 +192,6 @@ class IdentifyTests(unittest.TestCase):
     def fake_post(self, url, json=None, **kwargs):
         self.captured["url"] = url
         self.captured["json"] = json
-        self.captured.setdefault("calls", []).append({
-            "model": (json or {}).get("model"),
-            "timeout": kwargs.get("timeout"),
-            "temperature": (json or {}).get("temperature"),
-            "seed": (json or {}).get("seed"),
-        })
         model = (json or {}).get("model")
         prompt = ""
         try:
@@ -205,6 +199,13 @@ class IdentifyTests(unittest.TestCase):
             prompt = next(part.get("text", "") for part in content if part.get("type") == "input_text")
         except (KeyError, IndexError, StopIteration, TypeError):
             prompt = ""
+        self.captured.setdefault("calls", []).append({
+            "model": model,
+            "timeout": kwargs.get("timeout"),
+            "temperature": (json or {}).get("temperature"),
+            "seed": (json or {}).get("seed"),
+            "verify": "The first image is the animal" in prompt,
+        })
         if model in self.fail_timeout:
             raise requests.Timeout("slow")
         if model in self.fail_status:
@@ -1148,11 +1149,9 @@ class IdentifyTests(unittest.TestCase):
         self.assertFalse(timed["meta"]["verify_used"])
         self.assertNotEqual(timed["certainty"], "confident")
         self.assertIsNone(timed["discovery"])
-        verify_calls = [
-            call for call in self.captured["calls"]
-            if call.get("timeout") == 18
-        ]
+        verify_calls = [call for call in self.captured["calls"] if call.get("verify")]
         self.assertTrue(verify_calls)
+        self.assertGreaterEqual(verify_calls[-1]["timeout"], 18)
 
         wide = Image.new("RGB", (1200, 800), (10, 40, 80))
         buffer = io.BytesIO()
@@ -2054,9 +2053,10 @@ class IdentifyTests(unittest.TestCase):
         started = time.monotonic() - 70
         seconds = finfindr_server.verify_call_budget(started)
         self.assertGreater(seconds, 12)
-        self.assertLessEqual(seconds, 28)
+        self.assertLessEqual(seconds, 40)
         quick = finfindr_server.verify_call_budget(time.monotonic())
-        self.assertEqual(quick, 12)
+        self.assertGreater(quick, 12)
+        self.assertLessEqual(quick, 40)
 
     def test_unresolved_mammal_or_bird_is_not_rejected(self):
         sea_lion = {
