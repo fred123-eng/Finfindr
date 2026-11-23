@@ -195,6 +195,8 @@ class IdentifyTests(unittest.TestCase):
             raise requests.Timeout("slow")
         if model in self.fail_status:
             return FakeResponse({"error": "upstream"}, status=self.fail_status[model])
+        if self.captured.get("delay"):
+            time.sleep(self.captured["delay"])
         if "The first image is the animal" in prompt and self.captured.get("verify_raises") == "timeout":
             raise requests.Timeout("verify slow")
         if "The first image is the animal" in prompt and self.captured.get("verify_text"):
@@ -241,7 +243,13 @@ class IdentifyTests(unittest.TestCase):
         self.assertIn('params.get("debug") === "1"', page)
         self.assertIn('id="modelInput"', page)
         self.assertIn("Checking reference photos", page)
-        self.assertIn("Usually under a minute", page)
+        self.assertIn("Usually 30–90 seconds", page)
+        self.assertIn("object-fit:contain", page)
+        self.assertIn("function applySavedLocation", page)
+        self.assertIn('if (regionSelect.value === "my-location") applySavedLocation();', page)
+        self.assertIn("Nearest known record:", page)
+        self.assertIn("inat-submit", page)
+        self.assertIn('rel="icon"', page)
         self.assertIn("Common name unavailable", page)
 
     def test_missing_and_invalid_photos_stay_json(self):
@@ -771,6 +779,9 @@ class IdentifyTests(unittest.TestCase):
     def test_favicon_and_identify_errors_are_not_html(self):
         favicon = self.client.get("/favicon.ico")
         self.assertEqual(favicon.status_code, 204)
+        self.assertNotIn(b"<html", favicon.data.lower())
+        self.assertIn("geolocation=(self)", favicon.headers.get("Permissions-Policy", ""))
+        self.assertEqual(self.client.head("/favicon.ico").status_code, 204)
         with patch("finfindr_server.prepare_image", side_effect=RuntimeError("boom")):
             response = self.post_photo()
         self.assertEqual(response.status_code, 500)
@@ -1077,7 +1088,7 @@ class IdentifyTests(unittest.TestCase):
         )
         finfindr_server._PHOTO_CACHE.clear()
         hedged = self.post_photo(lat="24.2", lng="-110.3").get_json()
-        self.assertEqual(hedged["certainty"], "likely")
+        self.assertEqual(hedged["certainty"], "unsure")
         self.assertTrue(hedged["meta"]["verify_used"])
         self.assertFalse(hedged["meta"]["verify_succeeded"])
         self.assertIsNone(hedged["discovery"])
@@ -1121,6 +1132,139 @@ class IdentifyTests(unittest.TestCase):
             ),
             "likely",
         )
+
+
+    def test_discovery_stays_on_when_the_host_does_not_set_it(self):
+        os.environ.pop("FINFINDR_DISCOVERY", None)
+        self.assertTrue(finfindr_server.discovery_enabled(False, None))
+        self.assertTrue(finfindr_server.discovery_enabled(False, ""))
+        os.environ["FINFINDR_DISCOVERY"] = "0"
+        try:
+            self.assertFalse(finfindr_server.discovery_enabled(False, None))
+            self.assertTrue(finfindr_server.discovery_enabled(True, "1"))
+        finally:
+            os.environ.pop("FINFINDR_DISCOVERY", None)
+
+    def test_failed_verification_is_unsure_and_color_mismatch_is_no_match(self):
+        def handler(url, params):
+            if "taxa" in url:
+                return FakeResponse({"results": [{
+                    "name": params.get("q") or "Phataria unifascialis",
+                    "rank": "species",
+                    "preferred_common_name": "Blue Sea Star",
+                    "default_photo": {
+                        "id": 4,
+                        "url": "https://inaturalist-open-data.s3.amazonaws.com/photos/4/square.jpg",
+                        "attribution": "Riley Example",
+                        "license_code": "cc-by",
+                    },
+                }]})
+            return None
+
+        self.inat_handler = handler
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Phataria unifascialis\n"
+            "Common name: Blue Sea Star\n"
+            "Confidence: high\n"
+            "Candidate 1: Phataria unifascialis | Blue Sea Star | high | blue body\n"
+            "Candidate 2: Pentaceraster cumingi | Panamic cushion star | medium | thick body\n"
+        )
+        self.captured["verify_text"] = (
+            "Decision: UNSURE\nCertainty: unsure\nTrait: the arms are hidden\n"
+        )
+        unsure = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertEqual(unsure["certainty"], "unsure")
+        self.assertIsNone(unsure["discovery"])
+        self.assertTrue(unsure["candidates"])
+        self.assertNotEqual(unsure["candidates"][0]["confidence"], "high")
+
+        self.captured["verify_text"] = (
+            "Decision: Phataria unifascialis\n"
+            "Certainty: unsure\n"
+            "Trait: the main color does not match the blue reference\n"
+        )
+        finfindr_server._PHOTO_CACHE.clear()
+        mismatch = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertEqual(mismatch["certainty"], "unsure")
+        self.assertEqual(mismatch["discovery"]["type"], "no_match")
+
+    def test_off_list_species_can_be_a_range_extension_but_not_a_local_confident_match(self):
+        def handler(url, params):
+            if "taxa" in url:
+                name = params.get("q") or ""
+                if name.lower().startswith("notareal"):
+                    return FakeResponse({"results": []})
+                return FakeResponse({"results": [{
+                    "name": name,
+                    "rank": "species",
+                    "preferred_common_name": "Red octopus",
+                    "default_photo": {
+                        "id": 8,
+                        "url": "https://inaturalist-open-data.s3.amazonaws.com/photos/8/square.jpg",
+                        "attribution": "Riley Example",
+                        "license_code": "cc-by",
+                    },
+                }]})
+            if "observations" in url and str(params.get("per_page")) == "1":
+                return FakeResponse({"total_results": self.record_count, "results": []})
+            if "observations" in url:
+                return FakeResponse({"total_results": 1, "results": [{
+                    "id": 88,
+                    "geojson": {"coordinates": [-122.4, 37.8]},
+                    "place_guess": "Monterey",
+                    "observed_on": "2021-04-01",
+                }]})
+            return None
+
+        self.inat_handler = handler
+        self.record_count = 0
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Octopus rubescens\n"
+            "Common name: Red octopus\n"
+            "Confidence: medium\n"
+            "Candidate 1: Phataria unifascialis | Blue Sea Star | medium | blue body\n"
+            "Off-list 1: Octopus rubescens | Red octopus | reddish body and eight arms\n"
+            "Off-list 2: Notareal animalis | Invented | not a real animal\n"
+        )
+        self.captured["verify_text"] = (
+            "Decision: Octopus rubescens\nCertainty: confident\nTrait: eight arms and a reddish body\n"
+        )
+        body = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertEqual(body["discovery"]["type"], "possible_range_extension")
+        self.assertEqual(body["discovery"]["scientific_name"], "Octopus rubescens")
+        self.assertIsNotNone(body["discovery"]["nearest_known_record_km"])
+        self.assertEqual(body["discovery"]["nearest_known_record_source"], "iNaturalist")
+        self.assertTrue(body["discovery"]["nearest_records"])
+        self.assertNotIn("Notareal animalis", json.dumps(body["candidates"]))
+
+        self.record_count = 12
+        finfindr_server._PHOTO_CACHE.clear()
+        local = self.post_photo(lat="24.2", lng="-110.3").get_json()
+        self.assertIsNone(local["discovery"])
+        self.assertNotEqual(local["certainty"], "confident")
+        self.assertTrue(any(item.get("off_list") for item in local["candidates"]))
+
+    def test_identify_returns_inside_the_time_budget(self):
+        def slow_post(*args, **kwargs):
+            time.sleep(2)
+            raise requests.Timeout("still going")
+
+        started = time.perf_counter()
+        with patch("finfindr_server.http.post", side_effect=slow_post):
+            result = finfindr_server._call_vision_model(b"jpeg", "prompt", "grok-4.7", 0.4, "key")
+        elapsed = time.perf_counter() - started
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "timeout")
+        self.assertLess(elapsed, 1.5)
+
+        response = self.post_photo()
+        body = response.get_json()
+        self.assertIn("total_ms", body["meta"])
+        self.assertIsInstance(body["meta"]["total_ms"], int)
+        self.assertLess(body["meta"]["total_ms"], 110000)
+        self.assertEqual(body["meta"]["budget_s"], 110)
 
 
 class EvalScoreTests(unittest.TestCase):
