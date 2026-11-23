@@ -55,7 +55,7 @@ DEFAULT_TARGETS = {
     "false_reject_rate": {"max": 0.01},
     "decoy_false_flag_rate": {"max": 0.02},
     "discovery_precision": {"min": 0.99},
-    "discovery_recall": {"min": 0.80},
+    "discovery_recall": {"min": 0.95},
     "range_rule": {
         "max_records": 0,
         "radius_km": 100,

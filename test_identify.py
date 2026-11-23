@@ -2345,7 +2345,7 @@ class EvalScoreTests(unittest.TestCase):
         self.assertEqual(targets["false_reject_rate"]["max"], 0.01)
         self.assertEqual(targets["decoy_false_flag_rate"]["max"], 0.02)
         self.assertEqual(targets["discovery_precision"]["min"], 0.99)
-        self.assertEqual(targets["discovery_recall"]["min"], 0.80)
+        self.assertEqual(targets["discovery_recall"]["min"], 0.95)
         self.assertEqual(targets["range_rule"]["radius_km"], 100)
         self.assertEqual(targets["range_rule"]["max_records"], 0)
 
