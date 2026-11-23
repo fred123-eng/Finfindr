@@ -46,6 +46,14 @@ HTML = """
   .upload-zone.dragover { border-color: var(--aqua); background: rgba(34, 211, 238, 0.16); }
   .hint { opacity: 0.8; margin-top: 0.35rem; }
   .upload-zone.dragover .hint { color: var(--aqua); font-weight: 600; }
+  .region-panel { width: 100%; max-width: 560px; margin: 0 auto 1rem; text-align: left; }
+  .region-panel label { display: block; font-weight: 700; margin: 0.55rem 0 0.35rem; }
+  #regionSelect, #speciesListSelect { width: 100%; max-width: 100%; font-size: 16px; line-height: 1.3; min-height: 44px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.35); background: rgba(0,0,0,0.28); color: var(--white); padding: 0.45rem 0.7rem; color-scheme: dark; }
+  .location-status { min-height: 1.25rem; margin-top: 0.45rem; font-size: 0.92rem; opacity: 0.9; overflow-wrap: anywhere; }
+  .location-status:empty { display: none; }
+  .test-options { margin-top: 0.75rem; font-size: 0.85rem; opacity: 0.8; }
+  .test-options summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; }
+  .region-line { margin: 0.15rem 0 0.45rem; color: var(--aqua); font-weight: 600; overflow-wrap: anywhere; }
   #fileInput { display: block; width: 100%; max-width: 100%; margin: 1rem auto; font-size: 1rem; color: var(--white); }
   #results { max-width: 800px; margin: 0 auto; }
   .result-card { background: rgba(0,0,0,0.35); border-radius: 16px; margin-bottom: 1.25rem; border: 1px solid rgba(255,255,255,0.1); overflow: hidden; }
@@ -80,6 +88,7 @@ HTML = """
     #identifyBtn, .retry-btn { width: 100%; }
     .result-card img { max-height: 220px; }
     .sci { font-size: 1.05rem; }
+    .region-panel { text-align: left; }
   }
 </style>
 </head>
@@ -88,6 +97,30 @@ HTML = """
   <h1>FinFindr</h1>
   <p>Upload a photo · Get the species</p>
 </header>
+
+<div class="region-panel">
+  <label for="regionSelect">Region</label>
+  <select id="regionSelect">
+    <option value="sea-of-cortez">Sea of Cortez / La Paz</option>
+    <option value="caribbean">Caribbean</option>
+    <option value="hawaii">Hawaii</option>
+    <option value="red-sea">Red Sea</option>
+    <option value="great-barrier-reef">Great Barrier Reef</option>
+    <option value="mediterranean">Mediterranean</option>
+    <option value="other">Other</option>
+    <option value="my-location">Use my location</option>
+  </select>
+  <p id="locationStatus" class="location-status" role="status"></p>
+  <details class="test-options">
+    <summary>Testing: species list size</summary>
+    <label for="speciesListSelect">List sent with the photo</label>
+    <select id="speciesListSelect">
+      <option value="">Server default</option>
+      <option value="short">Short — top 250</option>
+      <option value="full">Full — all recorded</option>
+    </select>
+  </details>
+</div>
 
 <div class="upload-zone" id="uploadZone">
   <h2>Choose a photo</h2>
@@ -108,11 +141,123 @@ const results = document.getElementById("results");
 const uploadZone = document.getElementById("uploadZone");
 const clientError = document.getElementById("clientError");
 const dropHint = document.getElementById("dropHint");
+const regionSelect = document.getElementById("regionSelect");
+const speciesListSelect = document.getElementById("speciesListSelect");
+const locationStatus = document.getElementById("locationStatus");
 const MIN_DIMENSION = 32;
 const MAX_BYTES = 20 * 1024 * 1024;
+const REGION_KEY = "finfindr.region";
+const LOCATION_KEY = "finfindr.location";
+const LIST_KEY = "finfindr.speciesList";
 let busy = false;
 let validateToken = 0;
 let dragDepth = 0;
+let browserLat = null;
+let browserLng = null;
+
+function resultLines(text) {
+  const newline = String.fromCharCode(10);
+  const cr = String.fromCharCode(13);
+  const slashN = String.fromCharCode(92) + "n";
+  let normalized = String(text || "").split(cr + newline).join(newline).split(cr).join(newline);
+  if (normalized.indexOf(newline) === -1 && normalized.indexOf(slashN) !== -1) {
+    normalized = normalized.split(slashN).join(newline);
+  }
+  return normalized.split(newline).map(function (line) { return line.trim(); }).filter(Boolean);
+}
+
+function setLocationStatus(message) {
+  locationStatus.textContent = message || "";
+}
+
+function readSavedLocation() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(LOCATION_KEY) || "null");
+    if (!saved || typeof saved.lat !== "number" || typeof saved.lng !== "number") return null;
+    return saved;
+  } catch (err) {
+    return null;
+  }
+}
+
+function requestLocation() {
+  const saved = readSavedLocation();
+  if (saved) {
+    browserLat = saved.lat;
+    browserLng = saved.lng;
+    setLocationStatus("Using your location (" + saved.lat.toFixed(2) + ", " + saved.lng.toFixed(2) + ").");
+  }
+  if (!navigator.geolocation) {
+    setLocationStatus("Location isn't available in this browser. Photo GPS will be used if the picture has it.");
+    return;
+  }
+  if (browserLat == null) setLocationStatus("Finding your location…");
+  navigator.geolocation.getCurrentPosition(function (pos) {
+    browserLat = pos.coords.latitude;
+    browserLng = pos.coords.longitude;
+    try {
+      localStorage.setItem(LOCATION_KEY, JSON.stringify({ lat: browserLat, lng: browserLng, ts: Date.now() }));
+    } catch (err) {}
+    setLocationStatus("Using your location (" + browserLat.toFixed(2) + ", " + browserLng.toFixed(2) + ").");
+  }, function () {
+    if (browserLat == null) {
+      setLocationStatus("Couldn't read your location. You can still identify; photo GPS will be used if present.");
+    }
+  }, { enableHighAccuracy: false, timeout: 8000, maximumAge: 300000 });
+}
+
+function restoreRegionChoice() {
+  let stored = null;
+  try { stored = localStorage.getItem(REGION_KEY); } catch (err) { stored = null; }
+  if (stored && Array.prototype.some.call(regionSelect.options, function (option) { return option.value === stored; })) {
+    regionSelect.value = stored;
+  }
+  let listMode = null;
+  try { listMode = sessionStorage.getItem(LIST_KEY); } catch (err) { listMode = null; }
+  const params = new URLSearchParams(window.location.search);
+  const fromUrl = params.get("species_list");
+  if (fromUrl === "short" || fromUrl === "full") listMode = fromUrl;
+  if (listMode === "short" || listMode === "full") {
+    speciesListSelect.value = listMode;
+    const details = speciesListSelect.closest("details");
+    if (details) details.open = true;
+  }
+  if (regionSelect.value === "my-location") requestLocation();
+}
+
+regionSelect.addEventListener("change", function () {
+  try { localStorage.setItem(REGION_KEY, regionSelect.value); } catch (err) {}
+  if (regionSelect.value === "my-location") {
+    requestLocation();
+  } else {
+    setLocationStatus("");
+  }
+});
+
+speciesListSelect.addEventListener("change", function () {
+  try {
+    if (speciesListSelect.value === "short" || speciesListSelect.value === "full") {
+      sessionStorage.setItem(LIST_KEY, speciesListSelect.value);
+    } else {
+      sessionStorage.removeItem(LIST_KEY);
+    }
+  } catch (err) {}
+});
+
+restoreRegionChoice();
+
+function showRegion(card, label) {
+  if (!label) return;
+  let line = card.querySelector(".region-line");
+  if (!line) {
+    line = document.createElement("div");
+    line.className = "region-line";
+    const title = card.querySelector("h3");
+    if (title) title.insertAdjacentElement("afterend", line);
+    else card.querySelector(".result-body").prepend(line);
+  }
+  line.textContent = "Region: " + label;
+}
 
 function showClientError(message) {
   clientError.textContent = message;
@@ -227,9 +372,9 @@ async function readJsonResponse(resp) {
     return { ok: false, message: fallback };
   }
   if (!resp.ok || !data || data.error) {
-    return { ok: false, message: friendlyMessage(data && data.error) };
+    return { ok: false, message: friendlyMessage(data && data.error), region_label: data && data.region_label };
   }
-  return { ok: true, data: data };
+  return { ok: true, data: data, region_label: data.region_label };
 }
 
 fileInput.addEventListener("change", async function() {
@@ -331,9 +476,18 @@ async function handleFile(file) {
 
     const formData = new FormData();
     formData.append("image", file);
+    formData.append("region", regionSelect.value);
+    if (regionSelect.value === "my-location" && browserLat != null && browserLng != null) {
+      formData.append("lat", String(browserLat));
+      formData.append("lng", String(browserLng));
+    }
+    if (speciesListSelect.value === "short" || speciesListSelect.value === "full") {
+      formData.append("species_list", speciesListSelect.value);
+    }
 
     const resp = await fetch("/identify", { method: "POST", body: formData });
     const parsed = await readJsonResponse(resp);
+    if (parsed.region_label) showRegion(card, parsed.region_label);
     if (!parsed.ok) {
       showError(card, parsed.message);
       return;
@@ -345,7 +499,7 @@ async function handleFile(file) {
     if (spinner) spinner.remove();
 
     const text = data.result_text || "No response";
-    const lines = text.split("\\n").map(l => l.trim()).filter(Boolean);
+    const lines = resultLines(text);
     let common = "", scientific = "", group = "", altGroup = "", confidence = "", notes = "";
     lines.forEach(line => {
       const lower = line.toLowerCase();
@@ -782,46 +936,709 @@ def apply_standard_names(result_text):
     app.logger.info("Standard common name for %s: %s", canonical, common)
     return _set_field(text, "Common name", common)
 
-def _vision_payload(jpeg_bytes):
-    b64 = base64.b64encode(jpeg_bytes).decode("ascii")
-    data_url = f"data:image/jpeg;base64,{b64}"
-    prompt = (
-        "You are a marine biologist specializing in the Sea of Cortez. "
-        "This photo was taken near La Paz, Mexico.\\n\\n"
+# Regions are data. Adding a coast means adding a place id or a bounding box here,
+# not a new code path. place ids are iNaturalist polygons; boxes cover seas that
+# do not have a reliable water-body place.
+REGIONS = (
+    {
+        "id": "sea-of-cortez",
+        "label": "Sea of Cortez / La Paz",
+        "locality": "the Sea of Cortez (Gulf of California), near La Paz, Mexico",
+        "place_id": 122897,
+        "swlat": 22.5,
+        "swlng": -115.5,
+        "nelat": 32.2,
+        "nelng": -105.5,
+        "curated_fallback": True,
+        "lookalikes": True,
+    },
+    {
+        "id": "caribbean",
+        "label": "Caribbean",
+        "locality": "the Caribbean Sea",
+        "swlat": 9.0,
+        "swlng": -89.0,
+        "nelat": 27.5,
+        "nelng": -59.0,
+    },
+    {
+        "id": "hawaii",
+        "label": "Hawaii",
+        "locality": "Hawaii",
+        "place_id": 11,
+        "swlat": 18.8,
+        "swlng": -178.5,
+        "nelat": 28.6,
+        "nelng": -154.7,
+    },
+    {
+        "id": "red-sea",
+        "label": "Red Sea",
+        "locality": "the Red Sea",
+        "swlat": 12.0,
+        "swlng": 32.0,
+        "nelat": 30.0,
+        "nelng": 44.0,
+    },
+    {
+        "id": "great-barrier-reef",
+        "label": "Great Barrier Reef",
+        "locality": "the Great Barrier Reef, Australia",
+        "place_id": 50423,
+        "swlat": -24.5,
+        "swlng": 142.5,
+        "nelat": -10.0,
+        "nelng": 154.5,
+    },
+    {
+        "id": "mediterranean",
+        "label": "Mediterranean",
+        "locality": "the Mediterranean Sea",
+        "swlat": 30.0,
+        "swlng": -6.0,
+        "nelat": 46.0,
+        "nelng": 36.5,
+    },
+    {
+        "id": "other",
+        "label": "Other",
+        "locality": "an unspecified coast or ocean",
+    },
+    {
+        "id": "my-location",
+        "label": "Use my location",
+        "locality": "the photographer's location",
+    },
+)
+_REGIONS_BY_ID = {region["id"]: region for region in REGIONS}
+
+# Actinopterygii, Mollusca, and the catch-all Animalia iconic taxon (sharks,
+# rays, corals, echinoderms, crustaceans, and other invertebrates). Birds,
+# insects, reptiles, and mammals are separate iconic taxa, so terrestrial
+# groups in those classes stay out. The exclusions drop land snails, land
+# hermit crabs, land crabs, centipedes, and millipedes that still share an
+# included iconic taxon.
+MARINE_ICONIC = "Actinopterygii,Mollusca,Animalia"
+EXCLUDED_TAXA = "47485,54927,51731,51074,49556,47735"
+# Marine groups whose iconic taxon is Reptilia or Mammalia.
+SUPPLEMENT_TAXA = (
+    372234,  # sea turtles
+    152871,  # whales and dolphins
+    492346,  # sea snakes
+    41736,   # sea lions and fur seals
+    41687,   # true seals
+    46306,   # manatees and dugongs
+)
+SPECIES_COUNTS_URL = "https://api.inaturalist.org/v1/observations/species_counts"
+_SPECIES_HEADERS = {
+    "User-Agent": "FinFindr/1.0 (regional marine species list)",
+    "Accept": "application/json",
+}
+SHORT_LIMIT = 250
+SPECIES_PAGE_SIZE = 500
+LOCATION_RADIUS_KM = 100
+# Leave room for the image and a 256k context window, and stay under the
+# higher-priced band that starts at 128k tokens.
+MAX_PROMPT_TEXT_TOKENS = 100000
+XAI_TEMPERATURE = 0
+NL = chr(10)
+_SPECIES_LOCK = threading.Lock()
+_SPECIES_CACHE = {}
+_SPECIES_INFLIGHT = {}
+
+# Distinguishing features for pairs that were confused in Sea of Cortez tests.
+CORTEZ_LOOKALIKE_LINES = (
+    "Regional look-alikes in the eastern Pacific, including the Sea of Cortez:",
+    "- Giant hawkfish (Cirrhitus rivulatus) versus groupers: the hawkfish has a tuft of cirri on the tip of each dorsal spine, a wide pectoral fin whose lower rays are thick and unbranched, and olive-brown bars made of maze-like golden-brown marks edged in black and a thin blue line. It often sits propped on those pectoral fins. Groupers lack the dorsal-spine cirri, have a larger mouth, and have three spines on the gill cover rather than the hawkfish's two flat spines. A stout fish with those blue-edged bars is the giant hawkfish, not a grouper.",
+    "- Panamic cushion star (Pentaceraster cumingi) versus chocolate-chip star (Nidorellia armata): Nidorellia is the smaller one, to about 15 cm, with a thick inflated disc and very short arms that look almost webbed. Its cream, gray, green, or tan surface carries dark-brown conical spines of fairly even size, like chocolate chips, including a row down the middle of each arm. Pentaceraster is larger, often well past 15 cm and up to about 30 cm, with longer tapering arms. Its conical spines are usually red or orange on a beige, orange, green, or gray body and often trace a bright network, rather than sitting as scattered dark chips.",
+    "- Cortez rainbow wrasse (Thalassoma lucasanum) versus Mexican hogfish (Bodianus diplotaenia): the rainbow wrasse stays small, to about 15 cm, and is cigar-shaped. Initial-phase fish have horizontal yellow and red stripes and often school over the reef; terminal males have a blue head and a broad yellow saddle just behind it. The Mexican hogfish gets much larger, to about 76 cm, and has a pointed hog-like snout. Juveniles are bright yellow with two dark stripes along the side (the smallest may lack the stripes); females are reddish with two dark stripes and a yellow tail; large males grow a fleshy forehead hump, long filamentous fin tips, and a yellow bar near mid-body.",
+    "- Bullseye puffer (Sphoeroides annulatus) versus porcupinefish (Diodon): porcupinefish are covered in long spines that can stand erect. The bullseye puffer has only short prickles, a more elongated body, and a double concentric oval, the bullseye, on the back, plus narrow yellowish lines and small dark spots. Long spines mean a porcupinefish. If the mouth is clear, the puffer's beak has a central suture in each jaw and the porcupinefish beak does not.",
+)
+EASTERN_PACIFIC_BBOX = (-6.0, -118.0, 33.0, -77.0)
+
+
+def resolve_region(raw):
+    key = (raw or "").strip().lower()
+    return _REGIONS_BY_ID.get(key) or _REGIONS_BY_ID["sea-of-cortez"]
+
+
+def resolve_species_mode(raw=None):
+    """short is the default. An explicit short|full value wins over the env var."""
+    text = (raw or "").strip().lower()
+    if text in ("short", "full"):
+        return text
+    env = (os.environ.get("SPECIES_LIST_MODE") or "short").strip().lower()
+    if env in ("short", "full"):
+        return env
+    return "short"
+
+
+def _point_in_bbox(lat, lng, swlat, swlng, nelat, nelng):
+    if lat is None or lng is None:
+        return False
+    return swlat <= lat <= nelat and swlng <= lng <= nelng
+
+
+def region_matching_point(lat, lng):
+    matches = []
+    for region in REGIONS:
+        if "swlat" not in region:
+            continue
+        if _point_in_bbox(lat, lng, region["swlat"], region["swlng"], region["nelat"], region["nelng"]):
+            area = (region["nelat"] - region["swlat"]) * (region["nelng"] - region["swlng"])
+            matches.append((abs(area), region))
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item[0])
+    return matches[0][1]
+
+
+def cortez_lookalikes_apply(region, lat, lng):
+    if region.get("lookalikes"):
+        return True
+    if region["id"] not in ("other", "my-location") or lat is None:
+        return False
+    swlat, swlng, nelat, nelng = EASTERN_PACIFIC_BBOX
+    return _point_in_bbox(lat, lng, swlat, swlng, nelat, nelng)
+
+
+def species_query_for(region, lat, lng):
+    if region["id"] in ("other", "my-location"):
+        if lat is None or lng is None:
+            return None
+        lat_r = round(float(lat), 1)
+        lng_r = round(float(lng), 1)
+        match = region_matching_point(lat, lng)
+        return {
+            "key": f"pt:{lat_r:.1f}:{lng_r:.1f}:{LOCATION_RADIUS_KM}",
+            "lat": lat_r,
+            "lng": lng_r,
+            "radius": LOCATION_RADIUS_KM,
+            "curated_fallback": bool(match and match.get("curated_fallback")),
+        }
+    if region.get("place_id"):
+        return {
+            "key": f"place:{region['place_id']}",
+            "place_id": region["place_id"],
+            "curated_fallback": bool(region.get("curated_fallback")),
+        }
+    if "swlat" in region:
+        return {
+            "key": "bbox:{swlat:.3f}:{swlng:.3f}:{nelat:.3f}:{nelng:.3f}".format(**region),
+            "swlat": region["swlat"],
+            "swlng": region["swlng"],
+            "nelat": region["nelat"],
+            "nelng": region["nelng"],
+            "curated_fallback": False,
+        }
+    return None
+
+
+def display_region_label(region, lat, lng):
+    if region["id"] == "my-location":
+        if lat is None:
+            return "Use my location"
+        match = region_matching_point(lat, lng)
+        if match:
+            return f"Near you · {match['label']}"
+        return f"Near {lat:.2f}, {lng:.2f}"
+    if region["id"] == "other":
+        if lat is None:
+            return "Other"
+        match = region_matching_point(lat, lng)
+        if match:
+            return f"Other · near {match['label']}"
+        return f"Other · {lat:.2f}, {lng:.2f}"
+    return region["label"]
+
+
+def locality_text(region, lat, lng, coord_source):
+    if region["id"] in ("my-location", "other"):
+        if lat is None:
+            if region["id"] == "my-location":
+                return "an unknown spot (location was requested, but no coordinates were available)"
+            return "an unspecified coast or ocean"
+        match = region_matching_point(lat, lng)
+        where = f"{lat:.4f}, {lng:.4f}"
+        if coord_source == "exif":
+            prefix = f"the photo's GPS position ({where})"
+        elif coord_source == "browser":
+            prefix = f"the photographer's current location ({where})"
+        else:
+            prefix = f"coordinates {where}"
+        if match:
+            return f"{match['locality']}, based on {prefix}"
+        return prefix
+    text = region["locality"]
+    if lat is not None and "swlat" in region:
+        inside = _point_in_bbox(lat, lng, region["swlat"], region["swlng"], region["nelat"], region["nelng"])
+        source = "The photo's GPS" if coord_source == "exif" else "A reported position"
+        if inside:
+            text += f". {source} is {lat:.4f}, {lng:.4f}, inside this region"
+        else:
+            text += (
+                f". {source} is {lat:.4f}, {lng:.4f}, which is outside this region. "
+                "Treat the selected region as the locality"
+            )
+    return text
+
+
+def _exif_text(value):
+    if isinstance(value, bytes):
+        value = value.decode("ascii", "ignore")
+    return str(value or "").strip().upper()
+
+
+def _rational_to_float(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    numerator = getattr(value, "numerator", None)
+    denominator = getattr(value, "denominator", None)
+    if numerator is not None and denominator:
+        return float(numerator) / float(denominator)
+    if isinstance(value, tuple) and len(value) == 2 and not isinstance(value[0], (tuple, list)):
+        try:
+            return float(value[0]) / float(value[1] or 1)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+    return None
+
+
+def _dms_to_degrees(values):
+    if not values or not isinstance(values, (tuple, list)):
+        return None
+    parts = []
+    for value in list(values)[:3]:
+        number = _rational_to_float(value)
+        if number is None:
+            return None
+        parts.append(number)
+    while len(parts) < 3:
+        parts.append(0.0)
+    return parts[0] + parts[1] / 60.0 + parts[2] / 3600.0
+
+
+def extract_gps(image_bytes):
+    """Return (lat, lng) from photo EXIF, or (None, None)."""
+    if not image_bytes:
+        return None, None
+    img = None
+    try:
+        img = Image.open(BytesIO(image_bytes))
+        gps = img.getexif().get_ifd(0x8825)
+        if not gps:
+            return None, None
+        lat = _dms_to_degrees(gps.get(2))
+        lng = _dms_to_degrees(gps.get(4))
+        if lat is None or lng is None:
+            return None, None
+        if _exif_text(gps.get(1)).startswith("S"):
+            lat = -abs(lat)
+        if _exif_text(gps.get(3)).startswith("W"):
+            lng = -abs(lng)
+        if abs(lat) > 90 or abs(lng) > 180:
+            return None, None
+        return lat, lng
+    except Exception as exc:
+        app.logger.info("No usable GPS in photo: %s", exc)
+        return None, None
+    finally:
+        if img is not None:
+            try:
+                img.close()
+            except Exception:
+                pass
+
+
+def _parse_coord(value, limit):
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or abs(number) > limit:
+        return None
+    return number
+
+
+def _form_coordinates():
+    lat = _parse_coord(request.form.get("lat"), 90)
+    lng = _parse_coord(request.form.get("lng"), 180)
+    if lat is None or lng is None:
+        return None, None
+    return lat, lng
+
+
+def _choose_coordinates(image_bytes):
+    exif_lat, exif_lng = extract_gps(image_bytes)
+    if exif_lat is not None and exif_lng is not None:
+        return exif_lat, exif_lng, "exif"
+    form_lat, form_lng = _form_coordinates()
+    if form_lat is not None and form_lng is not None:
+        return form_lat, form_lng, "browser"
+    return None, None, None
+
+
+def estimate_text_tokens(text):
+    return max(1, (len(text) + 3) // 4)
+
+
+def assemble_prompt(locality, species, lookalikes, lat, lng):
+    lines = [f"You are a marine biologist identifying a marine animal in a photo taken in {locality}."]
+    if lat is not None and lng is not None:
+        lines.append(f"Approximate coordinates: {lat:.4f}, {lng:.4f}.")
+    lines.extend([
+        "",
         "Examine the animal carefully. First note the overall body plan "
-        "(arms/rays, fins, rounded spiny body, elongated form, hard shell, soft body, etc.).\\n\\n"
+        "(arms/rays, fins, rounded spiny body, elongated form, hard shell, soft body, etc.).",
+        "",
         "Then consider the two most likely groups this could belong to. "
-        "Do not lock in the first group — if features could fit either, weigh both.\\n"
+        "Do not lock in the first group — if features could fit either, weigh both.",
         "Example: an elongated animal could be an eel or a sea snake; "
         "a spiny animal could be a starfish or a sea urchin. "
-        "Choose the species that best matches the visible features, even if it is not in the first group you thought of.\\n\\n"
-        "Key rules:\\n"
-        "- Arms or rays from a central disc → starfish (not sea urchin).\\n"
-        "- Clearly rounded/globular body with long spines and no arms → sea urchin.\\n"
-        "- Prefer Sea of Cortez species when ambiguous.\\n\\n"
-        "Reply in this exact format:\\n"
-        "Common name: <name>\\n"
-        "Scientific name: <name>\\n"
-        "Group: <group>\\n"
-        "Alternative group considered: <other possible group or none>\\n"
-        "Confidence: <high / medium / low>\\n"
-        "Notes: <one cool fact about the species>\\n"
-        "If still unsure, list the closest alternatives."
-    )
+        "Choose the species that best matches the visible features, even if it is not in the first group you thought of.",
+        "",
+        "Key rules:",
+        "- Arms or rays from a central disc means a starfish, not a sea urchin.",
+        "- A clearly rounded or globular body with long spines and no arms means a sea urchin.",
+        "- Prefer a species known from this region when the visible features fit one.",
+    ])
+    if lookalikes:
+        lines.append("")
+        lines.extend(CORTEZ_LOOKALIKE_LINES)
+    if species:
+        lines.append("")
+        lines.append(
+            "Species recorded in this area, most frequently observed first. "
+            "Treat the list as a prior, not a limit: choose a listed species when it fits "
+            "the visible features, and name a different species when they do not."
+        )
+        for item in species:
+            common = item.get("common")
+            if common:
+                lines.append(f"- {item['scientific']} ({common})")
+            else:
+                lines.append(f"- {item['scientific']}")
+    else:
+        lines.append("")
+        lines.append("No regional species list was available. Identify the animal from the visible features.")
+    lines.extend([
+        "",
+        "Reply in this exact format, with each field on its own line:",
+        "Common name: <name>",
+        "Scientific name: <name>",
+        "Group: <group>",
+        "Alternative group considered: <other possible group or none>",
+        "Confidence: <high / medium / low>",
+        "Notes: <one cool fact about the species>",
+        "If still unsure, list the closest alternatives.",
+    ])
+    return NL.join(lines)
 
+
+def prompt_for_species(locality, species, lookalikes, lat, lng):
+    prompt = assemble_prompt(locality, species, lookalikes, lat, lng)
+    if estimate_text_tokens(prompt) <= MAX_PROMPT_TEXT_TOKENS:
+        return prompt, len(species), False
+    lo, hi = 0, len(species)
+    best = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = assemble_prompt(locality, species[:mid], lookalikes, lat, lng)
+        if estimate_text_tokens(candidate) <= MAX_PROMPT_TEXT_TOKENS:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    trimmed = species[:best]
+    return assemble_prompt(locality, trimmed, lookalikes, lat, lng), len(trimmed), True
+
+
+def _species_cache_get(key):
+    now = time.monotonic()
+    with _SPECIES_LOCK:
+        hit = _SPECIES_CACHE.get(key)
+        if not hit or hit[0] <= now:
+            _SPECIES_CACHE.pop(key, None)
+            return None
+        return hit[1]
+
+
+def _species_cache_put(key, payload, ttl):
+    with _SPECIES_LOCK:
+        if len(_SPECIES_CACHE) >= 64 and key not in _SPECIES_CACHE:
+            oldest = min(_SPECIES_CACHE, key=lambda item: _SPECIES_CACHE[item][0])
+            _SPECIES_CACHE.pop(oldest, None)
+        _SPECIES_CACHE[key] = (time.monotonic() + ttl, payload)
+
+
+def _empty_species():
+    return {"species": [], "available": 0, "complete": False, "source": "none"}
+
+
+def _curated_species_payload():
+    rows = []
+    seen = set()
+    for raw, common in CURATED_COMMON_NAMES.items():
+        scientific = exact_scientific_name(raw)
+        if not scientific:
+            continue
+        key = scientific.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({"scientific": scientific, "common": common, "count": 0})
+    rows.sort(key=lambda item: item["scientific"])
+    return {"species": rows, "available": len(rows), "complete": False, "source": "curated"}
+
+
+def _merge_species_rows(rows):
+    best = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        taxon = row.get("taxon") if isinstance(row.get("taxon"), dict) else {}
+        if taxon.get("rank") not in _SPECIES_RANKS:
+            continue
+        scientific = exact_scientific_name(taxon.get("name") or "")
+        if not scientific:
+            continue
+        try:
+            count = int(row.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        common = CURATED_COMMON_NAMES.get(scientific.lower()) or (taxon.get("preferred_common_name") or "").strip() or None
+        current = best.get(scientific.lower())
+        if current is None or count > current["count"]:
+            best[scientific.lower()] = {"scientific": scientific, "common": common, "count": count}
+    return sorted(best.values(), key=lambda item: (-item["count"], item["scientific"]))
+
+
+def _inat_species_page(query, page, per_page, taxon_id, timeout):
+    params = {
+        "locale": "en",
+        "rank": "species",
+        "verifiable": "true",
+        "quality_grade": "research",
+        "page": page,
+        "per_page": per_page,
+    }
+    if taxon_id:
+        params["taxon_id"] = taxon_id
+    else:
+        params["iconic_taxa"] = MARINE_ICONIC
+        params["without_taxon_id"] = EXCLUDED_TAXA
+    if query.get("place_id"):
+        params["place_id"] = query["place_id"]
+    elif query.get("radius"):
+        params["lat"] = query["lat"]
+        params["lng"] = query["lng"]
+        params["radius"] = query["radius"]
+    else:
+        params["swlat"] = query["swlat"]
+        params["swlng"] = query["swlng"]
+        params["nelat"] = query["nelat"]
+        params["nelng"] = query["nelng"]
+    try:
+        resp = requests.get(
+            SPECIES_COUNTS_URL,
+            params=params,
+            headers=_SPECIES_HEADERS,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        app.logger.warning("iNaturalist species_counts failed: %s", exc)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _collect_species_rows(query, taxon_id, per_page, max_pages, deadline):
+    rows = []
+    total = 0
+    got_page = False
+    exhausted = False
+    for page in range(1, max_pages + 1):
+        if page > 1:
+            # Full lists are many pages. Pause so a crawl does not burst the API.
+            time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+        if time.monotonic() >= deadline:
+            break
+        remaining = max(0.4, deadline - time.monotonic())
+        data = _inat_species_page(query, page, per_page, taxon_id, (1.0, min(2.5, remaining)))
+        if data is None:
+            break
+        got_page = True
+        try:
+            total = int(data.get("total_results") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        batch = data.get("results") if isinstance(data.get("results"), list) else []
+        rows.extend(batch)
+        if not batch:
+            exhausted = total == 0
+            break
+        if page * per_page >= total or page * per_page >= 10000:
+            exhausted = True
+            break
+    return rows, total, exhausted and got_page
+
+
+def _fetch_species_list(query, mode, deadline, on_progress):
+    short = mode == "short"
+    main_rows, main_total, main_done = _collect_species_rows(
+        query,
+        None,
+        300 if short else SPECIES_PAGE_SIZE,
+        1 if short else 20,
+        deadline,
+    )
+    if not main_rows and not main_done:
+        payload = _curated_species_payload() if query.get("curated_fallback") else _empty_species()
+        on_progress(payload)
+        return payload
+    # Short mode only asks for the first page. That page is the whole short list.
+    if short and main_rows:
+        main_done = True
+    early = _merge_species_rows(main_rows)
+    if short:
+        early = early[:SHORT_LIMIT]
+    on_progress({
+        "species": early,
+        "available": main_total,
+        "complete": False,
+        "source": "inaturalist",
+    })
+    extra_rows = []
+    extra_total = 0
+    supplements_done = True
+    for taxon_id in SUPPLEMENT_TAXA:
+        if time.monotonic() >= deadline:
+            supplements_done = False
+            break
+        supplement_rows, supplement_total, supplement_done = _collect_species_rows(
+            query,
+            taxon_id,
+            200,
+            1 if short else 5,
+            deadline,
+        )
+        if not supplement_done:
+            supplements_done = False
+        extra_rows.extend(supplement_rows)
+        extra_total += supplement_total
+    species = _merge_species_rows(main_rows + extra_rows)
+    if short:
+        species = species[:SHORT_LIMIT]
     payload = {
+        "species": species,
+        "available": main_total + extra_total,
+        "complete": bool(main_done and supplements_done),
+        "source": "inaturalist",
+    }
+    on_progress(payload)
+    return payload
+
+
+def load_species_list(query, mode, budget, refresh_incomplete=False, _retry=True):
+    if not query:
+        return _empty_species()
+    key = (mode, query["key"])
+    cached = _species_cache_get(key)
+    if cached and cached.get("complete"):
+        return cached
+    if cached and cached.get("species") and not refresh_incomplete:
+        return cached
+
+    with _SPECIES_LOCK:
+        event = _SPECIES_INFLIGHT.get(key)
+        if event is None:
+            event = threading.Event()
+            _SPECIES_INFLIGHT[key] = event
+            owner = True
+        else:
+            owner = False
+    if not owner:
+        end = time.monotonic() + budget
+        while time.monotonic() < end:
+            cached = _species_cache_get(key)
+            if cached and cached.get("species") and not refresh_incomplete:
+                return cached
+            if event.wait(0.25):
+                break
+        cached = _species_cache_get(key) or _empty_species()
+        if refresh_incomplete and _retry and not cached.get("complete"):
+            return load_species_list(query, mode, budget, refresh_incomplete=True, _retry=False)
+        return cached
+
+    def on_progress(payload):
+        if payload.get("complete") and payload.get("source") == "inaturalist":
+            ttl = INAT_CACHE_TTL
+        elif payload.get("source") == "none":
+            ttl = INAT_ERROR_TTL
+        else:
+            ttl = 120
+        _species_cache_put(key, payload, ttl)
+
+    try:
+        return _fetch_species_list(query, mode, time.monotonic() + budget, on_progress)
+    except Exception:
+        app.logger.warning("species list failed for %s", key, exc_info=True)
+        payload = _curated_species_payload() if query.get("curated_fallback") else _empty_species()
+        on_progress(payload)
+        return payload
+    finally:
+        with _SPECIES_LOCK:
+            _SPECIES_INFLIGHT.pop(key, None)
+        event.set()
+
+
+def _prefetch_species_lists():
+    named = [region for region in REGIONS if region["id"] not in ("other", "my-location")]
+    for mode, budget in (("short", 40), ("full", 150)):
+        for region in named:
+            query = species_query_for(region, None, None)
+            try:
+                load_species_list(query, mode, budget, refresh_incomplete=True)
+            except Exception:
+                app.logger.warning("species prefetch failed for %s %s", region["id"], mode, exc_info=True)
+            time.sleep(0.25)
+
+
+def _start_species_prefetch():
+    if os.environ.get("FINFINDR_PREFETCH", "1") != "1":
+        return
+    threading.Thread(
+        target=_prefetch_species_lists,
+        name="finfindr-species-prefetch",
+        daemon=True,
+    ).start()
+
+
+def _vision_payload(jpeg_bytes, prompt):
+    b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+    data_url = f"data:image/jpeg;base64,{b64}"
+    return {
         "model": "grok-4",
+        "temperature": XAI_TEMPERATURE,
         "input": [
             {
                 "role": "user",
                 "content": [
                     {"type": "input_image", "image_url": data_url, "detail": "high"},
-                    {"type": "input_text", "text": prompt}
-                ]
+                    {"type": "input_text", "text": prompt},
+                ],
             }
-        ]
+        ],
     }
-    return payload
 
 
 def _extract_text(data):
@@ -835,6 +1652,52 @@ def _extract_text(data):
     if not text and isinstance(data, dict) and "choices" in data:
         text = data["choices"][0].get("message", {}).get("content", "")
     return text
+
+
+def _prompt_tokens(data, prompt):
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if isinstance(usage, dict):
+        for key in ("input_tokens", "prompt_tokens"):
+            value = usage.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int) and value >= 0:
+                return value, "usage"
+            if isinstance(value, float) and value >= 0:
+                return int(value), "usage"
+    return estimate_text_tokens(prompt), "estimate"
+
+
+def _identification_meta(mode, sent, available, truncated, source, list_ms, model_ms, tokens, token_source):
+    return {
+        "species_list_mode": mode,
+        "species_sent": sent,
+        "species_available": available,
+        "species_truncated": bool(truncated),
+        "list_source": source,
+        "prompt_tokens": tokens,
+        "prompt_tokens_source": token_source,
+        "list_fetch_ms": int(list_ms),
+        "model_call_ms": int(model_ms),
+    }
+
+
+def _log_identification(region_id, meta):
+    app.logger.info(
+        "identify region=%s list_mode=%s species_sent=%s species_available=%s "
+        "prompt_tokens=%s prompt_tokens_source=%s list_fetch_ms=%s model_call_ms=%s "
+        "list_source=%s truncated=%s",
+        region_id,
+        meta["species_list_mode"],
+        meta["species_sent"],
+        meta["species_available"],
+        meta["prompt_tokens"],
+        meta["prompt_tokens_source"],
+        meta["list_fetch_ms"],
+        meta["model_call_ms"],
+        meta["list_source"],
+        meta["species_truncated"],
+    )
 
 
 @app.route("/")
@@ -858,38 +1721,100 @@ def identify():
     if not jpeg_bytes:
         return jsonify({"error": "Please upload a valid photo"}), 400
 
+    region = resolve_region(request.form.get("region"))
+    lat, lng, coord_source = _choose_coordinates(image_bytes)
+    region_label = display_region_label(region, lat, lng)
+    mode = resolve_species_mode(request.form.get("species_list"))
+
     xai_key = os.environ.get("XAI_API_KEY")
     if not xai_key:
         app.logger.error("XAI_API_KEY is not set")
-        return jsonify({"error": "Identification is temporarily unavailable. Please try again later."}), 500
+        return jsonify({
+            "error": "Identification is temporarily unavailable. Please try again later.",
+            "region_label": region_label,
+        }), 500
 
-    payload = _vision_payload(jpeg_bytes)
+    started = time.perf_counter()
+    species_payload = load_species_list(
+        species_query_for(region, lat, lng),
+        mode,
+        2.5 if mode == "short" else 12.0,
+    )
+    list_fetch_ms = int(round((time.perf_counter() - started) * 1000))
+    species = species_payload.get("species") or []
+    prompt, sent, prompt_trimmed = prompt_for_species(
+        locality_text(region, lat, lng, coord_source),
+        species,
+        cortez_lookalikes_apply(region, lat, lng),
+        lat,
+        lng,
+    )
+    available = int(species_payload.get("available") or 0)
+    truncated = prompt_trimmed or (mode == "full" and not species_payload.get("complete"))
+    source = species_payload.get("source") or "none"
+
+    payload = _vision_payload(jpeg_bytes, prompt)
+    model_started = time.perf_counter()
     try:
         resp = requests.post(
             "https://api.x.ai/v1/responses",
             headers={"Authorization": f"Bearer {xai_key}", "Content-Type": "application/json"},
             json=payload,
-            timeout=60
+            timeout=60,
         )
     except requests.Timeout:
         app.logger.exception("xAI request timed out")
-        return jsonify({"error": "Identification is taking too long. Please try again."}), 504
+        model_ms = int(round((time.perf_counter() - model_started) * 1000))
+        meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, None, "unavailable")
+        _log_identification(region["id"], meta)
+        return jsonify({
+            "error": "Identification is taking too long. Please try again.",
+            "region_label": region_label,
+            "meta": meta,
+        }), 504
     except requests.RequestException:
         app.logger.exception("xAI request failed")
-        return jsonify({"error": "Could not identify this photo. Please try again."}), 502
+        model_ms = int(round((time.perf_counter() - model_started) * 1000))
+        meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, None, "unavailable")
+        _log_identification(region["id"], meta)
+        return jsonify({
+            "error": "Could not identify this photo. Please try again.",
+            "region_label": region_label,
+            "meta": meta,
+        }), 502
 
+    model_ms = int(round((time.perf_counter() - model_started) * 1000))
     if not resp.ok:
         app.logger.error("xAI HTTP %s: %s", resp.status_code, resp.text[:500])
-        return jsonify({"error": "Could not identify this photo. Please try another one."}), 502
+        meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, None, "unavailable")
+        _log_identification(region["id"], meta)
+        return jsonify({
+            "error": "Could not identify this photo. Please try another one.",
+            "region_label": region_label,
+            "meta": meta,
+        }), 502
 
     try:
         data = resp.json()
     except ValueError:
         app.logger.exception("xAI returned invalid JSON")
-        return jsonify({"error": "Could not identify this photo. Please try again."}), 502
+        meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, None, "unavailable")
+        _log_identification(region["id"], meta)
+        return jsonify({
+            "error": "Could not identify this photo. Please try again.",
+            "region_label": region_label,
+            "meta": meta,
+        }), 502
 
+    tokens, token_source = _prompt_tokens(data, prompt)
+    meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, tokens, token_source)
+    _log_identification(region["id"], meta)
     text = apply_standard_names(_extract_text(data))
-    return jsonify({"result_text": text or "No response"})
+    return jsonify({
+        "result_text": text or "No response",
+        "region_label": region_label,
+        "meta": meta,
+    })
 
 
 @app.errorhandler(RequestEntityTooLarge)
@@ -905,6 +1830,9 @@ def unhandled(exc):
     if request.path == "/identify":
         return jsonify({"error": "Something went wrong. Please try again."}), 500
     return "Internal Server Error", 500
+
+
+_start_species_prefetch()
 
 
 if __name__ == "__main__":
