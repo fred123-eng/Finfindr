@@ -4,8 +4,10 @@ FinFindr – Marine species identification
 """
 
 import base64
+import fcntl
 import logging
 import os
+import random
 import re
 import threading
 import time
@@ -14,6 +16,7 @@ from io import BytesIO
 
 import requests
 from flask import Flask, jsonify, render_template_string, request
+from requests.adapters import HTTPAdapter
 from PIL import Image, ImageOps
 from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 
@@ -26,8 +29,17 @@ app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
 Image.MAX_IMAGE_PIXELS = 50_000_000
 
 MIN_DIMENSION = 32
-MAX_DIMENSION = 2048
+DEFAULT_MAX_IMAGE_PX = 1536
 JPEG_QUALITY = 85
+# grok-4.7 is the current flagship and accepts image input (text + image → text).
+# https://docs.x.ai/docs/models
+DEFAULT_XAI_MODEL = "grok-4.7"
+
+# One connection pool for xAI and iNaturalist so repeat calls reuse TLS.
+http = requests.Session()
+_http_adapter = HTTPAdapter(pool_connections=8, pool_maxsize=16)
+http.mount("https://", _http_adapter)
+http.mount("http://", _http_adapter)
 
 HTML = """
 <!DOCTYPE html>
@@ -49,7 +61,7 @@ HTML = """
   .upload-zone.dragover .hint { color: var(--aqua); font-weight: 600; }
   .region-panel { width: 100%; max-width: 560px; margin: 0 auto 1rem; text-align: left; }
   .region-panel label { display: block; font-weight: 700; margin: 0.55rem 0 0.35rem; }
-  #regionSelect, #speciesListSelect { width: 100%; max-width: 100%; font-size: 16px; line-height: 1.3; min-height: 44px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.35); background: rgba(0,0,0,0.28); color: var(--white); padding: 0.45rem 0.7rem; color-scheme: dark; }
+  #regionSelect, #speciesListSelect, #modelInput { width: 100%; max-width: 100%; font-size: 16px; line-height: 1.3; min-height: 44px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.35); background: rgba(0,0,0,0.28); color: var(--white); padding: 0.45rem 0.7rem; color-scheme: dark; }
   .location-status { min-height: 1.25rem; margin-top: 0.45rem; font-size: 0.92rem; opacity: 0.9; overflow-wrap: anywhere; }
   .location-status:empty { display: none; }
   .test-options { margin-top: 0.75rem; font-size: 0.85rem; opacity: 0.8; }
@@ -121,6 +133,8 @@ HTML = """
       <option value="short">Short — top 250</option>
       <option value="full">Full — all recorded</option>
     </select>
+    <label for="modelInput">Model</label>
+    <input id="modelInput" type="text" placeholder="Server default" autocomplete="off" spellcheck="false">
   </details>
 </div>
 
@@ -145,6 +159,7 @@ const clientError = document.getElementById("clientError");
 const dropHint = document.getElementById("dropHint");
 const regionSelect = document.getElementById("regionSelect");
 const speciesListSelect = document.getElementById("speciesListSelect");
+const modelInput = document.getElementById("modelInput");
 const locationStatus = document.getElementById("locationStatus");
 const MIN_DIMENSION = 32;
 const MAX_BYTES = 20 * 1024 * 1024;
@@ -156,6 +171,7 @@ let validateToken = 0;
 let dragDepth = 0;
 let browserLat = null;
 let browserLng = null;
+let debugMode = false;
 
 function resultLines(text) {
   const newline = String.fromCharCode(10);
@@ -215,7 +231,7 @@ function restoreRegionChoice() {
     regionSelect.value = stored;
   }
   const params = new URLSearchParams(window.location.search);
-  const debugMode = params.get("debug") === "1";
+  debugMode = params.get("debug") === "1";
   const speciesListOptions = document.getElementById("speciesListOptions");
   if (debugMode && speciesListOptions) speciesListOptions.hidden = false;
   let listMode = null;
@@ -490,6 +506,11 @@ async function handleFile(file) {
     if (speciesListSelect.value === "short" || speciesListSelect.value === "full") {
       formData.append("species_list", speciesListSelect.value);
     }
+    if (debugMode) {
+      formData.append("debug", "1");
+      const modelName = modelInput.value.trim();
+      if (modelName) formData.append("model", modelName);
+    }
 
     const resp = await fetch("/identify", { method: "POST", body: formData });
     const parsed = await readJsonResponse(resp);
@@ -580,8 +601,22 @@ def _to_rgb(img):
     return img.convert("RGB")
 
 
+def max_image_px():
+    """Longest edge sent to the model. MAX_IMAGE_PX overrides the 1536 default."""
+    raw = (os.environ.get("MAX_IMAGE_PX") or "").strip()
+    if not raw:
+        return DEFAULT_MAX_IMAGE_PX
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_IMAGE_PX
+    if value < 64 or value > 4096:
+        return DEFAULT_MAX_IMAGE_PX
+    return value
+
+
 def prepare_image(image_bytes):
-    """Return JPEG bytes for a usable photo, or None when the upload is not one."""
+    """Return (JPEG bytes, width, height), or None when the upload is not a photo."""
     if not image_bytes:
         app.logger.warning("Rejected empty upload")
         return None
@@ -605,12 +640,13 @@ def prepare_image(image_bytes):
             img.close()
             img = rgb
 
+        limit = max_image_px()
         longest = max(img.size)
-        if longest > MAX_DIMENSION:
-            scale = MAX_DIMENSION / float(longest)
+        if longest > limit:
+            scale = limit / float(longest)
             new_size = (
-                max(1, min(MAX_DIMENSION, int(round(img.size[0] * scale)))),
-                max(1, min(MAX_DIMENSION, int(round(img.size[1] * scale)))),
+                max(1, min(limit, int(round(img.size[0] * scale)))),
+                max(1, min(limit, int(round(img.size[1] * scale)))),
             )
             resized = img.resize(new_size, Image.Resampling.LANCZOS)
             img.close()
@@ -618,7 +654,8 @@ def prepare_image(image_bytes):
 
         out = BytesIO()
         img.save(out, format="JPEG", quality=JPEG_QUALITY, optimize=True)
-        return out.getvalue()
+        width, height = img.size
+        return out.getvalue(), width, height
     except Exception as exc:
         app.logger.warning("Rejected unreadable image: %s", exc)
         return None
@@ -851,13 +888,11 @@ def _cache_put(key, value, ttl):
         _inat_cache[key] = (time.monotonic() + ttl, value)
 
 
-def _fetch_inat_common_name(scientific):
+def _fetch_inat_common_name_uncached(scientific):
+    """Network lookup. Caller already missed the cache. Failures are cached briefly."""
     key = scientific.lower()
-    cached = _cache_get(key)
-    if cached is not None:
-        return cached[1]
     try:
-        resp = requests.get(
+        resp = http.get(
             _INAT_URL,
             params={"q": scientific, "locale": "en", "per_page": 10},
             headers={
@@ -884,14 +919,59 @@ def _fetch_inat_common_name(scientific):
     return common
 
 
-def standard_common_name(scientific):
+def _listed_common_name(scientific, species):
+    target = scientific.lower()
+    for item in species or []:
+        if not isinstance(item, dict):
+            continue
+        if (item.get("scientific") or "").lower() == target and (item.get("common") or "").strip():
+            return item["common"].strip()
+    return None
+
+
+def resolve_common_names(scientific_names, species=None):
+    """Curated, then the regional list, then cached iNaturalist, then parallel lookups."""
+    found = {}
+    pending = []
+    seen_pending = set()
+    for scientific in scientific_names:
+        if not scientific or scientific in found:
+            continue
+        curated = CURATED_COMMON_NAMES.get(scientific.lower())
+        if curated:
+            found[scientific] = curated
+            continue
+        listed = _listed_common_name(scientific, species)
+        if listed:
+            _cache_put(scientific.lower(), listed, INAT_CACHE_TTL)
+            found[scientific] = listed
+            continue
+        cached = _cache_get(scientific.lower())
+        if cached is not None:
+            found[scientific] = cached[1]
+            continue
+        if scientific.lower() not in seen_pending:
+            seen_pending.add(scientific.lower())
+            pending.append(scientific)
+    if not pending:
+        return found
+    workers = min(8, len(pending))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_fetch_inat_common_name_uncached, name) for name in pending]
+        for name, future in zip(pending, futures):
+            try:
+                found[name] = future.result()
+            except Exception:
+                app.logger.warning("common-name lookup failed for %s", name, exc_info=True)
+                found[name] = None
+    return found
+
+
+def standard_common_name(scientific, species=None):
     """Authoritative common name for an exact scientific name, or None."""
     if not scientific:
         return None
-    curated = CURATED_COMMON_NAMES.get(scientific.lower())
-    if curated:
-        return curated
-    return _fetch_inat_common_name(scientific)
+    return resolve_common_names([scientific], species).get(scientific)
 
 
 def _result_lines(text):
@@ -926,7 +1006,7 @@ def _set_field(text, label, value):
     return "\n".join(out)
 
 
-def apply_standard_names(result_text):
+def apply_standard_names(result_text, species=None):
     """Replace the model's common name when the scientific name resolves."""
     if not result_text:
         return result_text
@@ -936,7 +1016,7 @@ def apply_standard_names(result_text):
     if not canonical:
         return text
     text = _set_field(text, "Scientific name", canonical)
-    common = standard_common_name(canonical)
+    common = standard_common_name(canonical, species)
     if not common:
         return text
     app.logger.info("Standard common name for %s: %s", canonical, common)
@@ -1509,7 +1589,7 @@ def _inat_species_page(query, page, per_page, taxon_id, timeout, exclude=None):
         params["nelat"] = query["nelat"]
         params["nelng"] = query["nelng"]
     try:
-        resp = requests.get(
+        resp = http.get(
             SPECIES_COUNTS_URL,
             params=params,
             headers=_SPECIES_HEADERS,
@@ -1708,32 +1788,80 @@ def load_species_list(query, mode, budget, refresh_incomplete=False, _retry=True
 
 
 def _prefetch_species_lists():
-    named = [region for region in REGIONS if region["id"] not in ("other", "my-location")]
-    for mode, budget in (("short", 40), ("full", 150)):
+    """Warm short lists only. Full mode stays on demand. Failures never propagate."""
+    try:
+        # Spread gunicorn workers so they do not stampede iNaturalist together.
+        time.sleep(random.uniform(0.0, 0.5))
+        lock_file = None
+        try:
+            lock_path = os.environ.get("FINFINDR_PREFETCH_LOCK", "/tmp/finfindr-species-prefetch.lock")
+            lock_file = open(lock_path, "a")
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+        except OSError:
+            app.logger.warning("species prefetch lock unavailable; warming without it")
+        named = [region for region in REGIONS if region["id"] not in ("other", "my-location")]
+        named.sort(key=lambda region: 0 if region["id"] == "sea-of-cortez" else 1)
         for region in named:
             query = species_query_for(region, None, None)
             try:
-                load_species_list(query, mode, budget, refresh_incomplete=True)
+                load_species_list(query, "short", 40, refresh_incomplete=True)
             except Exception:
-                app.logger.warning("species prefetch failed for %s %s", region["id"], mode, exc_info=True)
-            time.sleep(0.25)
+                app.logger.warning("species prefetch failed for %s", region["id"], exc_info=True)
+            time.sleep(0.2)
+    except Exception:
+        app.logger.warning("species prefetch stopped", exc_info=True)
+    finally:
+        if lock_file is not None:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+                lock_file.close()
+            except OSError:
+                pass
+
+
+_prefetch_guard = threading.Lock()
+_prefetch_pid = None
 
 
 def _start_species_prefetch():
+    """Start one background warm-up per process. Safe after a gunicorn fork."""
+    global _prefetch_pid
     if os.environ.get("FINFINDR_PREFETCH", "1") != "1":
-        return
+        return False
+    pid = os.getpid()
+    with _prefetch_guard:
+        if _prefetch_pid == pid:
+            return False
+        _prefetch_pid = pid
     threading.Thread(
         target=_prefetch_species_lists,
         name="finfindr-species-prefetch",
         daemon=True,
     ).start()
+    return True
 
 
-def _vision_payload(jpeg_bytes, prompt):
+def _safe_model_name(name):
+    return bool(name) and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,64}", name))
+
+
+def resolve_model(raw=None, debug=False):
+    """Env XAI_MODEL overrides the flagship. A form value counts only while debug is on."""
+    if debug:
+        candidate = (raw or "").strip()
+        if _safe_model_name(candidate):
+            return candidate
+    env = (os.environ.get("XAI_MODEL") or "").strip()
+    if _safe_model_name(env):
+        return env
+    return DEFAULT_XAI_MODEL
+
+
+def _vision_payload(jpeg_bytes, prompt, model):
     b64 = base64.b64encode(jpeg_bytes).decode("ascii")
     data_url = f"data:image/jpeg;base64,{b64}"
     return {
-        "model": "grok-4",
+        "model": model,
         "temperature": XAI_TEMPERATURE,
         "input": [
             {
@@ -1774,7 +1902,7 @@ def _prompt_tokens(data, prompt):
     return estimate_text_tokens(prompt), "estimate"
 
 
-def _identification_meta(mode, sent, available, truncated, source, list_ms, model_ms, tokens, token_source):
+def _identification_meta(mode, sent, available, truncated, source, list_ms, model_ms, tokens, token_source, model, image_px):
     return {
         "species_list_mode": mode,
         "species_sent": sent,
@@ -1785,6 +1913,8 @@ def _identification_meta(mode, sent, available, truncated, source, list_ms, mode
         "prompt_tokens_source": token_source,
         "list_fetch_ms": int(list_ms),
         "model_call_ms": int(model_ms),
+        "model": model,
+        "image_px": image_px,
     }
 
 
@@ -1792,7 +1922,7 @@ def _log_identification(region_id, meta):
     app.logger.info(
         "identify region=%s list_mode=%s species_sent=%s species_available=%s "
         "prompt_tokens=%s prompt_tokens_source=%s list_fetch_ms=%s model_call_ms=%s "
-        "list_source=%s truncated=%s",
+        "list_source=%s truncated=%s model=%s image_px=%s",
         region_id,
         meta["species_list_mode"],
         meta["species_sent"],
@@ -1803,6 +1933,8 @@ def _log_identification(region_id, meta):
         meta["model_call_ms"],
         meta["list_source"],
         meta["species_truncated"],
+        meta.get("model"),
+        meta.get("image_px"),
     )
 
 
@@ -1823,15 +1955,19 @@ def identify():
         app.logger.warning("Could not read upload: %s", exc)
         return jsonify({"error": "Please upload a valid photo"}), 400
 
-    jpeg_bytes = prepare_image(image_bytes)
-    if not jpeg_bytes:
+    prepared = prepare_image(image_bytes)
+    if not prepared:
         return jsonify({"error": "Please upload a valid photo"}), 400
+    jpeg_bytes, image_w, image_h = prepared
+    image_px = f"{image_w}x{image_h}"
 
     region = resolve_region(request.form.get("region"))
     lat, lng, coord_source = _choose_coordinates(image_bytes)
     region, location_fallback = apply_location_fallback(region, lat, lng)
     region_label = display_region_label(region, lat, lng, location_fallback)
     mode = resolve_species_mode(request.form.get("species_list"))
+    debug = (request.form.get("debug") or "").strip() == "1"
+    model = resolve_model(request.form.get("model"), debug=debug)
 
     xai_key = os.environ.get("XAI_API_KEY")
     if not xai_key:
@@ -1866,10 +2002,10 @@ def identify():
     truncated = prompt_trimmed or (mode == "full" and not species_payload.get("complete"))
     source = species_payload.get("source") or "none"
 
-    payload = _vision_payload(jpeg_bytes, prompt)
+    payload = _vision_payload(jpeg_bytes, prompt, model)
     model_started = time.perf_counter()
     try:
-        resp = requests.post(
+        resp = http.post(
             "https://api.x.ai/v1/responses",
             headers={"Authorization": f"Bearer {xai_key}", "Content-Type": "application/json"},
             json=payload,
@@ -1878,7 +2014,7 @@ def identify():
     except requests.Timeout:
         app.logger.exception("xAI request timed out")
         model_ms = int(round((time.perf_counter() - model_started) * 1000))
-        meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, None, "unavailable")
+        meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, None, "unavailable", model, image_px)
         _log_identification(region["id"], meta)
         return jsonify({
             "error": "Identification is taking too long. Please try again.",
@@ -1888,7 +2024,7 @@ def identify():
     except requests.RequestException:
         app.logger.exception("xAI request failed")
         model_ms = int(round((time.perf_counter() - model_started) * 1000))
-        meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, None, "unavailable")
+        meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, None, "unavailable", model, image_px)
         _log_identification(region["id"], meta)
         return jsonify({
             "error": "Could not identify this photo. Please try again.",
@@ -1899,7 +2035,7 @@ def identify():
     model_ms = int(round((time.perf_counter() - model_started) * 1000))
     if not resp.ok:
         app.logger.error("xAI HTTP %s: %s", resp.status_code, resp.text[:500])
-        meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, None, "unavailable")
+        meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, None, "unavailable", model, image_px)
         _log_identification(region["id"], meta)
         return jsonify({
             "error": "Could not identify this photo. Please try another one.",
@@ -1911,7 +2047,7 @@ def identify():
         data = resp.json()
     except ValueError:
         app.logger.exception("xAI returned invalid JSON")
-        meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, None, "unavailable")
+        meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, None, "unavailable", model, image_px)
         _log_identification(region["id"], meta)
         return jsonify({
             "error": "Could not identify this photo. Please try again.",
@@ -1920,9 +2056,9 @@ def identify():
         }), 502
 
     tokens, token_source = _prompt_tokens(data, prompt)
-    meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, tokens, token_source)
+    meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, tokens, token_source, model, image_px)
     _log_identification(region["id"], meta)
-    text = apply_standard_names(_extract_text(data))
+    text = apply_standard_names(_extract_text(data), species)
     return jsonify({
         "result_text": text or "No response",
         "region_label": region_label,
@@ -1943,6 +2079,13 @@ def unhandled(exc):
     if request.path == "/identify":
         return jsonify({"error": "Something went wrong. Please try again."}), 500
     return "Internal Server Error", 500
+
+
+@app.before_request
+def _warm_species_cache():
+    # After a gunicorn fork the import-time thread is gone. Starting again is cheap
+    # and does not wait, so a health check is not held up.
+    _start_species_prefetch()
 
 
 _start_species_prefetch()
