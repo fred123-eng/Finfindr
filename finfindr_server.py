@@ -519,6 +519,15 @@ function appendNearestRecord(box, discovery) {
   box.appendChild(line);
 }
 
+function appendExternalRange(card, discovery) {
+  if (!discovery || !discovery.external_range) return;
+  const ext = document.createElement("p");
+  ext.className = "external-range";
+  const source = discovery.external_range_source || "not checked";
+  ext.textContent = "Outside iNaturalist: " + discovery.external_range + " (" + source + ")";
+  card.querySelector(".result-body").appendChild(ext);
+}
+
 function showNotMarine(card) {
   card.querySelector("h3").textContent = "Marine animals only";
   const sciWrap = card.querySelector(".scientific");
@@ -854,6 +863,7 @@ async function handleFile(file) {
           note.textContent = data.notable_note;
           card.querySelector(".result-body").appendChild(note);
         }
+        if (data.discovery && data.discovery.type === "off_list") appendExternalRange(card, data.discovery);
       } else {
         showPhotoRejection(card, data);
       }
@@ -898,6 +908,7 @@ async function handleFile(file) {
       n.textContent = notes;
       card.querySelector(".result-body").appendChild(n);
     }
+    if (data.discovery && data.discovery.type === "off_list") appendExternalRange(card, data.discovery);
     if (!common && !scientific) card.querySelector(".sci").textContent = text;
 
     const sciWrap = card.querySelector(".scientific");
@@ -1598,7 +1609,7 @@ CORTEZ_LOOKALIKE_LINES = (
     "- Blue sea star (Phataria unifascialis), Panamic cushion star (Pentaceraster cumingi), or chocolate-chip star (Nidorellia armata): a small disc with long slender cylindrical arms and no large conical spines means Phataria unifascialis, even when the color is tan, orange, or blue. A thick inflated body with short broad arms and large conical knobs means a cushion star, not Phataria. Among cushion stars, a pale body with very short, almost webbed arms and evenly sized dark-brown spines means Nidorellia armata. A larger cushion star whose knobs are red or orange and often linked in a network means Pentaceraster cumingi. Do not call a slender-armed star a cushion star, and do not call a knobby inflated star Phataria.",
     "- Cortez rainbow wrasse (Thalassoma lucasanum) or Mexican hogfish (Bodianus diplotaenia): a small cigar-shaped fish with horizontal yellow and red stripes, or a blue head with a broad yellow saddle just behind it, is the rainbow wrasse. A pointed hog-like snout with two dark side stripes on a yellow or reddish body, a yellow tail on the reddish fish, or a forehead hump and a yellow mid-body bar on a large fish, is the Mexican hogfish. Yellow with red stripes is not the hogfish. Two dark stripes and a hog snout are not the rainbow wrasse.",
     "- Bullseye puffer (Sphoeroides annulatus) or a porcupinefish (Diodon): long spines that can stand erect mean a porcupinefish, even when the body is spotted. Only short prickles, a more elongated body, and a double concentric oval on the back with narrow yellowish lines mean the bullseye puffer. Spots without long spines are not a porcupinefish. Long spines are not the bullseye puffer. A puffer that lacks the concentric oval is a different puffer, not Sphoeroides annulatus.",
-    "- Bull shark (Carcharhinus leucas) or silky shark (Carcharhinus falciformis): a stocky body, broad blunt snout, small eyes, and no ridge between the dorsal fins mean the bull shark, Carcharhinus leucas. A slender body, longer rounded snout, and a low ridge between the dorsal fins mean the silky shark. Do not name falciformis when the snout is blunt and the body is stocky. Put leucas in the candidate list whenever both are plausible.",
+    "- Bull shark (Carcharhinus leucas) or silky shark (Carcharhinus falciformis): a stocky body, broad blunt snout, small eyes, and no ridge between the dorsal fins mean the bull shark, Carcharhinus leucas. Rank Carcharhinus leucas first in that case. A slender body, longer rounded snout, and a visible low ridge between the dorsal fins mean the silky shark. Do not name falciformis, and do not rank it first, when the snout is blunt or the body is stocky. Put leucas in the candidate list whenever both are plausible.",
     "- Two-spot octopus (Octopus bimaculatus), Hubbs' octopus (Octopus hubbsorum), or red octopus (Octopus rubescens): a pair of false eye spots (ocelli) under the eyes means bimaculatus. A brown-gray octopus without those eye spots can be hubbsorum. A reddish octopus without eye spots, with a stout body and pale papillae, is Octopus rubescens even when it is not on the regional list. Do not leave rubescens off the off-list lines when the regional octopus species lack that reddish color and papillae.",
     "- California blue dorid (Felimare californiensis) or a rough nerite (Nerita scabricosta): a dark blue mantle with yellow spots or rings is Felimare californiensis. A thick dark shell with rough spiral ridges in the intertidal is Nerita scabricosta. Name the one whose spots or shell ridges you can see, and say that trait explicitly.",
 )
@@ -3046,6 +3057,17 @@ def should_fallback(result, remaining, fallback_cap):
     return False
 
 
+def answer_used_fallback(result, primary_model):
+    """True only when the answer we return came from the fallback model.
+
+    A parallel grok-4 row that lost to grok-4.7 is not a fallback. Treating it
+    as one was downgrading confident identifications to likely.
+    """
+    if not isinstance(result, dict) or not result.get("ok"):
+        return False
+    return (result.get("model") or primary_model) != primary_model
+
+
 def _record_parallel_fallback(fallback_thread, holder, fallback_model, attempts):
     """Keep the grok-4 attempt on the record even when the primary answer is the one we use."""
     if fallback_thread is None:
@@ -3063,10 +3085,11 @@ def _record_parallel_fallback(fallback_thread, holder, fallback_model, attempts)
 def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, extra_reserve=0, extra_images=None, use_cache=True):
     """Primary keeps most of its window. Fallback starts in parallel if it runs long.
 
-    grok-4.7 still gets about 70s (XAI_PRIMARY_TIMEOUT). If it is still running
-    after XAI_FALLBACK_AFTER (default 40s), grok-4 starts beside it so a full
-    primary timeout does not consume the verify window. A fast failure still
-    falls back immediately. About 16s stays reserved for verification.
+    grok-4.7 still gets its cap (XAI_PRIMARY_TIMEOUT). If it is still running
+    after XAI_FALLBACK_AFTER (default 40s), grok-4 starts beside it. The second
+    wait is until the primary deadline, not another full timeout on top of the
+    first wait. A fast failure still falls back immediately. Verification uses
+    whatever budget remains.
     """
     del extra_reserve
     worker_budget = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
@@ -3092,8 +3115,10 @@ def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, ext
             jpeg_bytes, prompt, model, primary_timeout, api_key, extra_images, use_cache=use_cache
         )
 
+    primary_started = time.monotonic()
+    primary_deadline = primary_started + primary_timeout
     primary_thread = _start_thread(run_primary, "finfindr-primary")
-    primary_thread.join(min(fallback_after, primary_timeout))
+    primary_thread.join(min(fallback_after, max(0.0, primary_deadline - time.monotonic())))
     fallback_thread = None
     if primary_thread.is_alive() and fallback_model and remaining() >= fallback_cap + 8:
         fallback_timeout = min(fallback_cap, max(5.0, remaining() - 3.0))
@@ -3104,8 +3129,13 @@ def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, ext
             )
 
         fallback_thread = _start_thread(run_fallback, "finfindr-fallback")
-    primary_thread.join(max(0.2, primary_timeout))
-    result = holder.get("primary") or timed_out(model, primary_timeout * 1000)
+    left_primary = primary_deadline - time.monotonic()
+    if left_primary > 0:
+        primary_thread.join(left_primary)
+    if primary_thread.is_alive():
+        result = timed_out(model, int(round((time.monotonic() - primary_started) * 1000)))
+    else:
+        result = holder.get("primary") or timed_out(model, primary_timeout * 1000)
     attempts.append(_attempt_record(model, result["ms"], result["ok"], None if result["ok"] else result.get("error")))
     if result.get("ok"):
         _record_parallel_fallback(fallback_thread, holder, fallback_model, attempts)
@@ -3175,11 +3205,21 @@ def verify_image_px():
 
 
 def verify_call_budget(request_started):
-    """Seconds left for verification, leaving a few seconds for the range lookup. None if it will not fit."""
-    left = _time_left(request_started) - 3.0
-    if left < 8.0:
+    """Seconds left for verification. None if fewer than 6 seconds remain.
+
+    A fast primary keeps the configured cap (12s unless FINFINDR_VERIFY_TIMEOUT
+    says otherwise). After a long primary, the leftover budget is used instead,
+    up to 28s, so the reference check is not cut off at 12s.
+    """
+    left = _time_left(request_started) - 2.0
+    if left < 6.0:
         return None
-    return min(verify_timeout_cap(), left)
+    cap = verify_timeout_cap()
+    budget = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
+    elapsed = budget - _time_left(request_started)
+    if elapsed >= 45.0:
+        return min(28.0, left)
+    return min(cap, left)
 
 
 def _shrink_jpeg(jpeg_bytes, limit):
@@ -3501,16 +3541,29 @@ def _prepare_off_list_candidates(candidates, species):
     return kept
 
 
+def _reference_cache_key(scientific, lat, lng, exclude_observation_id):
+    exclude = exclude_observation_id or ""
+    if lat is not None and lng is not None:
+        return f"ref:{scientific.lower()}:{round(float(lat), 1):.1f}:{round(float(lng), 1):.1f}:{exclude}"
+    return f"ref:{scientific.lower()}::{exclude}"
+
+
 def fetch_reference_photos(scientific, lat, lng, exclude_observation_id=None, deadline=None):
-    """Research-grade reference photos for one species, preferring the user's area."""
+    """Research-grade reference photos for one species, preferring the user's area.
+
+    Startup prefetch stores photos without coordinates. A later check reuses
+    that cache instead of waiting on iNaturalist again.
+    """
     if deadline is not None and time.monotonic() >= deadline:
         return []
-    rounded = ""
-    if lat is not None and lng is not None:
-        rounded = f":{round(float(lat), 1):.1f}:{round(float(lng), 1):.1f}"
-    key = f"ref:{scientific.lower()}{rounded}:{exclude_observation_id or ''}"
-    cached = _cached_photos(key)
-    if cached is not None:
+    specific = _reference_cache_key(scientific, lat, lng, exclude_observation_id)
+    generic = _reference_cache_key(scientific, None, None, exclude_observation_id)
+    cached = _cached_photos(specific)
+    if cached is None and specific != generic:
+        warmed = _cached_photos(generic)
+        if warmed:
+            return warmed
+    elif cached is not None:
         return cached
     taxon_payload = _inat_json(
         _TAXA_URL,
@@ -3574,7 +3627,10 @@ def fetch_reference_photos(scientific, lat, lng, exclude_observation_id=None, de
         photos = [photo for photo in photos if str(photo.get("observation_id") or "") != str(exclude_observation_id)]
     photos.sort(key=lambda photo: (str(photo.get("url") or ""), str(photo.get("source_url") or "")))
     photos = photos[:2]
-    _cache_photos(key, photos, INAT_CACHE_TTL if photos else INAT_ERROR_TTL)
+    ttl = INAT_CACHE_TTL if photos else INAT_ERROR_TTL
+    _cache_photos(specific, photos, ttl)
+    if photos and specific != generic:
+        _cache_photos(generic, photos, ttl)
     return photos
 
 
@@ -4144,8 +4200,45 @@ def ancestry_in_scope(taxon, allowed=None):
         return False
     if names & allowed:
         return True
+    iconic = str((taxon or {}).get("iconic_taxon_name") or "").strip().lower()
+    # Mammalia and Aves contain both marine and land species. An iNaturalist
+    # search often returns the class and an empty ancestor list. That is not
+    # enough to call the animal terrestrial.
+    if iconic in ("mammalia", "aves") or names & {"mammalia", "aves"}:
+        if not _ancestors_resolved(taxon):
+            return None
+        return False
     if names & LAND_ICONIC_TAXA:
         return False
+    return None
+
+
+def _ancestors_resolved(taxon):
+    """True when the taxon record includes named ancestors, not only a class."""
+    if not isinstance(taxon, dict):
+        return False
+    for ancestor in taxon.get("ancestors") or []:
+        if isinstance(ancestor, dict) and ancestor.get("name"):
+            return True
+        if isinstance(ancestor, str) and ancestor.strip():
+            return True
+    return False
+
+
+def _taxon_from_payload(payload, scientific):
+    if not isinstance(payload, dict):
+        return None
+    wanted = (scientific or "").strip().lower()
+    results = payload.get("results")
+    if isinstance(results, list):
+        for item in results:
+            if isinstance(item, dict) and (item.get("name") or "").strip().lower() == wanted:
+                return item
+        if len(results) == 1 and isinstance(results[0], dict):
+            return results[0]
+        return None
+    if (payload.get("name") or "").strip().lower() == wanted or payload.get("ancestors") or payload.get("ancestor_ids"):
+        return payload
     return None
 
 
@@ -4183,6 +4276,12 @@ def _worms_is_marine(scientific):
 
 
 def fetch_inat_taxon(scientific):
+    """Species record, including ancestors from /v1/taxa/{id}.
+
+    The search endpoint often returns iconic_taxon_name and an empty ancestors
+    list. The id endpoint has the ancestor names the scope check needs. Both
+    responses are cached by _inat_json.
+    """
     if not scientific:
         return None
     payload = _inat_json(
@@ -4201,16 +4300,17 @@ def fetch_inat_taxon(scientific):
             break
     if not match:
         return None
-    if match.get("ancestors") or match.get("iconic_taxon_name"):
+    if _ancestors_resolved(match):
         return match
     taxon_id = match.get("id")
     if not taxon_id or (call_time_left() is not None and call_time_left() < 1.5):
         return match
     full = _inat_json(f"{_TAXA_URL}/{taxon_id}", {}, INAT_TIMEOUT)
-    if isinstance(full, dict) and (full.get("name") or full.get("ancestors") or full.get("iconic_taxon_name")):
-        if full.get("results") and isinstance(full.get("results"), list):
-            return full["results"][0]
-        return full
+    resolved = _taxon_from_payload(full, scientific)
+    if resolved and (_ancestors_resolved(resolved) or resolved.get("ancestor_ids")):
+        if not resolved.get("iconic_taxon_name"):
+            resolved["iconic_taxon_name"] = match.get("iconic_taxon_name")
+        return resolved
     return match
 
 
@@ -4222,6 +4322,13 @@ def taxon_in_scope(scientific):
     taxon = fetch_inat_taxon(scientific)
     if taxon:
         status = ancestry_in_scope(taxon, allowed)
+        iconic = str(taxon.get("iconic_taxon_name") or "").strip().lower()
+        if iconic in ("mammalia", "aves"):
+            if status is True:
+                return True
+            if status is False and _ancestors_resolved(taxon):
+                return False
+            return None
         if status is not None:
             return status
     marine = _worms_is_marine(scientific)
@@ -4435,6 +4542,57 @@ def stamp_meta(meta, request_started):
     return stamped
 
 
+def _prefer_bull_shark(candidates, text):
+    """A blunt snout or stocky body is Carcharhinus leucas, not the silky shark.
+
+    The model was ranking falciformis first even when its own trait said the
+    snout was blunt. Reorder when both names are present. If only falciformis
+    was named and the text says blunt or stocky, and it does not mention the
+    interdorsal ridge, replace that top name with leucas.
+    """
+    if not candidates:
+        return candidates
+    blob = (text or "").lower()
+    blunt = any(phrase in blob for phrase in ("blunt snout", "stocky", "no ridge", "without a ridge", "no interdorsal"))
+    ridge = "interdorsal ridge" in blob or "ridge between the dorsal" in blob
+    if not blunt or ridge:
+        return candidates
+    leucas = None
+    rest = []
+    for item in candidates:
+        if (item.get("scientific_name") or "").lower() == "carcharhinus leucas":
+            leucas = item
+        else:
+            rest.append(item)
+    if leucas is not None:
+        if rest and _CONFIDENCE_RANK.get(leucas.get("confidence") or "medium", 1) > _CONFIDENCE_RANK.get(rest[0].get("confidence") or "medium", 1):
+            leucas["confidence"] = rest[0].get("confidence") or "medium"
+        return [leucas] + rest
+    top = candidates[0]
+    if (top.get("scientific_name") or "").lower() == "carcharhinus falciformis":
+        top["scientific_name"] = "Carcharhinus leucas"
+        top["common_name"] = top.get("common_name") or "Bull shark"
+        if "silky" in (top.get("common_name") or "").lower():
+            top["common_name"] = "Bull shark"
+    return candidates
+
+
+def _no_match_result_text(discovery):
+    """One wording for a rejected identification. No species is named as the match."""
+    names = []
+    for item in (discovery or {}).get("closest_relatives") or []:
+        scientific = item.get("scientific_name")
+        if scientific and scientific not in names:
+            names.append(scientific)
+    considered = ", ".join(names) if names else "none"
+    return "\n".join([
+        "Common name:",
+        "Scientific name:",
+        "Confidence: none",
+        "Notes: No matching species. Closest names considered and rejected: " + considered + ".",
+    ])
+
+
 def _offlist_followup_prompt(locality, candidates):
     names = ", ".join(
         item["scientific_name"] for item in candidates if not item.get("off_list")
@@ -4485,6 +4643,76 @@ def _unsure_crash_body():
     }), 200
 
 
+def response_wall_seconds():
+    """Hard cap for the HTTP response. Whitespace heartbeats must not hold it open longer."""
+    return _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115) + 5.0
+
+
+def _wall_timeout_response(started):
+    meta = apply_verify_rates(
+        stamp_meta({
+            "verify_skipped": "wall",
+            "model": resolve_model(),
+            "fallback_used": False,
+            "attempts": [],
+        }, started),
+        False, False, 0, 0, "wall",
+    )
+    return jsonify({
+        "result_text": "",
+        "certainty": "unsure",
+        "photo_quality": "good",
+        "candidates": [],
+        "discovery": None,
+        "message": "Identification is taking too long. Please try again.",
+        "reason": "timeout",
+        "meta": meta,
+    })
+
+
+def _identify_chunks(worker, started, final):
+    """Whitespace heartbeats, then one JSON body. Stops at the response wall."""
+    wall = response_wall_seconds()
+    while worker.is_alive():
+        if time.monotonic() - started >= wall:
+            payload = _ensure_meta(_wall_timeout_response(started), started)
+            yield payload.get_data()
+            return
+        yield b" \n"
+        worker.join(min(5.0, max(0.05, wall - (time.monotonic() - started))))
+    if time.monotonic() - started >= wall:
+        payload = _ensure_meta(_wall_timeout_response(started), started)
+        yield payload.get_data()
+        return
+    response = _ensure_meta(final(), started)
+    payload = response[0] if isinstance(response, tuple) else response
+    yield payload.get_data()
+
+
+def _ensure_meta(response, started):
+    """Every identify body carries a meta object. A missing one is filled in."""
+    status = None
+    resp = response
+    if isinstance(response, tuple):
+        resp = response[0]
+        status = response[1] if len(response) > 1 else 200
+    data = None
+    try:
+        data = resp.get_json(silent=True) if resp is not None else None
+    except Exception:
+        data = None
+    if isinstance(data, dict) and not isinstance(data.get("meta"), dict):
+        reason = data.get("reason") or "missing_meta"
+        data["meta"] = apply_verify_rates(
+            stamp_meta({"verify_skipped": reason}, started),
+            False, False, 0, 0, reason,
+        )
+        resp = jsonify(data)
+    if status is None:
+        return resp
+    return resp, status
+
+
 @app.route("/health", methods=["GET", "HEAD"])
 def health():
     primary = resolve_model()
@@ -4503,8 +4731,11 @@ def identify():
 
     A silent response longer than about 30s becomes a Cloudflare 520. Fast
     answers return normally. Longer ones stream whitespace, which JSON parsers
-    ignore, and then the JSON body.
+    ignore, and then the JSON body. The stream stops at the budget plus 5
+    seconds even if the worker is still going, so a heartbeat cannot hold the
+    connection open past about 115 seconds.
     """
+    started = time.monotonic()
     holder = {}
 
     @copy_current_request_context
@@ -4516,19 +4747,14 @@ def identify():
 
     worker = threading.Thread(target=run, name="finfindr-identify", daemon=True)
     worker.start()
-    worker.join(15)
+    worker.join(min(15.0, response_wall_seconds()))
     if not worker.is_alive():
         if holder.get("error"):
             raise holder["error"]
-        return holder.get("out") or _unsure_crash_body()
+        return _ensure_meta(holder.get("out") or _unsure_crash_body(), started)
 
     def generate():
-        while worker.is_alive():
-            yield b" \n"
-            worker.join(5)
-        response = holder.get("out") or _unsure_crash_body()
-        payload = response[0] if isinstance(response, tuple) else response
-        yield payload.get_data()
+        yield from _identify_chunks(worker, started, lambda: holder.get("out") or _unsure_crash_body())
 
     return Response(
         generate(),
@@ -4611,7 +4837,7 @@ def _identify_http():
     )
     model_ms = sum(item["ms"] for item in attempts)
     answered = result.get("model") or model
-    fallback_used = any(item["model"] != model for item in attempts)
+    fallback_used = answer_used_fallback(result, model)
     if not result.get("ok"):
         if not result.get("retryable"):
             status = 502
@@ -4619,11 +4845,15 @@ def _identify_http():
             body = {"error": message, "region_label": region_label}
         else:
             status = 200
-            message = (
-                "Identification is taking too long. Please try again."
-                if result.get("error") == "timeout"
-                else "Could not identify this photo. Please try again."
-            )
+            if result.get("error") == "rate_limited":
+                message = "Could not identify this photo. Please try again."
+                reason = "rate_limited"
+            elif result.get("error") == "timeout":
+                message = "Identification is taking too long. Please try again."
+                reason = "timeout"
+            else:
+                message = "Could not identify this photo. Please try again."
+                reason = ""
             body = {
                 "result_text": "",
                 "region_label": region_label,
@@ -4633,6 +4863,8 @@ def _identify_http():
                 "discovery": None,
                 "message": message,
             }
+            if reason:
+                body["reason"] = reason
         total_ms = int(round((time.monotonic() - request_started) * 1000))
         meta = _identification_meta(
             mode, sent, available, truncated, source, list_fetch_ms, model_ms,
@@ -4650,7 +4882,7 @@ def _identify_http():
     text = apply_standard_names(_extract_text(data), species)
     photo_quality = parse_photo_quality(text)
     photo_issue = _field_value(text, "Photo issue")
-    parsed_candidates = parse_model_candidates(text)
+    parsed_candidates = _prefer_bull_shark(parse_model_candidates(text), text)
     named = parsed_candidates[0]["scientific_name"] if parsed_candidates else ""
     taxon_status = taxon_in_scope(named) if named else None
     # Text is only a land-animal veto when iNaturalist did not resolve a taxon.
@@ -4943,6 +5175,7 @@ def _identify_http():
         if record_count is not None:
             evidence.append(f"records_in_radius={record_count}")
         unrecorded = record_count is not None and record_count <= rule["max_records"]
+        off_list_focus = False
         if focus and record_count is not None:
             listed_names = {(item.get("scientific") or "").lower() for item in species}
             listed_here = focus.lower() in listed_names
@@ -4995,6 +5228,21 @@ def _identify_http():
             evidence.append("verification_agreed" if strong_id else "off_list_range_unverified")
             if not strong_id and certainty == "confident":
                 certainty = "likely"
+        elif off_list_focus:
+            discovery = {
+                "type": "off_list",
+                "scientific_name": focus,
+                "common_name": shown[0].get("common_name") or "",
+                "records_in_region": record_count,
+                "radius_km": rule["radius_km"],
+                "nearest_records": [],
+                "traits": [item.get("trait") for item in shown if item.get("trait")][:3],
+                "rule": rule,
+                "external_range": range_status or "unknown",
+                "external_range_source": range_evidence.get("source") or "",
+                "note": "This species is not on the regional list.",
+            }
+            evidence.append("off_list_kept")
         elif unrecorded and strong_id and range_status == "unknown":
             certainty = "unsure"
             notable_note = (
@@ -5057,7 +5305,10 @@ def _identify_http():
         for item in shown:
             if item.get("confidence") == "high":
                 item["confidence"] = "medium"
-    if shown and text:
+    if no_match or (discovery and discovery.get("type") == "no_match"):
+        text = _no_match_result_text(discovery)
+        certainty = "unsure"
+    elif shown and text:
         text = _set_field(text, "Confidence", shown[0].get("confidence") or "medium")
     off_list_kept = sum(1 for item in shown if item.get("off_list"))
     if verify_skipped in ("timeout", "connection", "no_time") and certainty == "confident":
