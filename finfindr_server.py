@@ -322,7 +322,7 @@ function showCandidates(card, candidates) {
     const cap = document.createElement("div");
     cap.className = "cap";
     const title = document.createElement("h4");
-    title.textContent = item.common_name || item.scientific_name || "Candidate";
+    title.textContent = item.common_name || "Common name unavailable";
     cap.appendChild(title);
     if (item.scientific_name) {
       const sci = document.createElement("div");
@@ -522,7 +522,9 @@ fileInput.addEventListener("change", async function() {
 });
 
 identifyBtn.addEventListener("click", function() {
+  if (busy) return;
   if (!fileInput.files || !fileInput.files[0]) return;
+  identifyBtn.disabled = true;
   handleFile(fileInput.files[0]);
 });
 
@@ -548,8 +550,10 @@ uploadZone.addEventListener("drop", (event) => {
   event.preventDefault();
   dragDepth = 0;
   uploadZone.classList.remove("dragover");
+  if (busy) return;
   const files = event.dataTransfer && event.dataTransfer.files;
   if (!files || !files[0]) return;
+  identifyBtn.disabled = true;
   handleFile(files[0]);
 });
 
@@ -559,7 +563,9 @@ document.addEventListener("drop", (event) => event.preventDefault());
 async function handleFile(file) {
   if (busy) return;
   busy = true;
+  identifyBtn.disabled = true;
   clearClientError();
+  let progressTimer = null;
   try {
     const problem = await validatePhoto(file);
     if (problem) {
@@ -579,7 +585,8 @@ async function handleFile(file) {
       <img class="preview" alt="Photo being identified" style="width:100%; max-height:280px; object-fit:cover;">
       <div class="result-body">
         <div class="spinner" role="status" aria-label="Identifying photo"></div>
-        <h3>Identifying…</h3>
+        <h3 class="progress-title">Identifying…</h3>
+        <p class="hint progress-note">Usually under a minute.</p>
         <div class="scientific" hidden>
           <div class="sci-label" hidden>Scientific name</div>
           <div class="sci" translate="no"></div>
@@ -589,6 +596,13 @@ async function handleFile(file) {
       </div>
     `;
     results.appendChild(card);
+    const progressStarted = Date.now();
+    progressTimer = setInterval(function () {
+      const title = card.querySelector(".progress-title");
+      if (!title) return;
+      const elapsed = Date.now() - progressStarted;
+      title.textContent = elapsed < 8000 ? "Identifying…" : "Checking reference photos…";
+    }, 1000);
 
     const reader = new FileReader();
     reader.onload = (e) => {
@@ -618,6 +632,9 @@ async function handleFile(file) {
 
     const resp = await fetch("/identify", { method: "POST", body: formData });
     const parsed = await readJsonResponse(resp);
+    clearInterval(progressTimer);
+    const progressNote = card.querySelector(".progress-note");
+    if (progressNote) progressNote.remove();
     if (parsed.region_label) showRegion(card, parsed.region_label);
     if (!parsed.ok) {
       showError(card, parsed.message);
@@ -642,33 +659,9 @@ async function handleFile(file) {
       else if (lower.startsWith("notes:")) notes = line.split(":").slice(1).join(":").trim();
     });
 
-    card.querySelector("h3").textContent = common || "Result";
-    card.querySelector(".sci").textContent = scientific;
-    if (group) {
-      const g = document.createElement("div");
-      g.style.margin = "0.3rem 0";
-      g.textContent = "Group: " + group;
-      card.querySelector(".result-body").appendChild(g);
-    }
-    if (altGroup && altGroup.toLowerCase() !== "none") {
-      const a = document.createElement("div");
-      a.style.margin = "0.2rem 0";
-      a.style.opacity = "0.75";
-      a.style.fontSize = "0.9rem";
-      a.textContent = "Also considered: " + altGroup;
-      card.querySelector(".result-body").appendChild(a);
-    }
-    if (confidence) card.querySelector(".confidence").textContent = confidence + " confidence";
-    if (notes) {
-      const n = document.createElement("div");
-      n.style.marginTop = "0.5rem";
-      n.textContent = notes;
-      card.querySelector(".result-body").appendChild(n);
-    }
-    if (!common && !scientific) card.querySelector(".sci").textContent = text;
-
-    const uncertain = data.certainty === "likely" || data.certainty === "unsure";
-    if (uncertain && data.candidates && data.candidates.length) {
+    const uncertain = (data.certainty === "likely" || data.certainty === "unsure")
+      && data.candidates && data.candidates.length;
+    if (uncertain) {
       card.querySelector("h3").textContent = data.certainty === "unsure" ? "Not sure yet" : "Likely — check these";
       card.querySelector("h3").classList.add("unsure-title");
       const sciWrapEarly = card.querySelector(".scientific");
@@ -676,6 +669,31 @@ async function handleFile(file) {
       const conf = card.querySelector(".confidence");
       if (conf) conf.textContent = "";
       showCandidates(card, data.candidates);
+    } else {
+      card.querySelector("h3").textContent = common || "Result";
+      card.querySelector(".sci").textContent = scientific;
+      if (group) {
+        const g = document.createElement("div");
+        g.style.margin = "0.3rem 0";
+        g.textContent = "Group: " + group;
+        card.querySelector(".result-body").appendChild(g);
+      }
+      if (altGroup && altGroup.toLowerCase() !== "none") {
+        const a = document.createElement("div");
+        a.style.margin = "0.2rem 0";
+        a.style.opacity = "0.75";
+        a.style.fontSize = "0.9rem";
+        a.textContent = "Also considered: " + altGroup;
+        card.querySelector(".result-body").appendChild(a);
+      }
+      if (confidence) card.querySelector(".confidence").textContent = confidence + " confidence";
+      if (notes) {
+        const n = document.createElement("div");
+        n.style.marginTop = "0.5rem";
+        n.textContent = notes;
+        card.querySelector(".result-body").appendChild(n);
+      }
+      if (!common && !scientific) card.querySelector(".sci").textContent = text;
     }
 
     const sciWrap = card.querySelector(".scientific");
@@ -696,6 +714,7 @@ async function handleFile(file) {
       showClientError("Something went wrong identifying this photo. Please try again.");
     }
   } finally {
+    if (progressTimer) clearInterval(progressTimer);
     busy = false;
   }
 }
@@ -2090,7 +2109,7 @@ def resolve_fallback_model(primary):
     return raw
 
 
-def _identification_meta(mode, sent, available, truncated, source, list_ms, model_ms, tokens, token_source, model, image_px, fallback_used=False, attempts=None, verify_used=False, verify_ms=0, reference_fetch_ms=0):
+def _identification_meta(mode, sent, available, truncated, source, list_ms, model_ms, tokens, token_source, model, image_px, fallback_used=False, attempts=None, verify_used=False, verify_ms=0, reference_fetch_ms=0, total_ms=None, verify_skipped=""):
     return {
         "species_list_mode": mode,
         "species_sent": sent,
@@ -2106,8 +2125,10 @@ def _identification_meta(mode, sent, available, truncated, source, list_ms, mode
         "fallback_used": bool(fallback_used),
         "attempts": attempts or [],
         "verify_used": bool(verify_used),
+        "verify_skipped": verify_skipped or "",
         "verify_ms": int(verify_ms),
         "reference_fetch_ms": int(reference_fetch_ms),
+        "total_ms": int(total_ms) if total_ms is not None else None,
     }
 
 
@@ -2296,9 +2317,10 @@ def _medium_photo_url(url):
     if not url or not isinstance(url, str):
         return ""
     return (
-        url.replace("/square.", "/medium.")
-        .replace("/square.jpg", "/medium.jpg")
-        .replace("/large.", "/medium.")
+        url.replace("/square.", "/small.")
+        .replace("/square.jpg", "/small.jpg")
+        .replace("/medium.", "/small.")
+        .replace("/large.", "/small.")
     )
 
 
@@ -2395,7 +2417,9 @@ def fetch_reference_photos(scientific, lat, lng, exclude_observation_id=None, de
             record = _photo_record(taxon.get("default_photo"))
             if record:
                 photos.append(record)
-        if lat is not None and lng is not None and (deadline is None or time.monotonic() < deadline):
+        if exclude_observation_id:
+            photos = [photo for photo in photos if str(photo.get("observation_id") or "") != str(exclude_observation_id)]
+        if not photos and lat is not None and lng is not None and (deadline is None or time.monotonic() < deadline):
             obs_payload = _inat_json(
                 _OBS_URL,
                 {
@@ -2409,7 +2433,7 @@ def fetch_reference_photos(scientific, lat, lng, exclude_observation_id=None, de
                     "order_by": "votes",
                     "locale": "en",
                 },
-                (1.0, 2.0),
+                (0.6, 1.5),
             )
             nearby = []
             for obs in (obs_payload or {}).get("results") or []:
@@ -2426,6 +2450,7 @@ def fetch_reference_photos(scientific, lat, lng, exclude_observation_id=None, de
                 photos = nearby + [photo for photo in photos if photo["url"] not in {item["url"] for item in nearby}]
     if exclude_observation_id:
         photos = [photo for photo in photos if str(photo.get("observation_id") or "") != str(exclude_observation_id)]
+    photos.sort(key=lambda photo: (str(photo.get("url") or ""), str(photo.get("source_url") or "")))
     photos = photos[:2]
     _cache_photos(key, photos, INAT_CACHE_TTL if photos else INAT_ERROR_TTL)
     return photos
@@ -2446,7 +2471,15 @@ def _attach_reference_photos(candidates, lat, lng, exclude_observation_id, deadl
     if not candidates:
         return candidates
     with ThreadPoolExecutor(max_workers=min(3, len(candidates))) as pool:
-        return list(pool.map(one, candidates))
+        futures = [pool.submit(one, candidate) for candidate in candidates]
+        attached = []
+        for future, candidate in zip(futures, candidates):
+            try:
+                attached.append(future.result(timeout=4))
+            except Exception:
+                app.logger.warning("reference photo timed out for %s", candidate.get("scientific_name"))
+                attached.append(candidate)
+        return attached
 
 
 def _verification_prompt(candidates):
@@ -2501,6 +2534,15 @@ def _order_candidates(candidates, scientific):
     return ordered
 
 
+def candidates_far_apart(candidates):
+    """A lone high-confidence pick, or a high pick with only a low alternative."""
+    if not candidates or candidates[0].get("confidence") != "high":
+        return False
+    if len(candidates) == 1:
+        return True
+    return candidates[1].get("confidence") == "low"
+
+
 def certainty_for(candidates, verification):
     """Confident only after reference photos agree. Otherwise say so."""
     if not candidates:
@@ -2515,9 +2557,13 @@ def certainty_for(candidates, verification):
 
 
 def public_candidates(candidates, species):
+    chosen = candidates[:3]
+    resolved = resolve_common_names([item["scientific_name"] for item in chosen], species)
     cleaned = []
-    for item in candidates[:3]:
-        common = standard_common_name(item["scientific_name"], species) or item.get("common_name") or ""
+    for item in chosen:
+        common = resolved.get(item["scientific_name"]) or item.get("common_name") or ""
+        if common.lower() == (item.get("scientific_name") or "").lower():
+            common = ""
         photo = item.get("reference_photo") or None
         if photo:
             photo = {
@@ -2640,8 +2686,16 @@ def identify():
     verify_used = False
     verify_ms = 0
     reference_fetch_ms = 0
+    verify_skipped = ""
     verification = None
-    if verify and candidates and _time_left(request_started) >= 12:
+    far_apart = candidates_far_apart(candidates)
+    if verify and candidates and far_apart:
+        verify_skipped = "far_apart"
+    elif verify and candidates and _time_left(request_started) < 12:
+        verify_skipped = "no_time"
+    elif not verify:
+        verify_skipped = "disabled"
+    if verify and candidates and not far_apart and _time_left(request_started) >= 12:
         fetch_started = time.perf_counter()
         candidates = _attach_reference_photos(
             candidates, lat, lng, exclude_observation, request_started + _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115) - 8
@@ -2650,13 +2704,15 @@ def identify():
         reference_urls = []
         for candidate in candidates:
             reference_urls.extend(candidate.get("_reference_urls") or [])
-        if reference_urls and _time_left(request_started) >= 8:
+        if not reference_urls:
+            verify_skipped = "no_photos"
+        elif _time_left(request_started) >= 8:
             verify_started = time.perf_counter()
             verify_result = _call_vision_model(
                 jpeg_bytes,
                 _verification_prompt(candidates),
                 answered,
-                min(20.0, max(5.0, _time_left(request_started) - 2.0)),
+                min(12.0, max(5.0, _time_left(request_started) - 2.0)),
                 xai_key,
                 reference_urls[:3],
             )
@@ -2679,12 +2735,16 @@ def identify():
                     )
     for candidate in candidates:
         candidate.pop("_reference_urls", None)
-    certainty = certainty_for(candidates, verification)
+    if far_apart and verify:
+        certainty = "confident"
+    else:
+        certainty = certainty_for(candidates, verification)
     shown = public_candidates(candidates, species)
+    total_ms = int(round((time.monotonic() - request_started) * 1000))
     meta = _identification_meta(
         mode, sent, available, truncated, source, list_fetch_ms, model_ms,
         tokens, token_source, answered, image_px, fallback_used, attempts,
-        verify_used, verify_ms, reference_fetch_ms,
+        verify_used, verify_ms, reference_fetch_ms, total_ms, verify_skipped,
     )
     _log_identification(region["id"], meta)
     return jsonify({
@@ -2701,13 +2761,18 @@ def too_large(_exc):
     return jsonify({"error": "That photo is too large. Please choose a smaller one."}), 413
 
 
+@app.route("/favicon.ico")
+def favicon():
+    return ("", 204)
+
+
 @app.errorhandler(Exception)
 def unhandled(exc):
-    if isinstance(exc, HTTPException):
-        return exc
-    app.logger.exception("Unhandled error")
+    app.logger.exception("Unhandled error on %s", request.path)
     if request.path == "/identify":
         return jsonify({"error": "Something went wrong. Please try again."}), 500
+    if isinstance(exc, HTTPException):
+        return exc
     return "Internal Server Error", 500
 
 
