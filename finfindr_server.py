@@ -1145,6 +1145,7 @@ XAI_TEMPERATURE = 0
 NL = chr(10)
 _SPECIES_LOCK = threading.Lock()
 _SPECIES_CACHE = {}
+_SPECIES_WAIT_RESULT = {}
 _SPECIES_INFLIGHT = {}
 
 # Feature pairs that were confused in Sea of Cortez tests. Each note names the
@@ -1635,14 +1636,24 @@ def _collect_species_rows(query, taxon_id, per_page, max_pages, deadline, exclud
         if page * per_page >= total or page * per_page >= 10000:
             exhausted = True
             break
+        if page == max_pages:
+            # The caller asked for this many pages (the short-list quota is one
+            # page). A successful page is complete even when the taxon has more.
+            exhausted = True
+            break
     return rows, total, exhausted and got_page
 
 
 def _fetch_short_species_list(query, deadline):
-    """One page per quota group, in parallel, so a cold request stays short."""
+    """One page per quota group, in parallel, so a cold request stays short.
+
+    A group that has more species than its quota is still complete: the page is
+    the top of that quota. Only a failed or timed-out call is retried, and an
+    incomplete result is not cached.
+    """
     buckets = {group["label"]: [] for group in SHORT_GROUPS}
     totals = {group["label"]: 0 for group in SHORT_GROUPS}
-    failed = {group["label"]: False for group in SHORT_GROUPS}
+    pending = [(group, taxon_id) for group in SHORT_GROUPS for taxon_id in group["taxon_ids"]]
 
     def fetch_taxon(group, taxon_id):
         if time.monotonic() >= deadline:
@@ -1657,15 +1668,24 @@ def _fetch_short_species_list(query, deadline):
         )
         return group["label"], rows, total, done
 
-    calls = [(group, taxon_id) for group in SHORT_GROUPS for taxon_id in group["taxon_ids"]]
-    with ThreadPoolExecutor(max_workers=len(calls) or 1) as pool:
-        futures = [pool.submit(fetch_taxon, group, taxon_id) for group, taxon_id in calls]
-        for future in futures:
-            label, rows, total, done = future.result()
-            buckets[label].extend(rows)
-            totals[label] += total
-            if not done:
-                failed[label] = True
+    for _attempt in range(2):
+        if not pending or time.monotonic() >= deadline:
+            break
+        still_pending = []
+        with ThreadPoolExecutor(max_workers=len(pending) or 1) as pool:
+            futures = [pool.submit(fetch_taxon, group, taxon_id) for group, taxon_id in pending]
+            for (group, taxon_id), future in zip(pending, futures):
+                try:
+                    label, rows, total, done = future.result()
+                except Exception:
+                    app.logger.warning("species group failed for %s", taxon_id, exc_info=True)
+                    label, rows, total, done = group["label"], [], 0, False
+                if done:
+                    buckets[label].extend(rows)
+                    totals[label] += total
+                else:
+                    still_pending.append((group, taxon_id))
+        pending = still_pending
 
     if not any(buckets.values()):
         if query.get("curated_fallback"):
@@ -1678,7 +1698,7 @@ def _fetch_short_species_list(query, deadline):
     return {
         "species": species,
         "available": sum(totals.values()),
-        "complete": not any(failed.values()),
+        "complete": not pending,
         "source": "inaturalist",
     }
 
@@ -1734,14 +1754,30 @@ def _fetch_species_list(query, mode, deadline, on_progress):
     return payload
 
 
+def _cache_usable(cached, refresh_incomplete):
+    """Incomplete iNaturalist lists are never reused. They made species_sent drift."""
+    if not cached:
+        return False
+    if cached.get("complete"):
+        return True
+    if refresh_incomplete:
+        return False
+    return cached.get("source") in ("curated", "none")
+
+
+def _should_cache_species(payload):
+    source = payload.get("source")
+    if source == "inaturalist" and not payload.get("complete"):
+        return False
+    return True
+
+
 def load_species_list(query, mode, budget, refresh_incomplete=False, _retry=True):
     if not query:
         return _empty_species()
     key = (mode, query["key"])
     cached = _species_cache_get(key)
-    if cached and cached.get("complete"):
-        return cached
-    if cached and cached.get("species") and not refresh_incomplete:
+    if _cache_usable(cached, refresh_incomplete):
         return cached
 
     with _SPECIES_LOCK:
@@ -1756,16 +1792,26 @@ def load_species_list(query, mode, budget, refresh_incomplete=False, _retry=True
         end = time.monotonic() + budget
         while time.monotonic() < end:
             cached = _species_cache_get(key)
-            if cached and cached.get("species") and not refresh_incomplete:
+            if _cache_usable(cached, refresh_incomplete):
                 return cached
             if event.wait(0.25):
                 break
-        cached = _species_cache_get(key) or _empty_species()
-        if refresh_incomplete and _retry and not cached.get("complete"):
+        cached = _species_cache_get(key)
+        if _cache_usable(cached, refresh_incomplete):
+            return cached
+        with _SPECIES_LOCK:
+            shared = _SPECIES_WAIT_RESULT.get(key)
+        if shared:
+            return shared
+        if refresh_incomplete and _retry and not (cached and cached.get("complete")):
             return load_species_list(query, mode, budget, refresh_incomplete=True, _retry=False)
-        return cached
+        return shared or cached or _empty_species()
 
     def on_progress(payload):
+        with _SPECIES_LOCK:
+            _SPECIES_WAIT_RESULT[key] = payload
+        if not _should_cache_species(payload):
+            return
         if payload.get("complete") and payload.get("source") == "inaturalist":
             ttl = INAT_CACHE_TTL
         elif payload.get("source") == "none":
@@ -1902,7 +1948,32 @@ def _prompt_tokens(data, prompt):
     return estimate_text_tokens(prompt), "estimate"
 
 
-def _identification_meta(mode, sent, available, truncated, source, list_ms, model_ms, tokens, token_source, model, image_px):
+def _env_seconds(name, default, low, high):
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return float(default)
+    try:
+        value = float(raw)
+    except ValueError:
+        return float(default)
+    return min(float(high), max(float(low), value))
+
+
+def resolve_fallback_model(primary):
+    """Faster model used once if the primary call times out or the server errors.
+
+    XAI_FALLBACK_MODEL defaults to grok-4. An empty value disables the fallback.
+    """
+    if "XAI_FALLBACK_MODEL" in os.environ:
+        raw = os.environ.get("XAI_FALLBACK_MODEL", "").strip()
+    else:
+        raw = "grok-4"
+    if not _safe_model_name(raw) or raw == primary:
+        return None
+    return raw
+
+
+def _identification_meta(mode, sent, available, truncated, source, list_ms, model_ms, tokens, token_source, model, image_px, fallback_used=False, attempts=None):
     return {
         "species_list_mode": mode,
         "species_sent": sent,
@@ -1915,6 +1986,8 @@ def _identification_meta(mode, sent, available, truncated, source, list_ms, mode
         "model_call_ms": int(model_ms),
         "model": model,
         "image_px": image_px,
+        "fallback_used": bool(fallback_used),
+        "attempts": attempts or [],
     }
 
 
@@ -1922,7 +1995,7 @@ def _log_identification(region_id, meta):
     app.logger.info(
         "identify region=%s list_mode=%s species_sent=%s species_available=%s "
         "prompt_tokens=%s prompt_tokens_source=%s list_fetch_ms=%s model_call_ms=%s "
-        "list_source=%s truncated=%s model=%s image_px=%s",
+        "list_source=%s truncated=%s model=%s image_px=%s fallback_used=%s attempts=%s",
         region_id,
         meta["species_list_mode"],
         meta["species_sent"],
@@ -1935,7 +2008,83 @@ def _log_identification(region_id, meta):
         meta["species_truncated"],
         meta.get("model"),
         meta.get("image_px"),
+        meta.get("fallback_used"),
+        meta.get("attempts"),
     )
+
+
+def _attempt_record(model, elapsed_ms, ok, error=None):
+    record = {"model": model, "ms": int(elapsed_ms), "ok": bool(ok)}
+    if error:
+        record["error"] = error
+    return record
+
+
+def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key):
+    """One model attempt. Retryable covers timeout, connection loss, and HTTP 5xx."""
+    started = time.perf_counter()
+    payload = _vision_payload(jpeg_bytes, prompt, model)
+    try:
+        resp = http.post(
+            "https://api.x.ai/v1/responses",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=max(1.0, timeout),
+        )
+    except requests.Timeout:
+        elapsed = int(round((time.perf_counter() - started) * 1000))
+        app.logger.warning("xAI timeout model=%s after %sms", model, elapsed)
+        return {"ok": False, "retryable": True, "model": model, "ms": elapsed, "error": "timeout", "status": 504}
+    except requests.RequestException as exc:
+        elapsed = int(round((time.perf_counter() - started) * 1000))
+        app.logger.warning("xAI connection error model=%s: %s", model, exc)
+        return {"ok": False, "retryable": True, "model": model, "ms": elapsed, "error": "connection", "status": 502}
+    elapsed = int(round((time.perf_counter() - started) * 1000))
+    if resp.status_code >= 500:
+        app.logger.error("xAI HTTP %s model=%s: %s", resp.status_code, model, resp.text[:500])
+        return {"ok": False, "retryable": True, "model": model, "ms": elapsed, "error": f"http_{resp.status_code}", "status": 502}
+    if not resp.ok:
+        app.logger.error("xAI HTTP %s model=%s: %s", resp.status_code, model, resp.text[:500])
+        return {"ok": False, "retryable": False, "model": model, "ms": elapsed, "error": f"http_{resp.status_code}", "status": 502}
+    try:
+        data = resp.json()
+    except ValueError:
+        app.logger.warning("xAI invalid JSON model=%s", model)
+        return {"ok": False, "retryable": True, "model": model, "ms": elapsed, "error": "invalid_json", "status": 502}
+    return {"ok": True, "retryable": False, "model": model, "ms": elapsed, "data": data, "status": 200}
+
+
+def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started):
+    """Primary model gets most of the budget. One faster fallback uses what is left.
+
+    Wall time stays under FINFINDR_TIME_BUDGET (default 110s) so a 120s worker
+    can still return JSON.
+    """
+    worker_budget = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
+    primary_cap = _env_seconds("XAI_PRIMARY_TIMEOUT", 80, 5, 100)
+    fallback_cap = _env_seconds("XAI_FALLBACK_TIMEOUT", 25, 5, 60)
+    deadline = request_started + worker_budget
+    attempts = []
+
+    def remaining():
+        return deadline - time.monotonic()
+
+    primary_timeout = min(primary_cap, max(1.0, remaining() - 15.0))
+    if remaining() < 8:
+        primary_timeout = max(1.0, remaining() - 1.0)
+    result = _call_vision_model(jpeg_bytes, prompt, model, primary_timeout, api_key)
+    attempts.append(_attempt_record(model, result["ms"], result["ok"], None if result["ok"] else result.get("error")))
+    if result["ok"] or not result["retryable"]:
+        return result, attempts
+
+    fallback = resolve_fallback_model(model)
+    left = remaining()
+    if fallback and left >= 5:
+        result = _call_vision_model(
+            jpeg_bytes, prompt, fallback, min(fallback_cap, left - 1.0), api_key
+        )
+        attempts.append(_attempt_record(fallback, result["ms"], result["ok"], None if result["ok"] else result.get("error")))
+    return result, attempts
 
 
 @app.route("/")
@@ -1977,6 +2126,7 @@ def identify():
             "region_label": region_label,
         }), 500
 
+    request_started = time.monotonic()
     started = time.perf_counter()
     species_payload = load_species_list(
         species_query_for(region, lat, lng),
@@ -2002,61 +2152,33 @@ def identify():
     truncated = prompt_trimmed or (mode == "full" and not species_payload.get("complete"))
     source = species_payload.get("source") or "none"
 
-    payload = _vision_payload(jpeg_bytes, prompt, model)
-    model_started = time.perf_counter()
-    try:
-        resp = http.post(
-            "https://api.x.ai/v1/responses",
-            headers={"Authorization": f"Bearer {xai_key}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=60,
+    result, attempts = _run_model_attempts(jpeg_bytes, prompt, model, xai_key, request_started)
+    model_ms = sum(item["ms"] for item in attempts)
+    answered = result.get("model") or model
+    fallback_used = any(item["model"] != model for item in attempts)
+    if not result.get("ok"):
+        if not result.get("retryable"):
+            status = 502
+            message = "Could not identify this photo. Please try another one."
+        elif result.get("error") == "timeout":
+            status = 504
+            message = "Identification is taking too long. Please try again."
+        else:
+            status = 502
+            message = "Could not identify this photo. Please try again."
+        meta = _identification_meta(
+            mode, sent, available, truncated, source, list_fetch_ms, model_ms,
+            None, "unavailable", answered, image_px, fallback_used, attempts,
         )
-    except requests.Timeout:
-        app.logger.exception("xAI request timed out")
-        model_ms = int(round((time.perf_counter() - model_started) * 1000))
-        meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, None, "unavailable", model, image_px)
         _log_identification(region["id"], meta)
-        return jsonify({
-            "error": "Identification is taking too long. Please try again.",
-            "region_label": region_label,
-            "meta": meta,
-        }), 504
-    except requests.RequestException:
-        app.logger.exception("xAI request failed")
-        model_ms = int(round((time.perf_counter() - model_started) * 1000))
-        meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, None, "unavailable", model, image_px)
-        _log_identification(region["id"], meta)
-        return jsonify({
-            "error": "Could not identify this photo. Please try again.",
-            "region_label": region_label,
-            "meta": meta,
-        }), 502
+        return jsonify({"error": message, "region_label": region_label, "meta": meta}), status
 
-    model_ms = int(round((time.perf_counter() - model_started) * 1000))
-    if not resp.ok:
-        app.logger.error("xAI HTTP %s: %s", resp.status_code, resp.text[:500])
-        meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, None, "unavailable", model, image_px)
-        _log_identification(region["id"], meta)
-        return jsonify({
-            "error": "Could not identify this photo. Please try another one.",
-            "region_label": region_label,
-            "meta": meta,
-        }), 502
-
-    try:
-        data = resp.json()
-    except ValueError:
-        app.logger.exception("xAI returned invalid JSON")
-        meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, None, "unavailable", model, image_px)
-        _log_identification(region["id"], meta)
-        return jsonify({
-            "error": "Could not identify this photo. Please try again.",
-            "region_label": region_label,
-            "meta": meta,
-        }), 502
-
+    data = result["data"]
     tokens, token_source = _prompt_tokens(data, prompt)
-    meta = _identification_meta(mode, sent, available, truncated, source, list_fetch_ms, model_ms, tokens, token_source, model, image_px)
+    meta = _identification_meta(
+        mode, sent, available, truncated, source, list_fetch_ms, model_ms,
+        tokens, token_source, answered, image_px, fallback_used, attempts,
+    )
     _log_identification(region["id"], meta)
     text = apply_standard_names(_extract_text(data), species)
     return jsonify({
