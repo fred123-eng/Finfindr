@@ -128,12 +128,18 @@ class IdentifyTests(unittest.TestCase):
         os.environ["XAI_API_KEY"] = "test-key"
         os.environ.pop("SPECIES_LIST_MODE", None)
         os.environ.pop("XAI_MODEL", None)
+        os.environ.pop("XAI_FALLBACK_MODEL", None)
+        os.environ.pop("XAI_PRIMARY_TIMEOUT", None)
+        os.environ.pop("XAI_FALLBACK_TIMEOUT", None)
+        os.environ.pop("FINFINDR_TIME_BUDGET", None)
         os.environ.pop("MAX_IMAGE_PX", None)
         finfindr_server._SPECIES_CACHE.clear()
         finfindr_server._SPECIES_INFLIGHT.clear()
         finfindr_server._inat_cache.clear()
         self.client = finfindr_server.app.test_client()
         self.captured = {}
+        self.fail_timeout = set()
+        self.fail_status = {}
         self.species_calls = []
         self._calls_lock = threading.Lock()
         self.get_patch = patch("finfindr_server.http.get", side_effect=self.fake_get)
@@ -156,6 +162,15 @@ class IdentifyTests(unittest.TestCase):
     def fake_post(self, url, json=None, **kwargs):
         self.captured["url"] = url
         self.captured["json"] = json
+        self.captured.setdefault("calls", []).append({
+            "model": (json or {}).get("model"),
+            "timeout": kwargs.get("timeout"),
+        })
+        model = (json or {}).get("model")
+        if model in self.fail_timeout:
+            raise requests.Timeout("slow")
+        if model in self.fail_status:
+            return FakeResponse({"error": "upstream"}, status=self.fail_status[model])
         text = self.captured.get(
             "model_text",
             "Common name: Wrong\nScientific name: Thalassoma lucasanum\n"
@@ -524,6 +539,91 @@ class IdentifyTests(unittest.TestCase):
         cached = finfindr_server.resolve_common_names(["Zanclus imaginatus"])
         self.assertLess(time.perf_counter() - started, 0.1)
         self.assertEqual(cached["Zanclus imaginatus"], "Common imaginatus")
+
+    def test_primary_timeout_falls_back_within_budget(self):
+        self.fail_timeout = {"grok-4.7"}
+        response = self.post_photo()
+        body = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["meta"]["model"], "grok-4")
+        self.assertTrue(body["meta"]["fallback_used"])
+        self.assertEqual([item["model"] for item in body["meta"]["attempts"]], ["grok-4.7", "grok-4"])
+        self.assertFalse(body["meta"]["attempts"][0]["ok"])
+        self.assertEqual(body["meta"]["attempts"][0]["error"], "timeout")
+        self.assertTrue(body["meta"]["attempts"][1]["ok"])
+        self.assertGreaterEqual(self.captured["calls"][0]["timeout"], 70)
+        self.assertLessEqual(self.captured["calls"][1]["timeout"], 25)
+        self.assertIn("Cortez Rainbow Wrasse", body["result_text"])
+
+    def test_both_models_timing_out_stays_json(self):
+        self.fail_timeout = {"grok-4.7", "grok-4"}
+        response = self.post_photo()
+        self.assertEqual(response.status_code, 504)
+        body = response.get_json()
+        self.assertIn("taking too long", body["error"])
+        self.assertTrue(body["meta"]["fallback_used"])
+        self.assertEqual(len(body["meta"]["attempts"]), 2)
+
+    def test_client_error_does_not_fall_back(self):
+        self.fail_status = {"grok-4.7": 400}
+        response = self.post_photo()
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(len(self.captured["calls"]), 1)
+        self.assertFalse(response.get_json()["meta"]["fallback_used"])
+        self.assertIn("try another", response.get_json()["error"])
+
+    def test_fallback_model_can_be_disabled(self):
+        os.environ["XAI_FALLBACK_MODEL"] = ""
+        self.fail_timeout = {"grok-4.7"}
+        try:
+            response = self.post_photo()
+        finally:
+            os.environ.pop("XAI_FALLBACK_MODEL", None)
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(len(self.captured["calls"]), 1)
+        self.assertFalse(response.get_json()["meta"]["fallback_used"])
+
+    def test_short_list_is_stable_and_incomplete_lists_are_not_cached(self):
+        query = finfindr_server.species_query_for(
+            finfindr_server._REGIONS_BY_ID["sea-of-cortez"], None, None
+        )
+        first = finfindr_server.load_species_list(query, "short", 5)
+        self.assertTrue(first["complete"])
+        calls = len(self.species_calls)
+        second = finfindr_server.load_species_list(query, "short", 5)
+        self.assertEqual(len(self.species_calls), calls)
+        self.assertEqual(
+            [item["scientific"] for item in first["species"]],
+            [item["scientific"] for item in second["species"]],
+        )
+
+        def flaky(url, params=None, **kwargs):
+            if int((params or {}).get("taxon_id") or 0) == 47178:
+                raise requests.ConnectionError("fish down")
+            return self.fake_get(url, params, **kwargs)
+
+        self.get_patch.stop()
+        finfindr_server._SPECIES_CACHE.clear()
+        finfindr_server._SPECIES_WAIT_RESULT.clear()
+        seen = {"n": 0}
+
+        def counting(url, params=None, **kwargs):
+            seen["n"] += 1
+            return flaky(url, params, **kwargs)
+
+        try:
+            with patch("finfindr_server.http.get", side_effect=counting):
+                partial = finfindr_server.load_species_list(query, "short", 5)
+                self.assertFalse(partial["complete"])
+                names = [item["scientific"] for item in partial["species"]]
+                self.assertNotIn("Thalassoma lucasanum", names)
+                self.assertIn("Hydrophis platurus", names)
+                self.assertIsNone(finfindr_server._species_cache_get(("short", "place:122897")))
+                before = seen["n"]
+                finfindr_server.load_species_list(query, "short", 5)
+                self.assertGreater(seen["n"], before)
+        finally:
+            self.get_patch.start()
 
     def test_prefetch_warms_short_lists_and_survives_errors(self):
         finfindr_server._SPECIES_CACHE.clear()
