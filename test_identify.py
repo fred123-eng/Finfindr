@@ -251,6 +251,9 @@ class IdentifyTests(unittest.TestCase):
         self.assertEqual(self.captured["json"]["model"], "grok-4.7")
         self.assertEqual(body["meta"]["model"], "grok-4.7")
         self.assertEqual(body["meta"]["image_px"], "80x60")
+        self.assertEqual(body["certainty"], "likely")
+        self.assertFalse(body["meta"]["verify_used"])
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Thalassoma lucasanum")
         self.assertEqual(body["region_label"], "Sea of Cortez / La Paz")
         self.assertIn("Cortez Rainbow Wrasse", body["result_text"])
         self.assertNotIn("Wrong", body["result_text"])
@@ -349,10 +352,12 @@ class IdentifyTests(unittest.TestCase):
         )
         self.assertEqual(response.get_json()["region_label"], "Sea of Cortez / La Paz")
         prompt = self.prompt()
-        self.assertIn("outside this region", prompt)
+        self.assertIn("outside the selected region", prompt)
+        self.assertIn("coordinates as the place", prompt)
         self.assertIn("Cirrhitus rivulatus", prompt)
-        located = next(call for call in self.species_calls if call.get("place_id"))
-        self.assertEqual(located["place_id"], 122897)
+        located = next(call for call in self.species_calls if "radius" in call)
+        self.assertAlmostEqual(float(located["lat"]), 21.3, places=1)
+        self.assertAlmostEqual(float(located["lng"]), -157.8, places=1)
 
     def test_inaturalist_failure_falls_back_without_blocking_identification(self):
         self.get_patch.stop()
@@ -650,6 +655,76 @@ class IdentifyTests(unittest.TestCase):
         finally:
             os.environ["FINFINDR_PREFETCH"] = "0"
             finfindr_server._prefetch_pid = None
+
+    def test_candidates_and_verification_toggle(self):
+        text = (
+            "Common name: Cortez damselfish\n"
+            "Scientific name: Stegastes rectifraenum\n"
+            "Confidence: high\n"
+            "Candidate 1: Stegastes rectifraenum | Cortez damselfish | high | yellow tail on a dark body\n"
+            "Candidate 2: Microspathodon dorsalis | Giant damselfish | medium | taller body and a bump on the forehead\n"
+        )
+        candidates = finfindr_server.parse_model_candidates(text)
+        self.assertEqual(candidates[0]["scientific_name"], "Stegastes rectifraenum")
+        self.assertEqual(candidates[1]["scientific_name"], "Microspathodon dorsalis")
+        self.assertEqual(finfindr_server.certainty_for(candidates, None), "likely")
+        unsure = finfindr_server._parse_verification("Decision: UNSURE\nCertainty: unsure\nTrait: the tail is hidden", candidates)
+        self.assertEqual(finfindr_server.certainty_for(candidates, unsure), "unsure")
+        agreed = finfindr_server._parse_verification(
+            "Decision: Microspathodon dorsalis\nCertainty: confident\nTrait: bump on the forehead",
+            candidates,
+        )
+        self.assertEqual(finfindr_server.certainty_for(candidates, agreed), "confident")
+        self.assertTrue(finfindr_server.verification_enabled(False, None))
+        self.assertFalse(finfindr_server.verification_enabled(True, "0"))
+        os.environ["FINFINDR_VERIFY"] = "0"
+        try:
+            self.assertFalse(finfindr_server.verification_enabled(False, "1"))
+            self.assertTrue(finfindr_server.verification_enabled(True, "1"))
+        finally:
+            os.environ.pop("FINFINDR_VERIFY", None)
+
+    def test_reference_photos_skip_the_same_observation(self):
+        def fake_get(url, params=None, **kwargs):
+            if url.endswith("/taxa"):
+                return FakeResponse({"results": [{
+                    "id": 9,
+                    "name": "Sphoeroides annulatus",
+                    "rank": "species",
+                    "default_photo": {
+                        "id": 1,
+                        "url": "https://inaturalist-open-data.s3.amazonaws.com/photos/1/square.jpg",
+                        "attribution": "Sam Example",
+                        "license_code": "cc-by",
+                        "observation_id": 50,
+                    },
+                }]})
+            return FakeResponse({"results": [{
+                "id": 50,
+                "photos": [{
+                    "id": 1,
+                    "url": "https://inaturalist-open-data.s3.amazonaws.com/photos/1/square.jpg",
+                    "attribution": "Sam Example",
+                    "license_code": "cc-by",
+                }],
+            }, {
+                "id": 77,
+                "photos": [{
+                    "id": 2,
+                    "url": "https://static.inaturalist.org/photos/2/square.jpg",
+                    "attribution": "Alex Example",
+                    "license_code": "cc-by-nc",
+                }],
+            }]})
+
+        finfindr_server._PHOTO_CACHE.clear()
+        with patch("finfindr_server.http.get", side_effect=fake_get):
+            photos = finfindr_server.fetch_reference_photos("Sphoeroides annulatus", 24.1, -110.3, "50")
+        self.assertTrue(photos)
+        self.assertEqual(photos[0]["attribution"], "Alex Example")
+        self.assertIn("medium.jpg", photos[0]["url"])
+        self.assertEqual(photos[0]["license"], "CC BY-NC")
+        self.assertTrue(photos[0]["source_url"].startswith("https://www.inaturalist.org/photos/"))
 
     def test_missing_api_key_is_json(self):
         os.environ.pop("XAI_API_KEY", None)
