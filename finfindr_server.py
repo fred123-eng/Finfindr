@@ -68,6 +68,22 @@ HTML = """
   .test-options[hidden] { display: none; }
   .test-options summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; }
   .region-line { margin: 0.15rem 0 0.45rem; color: var(--aqua); font-weight: 600; overflow-wrap: anywhere; }
+  .candidates { display: flex; flex-direction: column; gap: 0.75rem; margin-top: 0.75rem; }
+  .candidate { border: 1px solid rgba(255,255,255,0.16); border-radius: 12px; overflow: hidden; background: rgba(0,0,0,0.22); }
+  .candidate img { width: 100%; max-height: 180px; object-fit: cover; display: block; background: rgba(0,0,0,0.25); }
+  .candidate .cap { padding: 0.65rem 0.75rem 0.8rem; }
+  .candidate h4 { font-size: 1.05rem; margin-bottom: 0.15rem; }
+  .candidate .attr { margin-top: 0.45rem; font-size: 0.75rem; opacity: 0.8; overflow-wrap: anywhere; }
+  .candidate a { color: var(--aqua); }
+  .unsure-title { color: #fde68a; }
+  .candidates { display: flex; flex-direction: column; gap: 0.75rem; margin-top: 0.75rem; }
+  .candidate { border: 1px solid rgba(255,255,255,0.16); border-radius: 12px; overflow: hidden; background: rgba(0,0,0,0.22); }
+  .candidate img { width: 100%; max-height: 180px; object-fit: cover; display: block; background: rgba(0,0,0,0.25); }
+  .candidate .cap { padding: 0.65rem 0.75rem 0.8rem; }
+  .candidate h4 { font-size: 1.05rem; margin-bottom: 0.15rem; }
+  .candidate .attr { margin-top: 0.45rem; font-size: 0.75rem; opacity: 0.8; overflow-wrap: anywhere; }
+  .candidate a { color: var(--aqua); }
+  .unsure-title { color: #fde68a; }
   #fileInput { display: block; width: 100%; max-width: 100%; margin: 1rem auto; font-size: 1rem; color: var(--white); }
   #results { max-width: 800px; margin: 0 auto; }
   .result-card { background: rgba(0,0,0,0.35); border-radius: 16px; margin-bottom: 1.25rem; border: 1px solid rgba(255,255,255,0.1); overflow: hidden; }
@@ -135,6 +151,12 @@ HTML = """
     </select>
     <label for="modelInput">Model</label>
     <input id="modelInput" type="text" placeholder="Server default" autocomplete="off" spellcheck="false">
+    <label for="verifySelect">Reference check</label>
+    <select id="verifySelect">
+      <option value="">Server default</option>
+      <option value="1">On</option>
+      <option value="0">Off</option>
+    </select>
   </details>
 </div>
 
@@ -160,6 +182,7 @@ const dropHint = document.getElementById("dropHint");
 const regionSelect = document.getElementById("regionSelect");
 const speciesListSelect = document.getElementById("speciesListSelect");
 const modelInput = document.getElementById("modelInput");
+const verifySelect = document.getElementById("verifySelect");
 const locationStatus = document.getElementById("locationStatus");
 const MIN_DIMENSION = 32;
 const MAX_BYTES = 20 * 1024 * 1024;
@@ -267,6 +290,84 @@ speciesListSelect.addEventListener("change", function () {
 });
 
 restoreRegionChoice();
+
+function safeHttpUrl(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:") return "";
+    const host = parsed.hostname;
+    const allowed = host === "inaturalist.org" || host.endsWith(".inaturalist.org")
+      || host === "inaturalist-open-data.s3.amazonaws.com"
+      || host.endsWith(".amazonaws.com");
+    return allowed ? parsed.href : "";
+  } catch (err) {
+    return "";
+  }
+}
+
+function showCandidates(card, candidates) {
+  const list = document.createElement("div");
+  list.className = "candidates";
+  candidates.slice(0, 3).forEach(function (item) {
+    const block = document.createElement("article");
+    block.className = "candidate";
+    const photo = item.reference_photo || {};
+    const imgUrl = safeHttpUrl(photo.url || "");
+    if (imgUrl) {
+      const img = document.createElement("img");
+      img.src = imgUrl;
+      img.alt = "Reference photo of " + (item.common_name || item.scientific_name || "a candidate");
+      block.appendChild(img);
+    }
+    const cap = document.createElement("div");
+    cap.className = "cap";
+    const title = document.createElement("h4");
+    title.textContent = item.common_name || item.scientific_name || "Candidate";
+    cap.appendChild(title);
+    if (item.scientific_name) {
+      const sci = document.createElement("div");
+      sci.className = "sci";
+      sci.setAttribute("translate", "no");
+      sci.textContent = item.scientific_name;
+      cap.appendChild(sci);
+    }
+    if (item.confidence) {
+      const conf = document.createElement("div");
+      conf.className = "confidence";
+      conf.textContent = item.confidence + " confidence";
+      cap.appendChild(conf);
+    }
+    if (item.trait) {
+      const trait = document.createElement("div");
+      trait.style.marginTop = "0.35rem";
+      trait.textContent = "What to check: " + item.trait;
+      cap.appendChild(trait);
+    }
+    if (photo.attribution || photo.license || photo.source_url) {
+      const attr = document.createElement("div");
+      attr.className = "attr";
+      const link = safeHttpUrl(photo.source_url || "");
+      if (link) {
+        const a = document.createElement("a");
+        a.href = link;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.textContent = photo.attribution || "iNaturalist photo";
+        attr.appendChild(a);
+      } else {
+        attr.textContent = photo.attribution || "Reference photo";
+      }
+      if (photo.license) {
+        attr.appendChild(document.createTextNode(" · " + photo.license));
+      }
+      attr.appendChild(document.createTextNode(" · iNaturalist"));
+      cap.appendChild(attr);
+    }
+    block.appendChild(cap);
+    list.appendChild(block);
+  });
+  card.querySelector(".result-body").appendChild(list);
+}
 
 function showRegion(card, label) {
   if (!label) return;
@@ -510,6 +611,9 @@ async function handleFile(file) {
       formData.append("debug", "1");
       const modelName = modelInput.value.trim();
       if (modelName) formData.append("model", modelName);
+      if (verifySelect && (verifySelect.value === "0" || verifySelect.value === "1")) {
+        formData.append("verify", verifySelect.value);
+      }
     }
 
     const resp = await fetch("/identify", { method: "POST", body: formData });
@@ -562,6 +666,17 @@ async function handleFile(file) {
       card.querySelector(".result-body").appendChild(n);
     }
     if (!common && !scientific) card.querySelector(".sci").textContent = text;
+
+    const uncertain = data.certainty === "likely" || data.certainty === "unsure";
+    if (uncertain && data.candidates && data.candidates.length) {
+      card.querySelector("h3").textContent = data.certainty === "unsure" ? "Not sure yet" : "Likely — check these";
+      card.querySelector("h3").classList.add("unsure-title");
+      const sciWrapEarly = card.querySelector(".scientific");
+      if (sciWrapEarly) sciWrapEarly.hidden = true;
+      const conf = card.querySelector(".confidence");
+      if (conf) conf.textContent = "";
+      showCandidates(card, data.candidates);
+    }
 
     const sciWrap = card.querySelector(".scientific");
     const sciLabel = card.querySelector(".sci-label");
@@ -1206,20 +1321,22 @@ def cortez_lookalikes_apply(region, lat, lng):
     return _point_in_bbox(lat, lng, swlat, swlng, nelat, nelng)
 
 
-def species_query_for(region, lat, lng):
-    if region["id"] in ("other", "my-location"):
-        if lat is None or lng is None:
-            return None
+def species_query_for(region, lat, lng, radius=None):
+    """Coordinates drive the species list anywhere. Presets are the fallback."""
+    if lat is not None and lng is not None:
+        distance = int(radius or LOCATION_RADIUS_KM)
         lat_r = round(float(lat), 1)
         lng_r = round(float(lng), 1)
         match = region_matching_point(lat, lng)
         return {
-            "key": f"pt:{lat_r:.1f}:{lng_r:.1f}:{LOCATION_RADIUS_KM}",
+            "key": f"pt:{lat_r:.1f}:{lng_r:.1f}:{distance}",
             "lat": lat_r,
             "lng": lng_r,
-            "radius": LOCATION_RADIUS_KM,
+            "radius": distance,
             "curated_fallback": bool(match and match.get("curated_fallback")),
         }
+    if region["id"] in ("other", "my-location"):
+        return None
     if region.get("place_id"):
         return {
             "key": f"place:{region['place_id']}",
@@ -1290,8 +1407,8 @@ def locality_text(region, lat, lng, coord_source):
             text += f". {source} is {lat:.4f}, {lng:.4f}, inside this region"
         else:
             text += (
-                f". {source} is {lat:.4f}, {lng:.4f}, which is outside this region. "
-                "Treat the selected region as the locality"
+                f". {source} is {lat:.4f}, {lng:.4f}, which is outside the selected region. "
+                "Use the coordinates as the place the animal was seen"
             )
     return text
 
@@ -1454,7 +1571,10 @@ def assemble_prompt(locality, species, lookalikes, lat, lng):
         "Alternative group considered: <other possible group or none>",
         "Confidence: <high / medium / low>",
         "Notes: <one cool fact about the species>",
-        "If still unsure, list the closest alternatives.",
+        "Candidate 1: <scientific name> | <common name> | <high/medium/low> | <one trait that separates it from the next candidate>",
+        "Candidate 2: <scientific name> | <common name> | <high/medium/low> | <one trait>",
+        "Candidate 3: <scientific name or none> | <common name> | <high/medium/low> | <one trait>",
+        "List the best supported species first. Include a look-alike when one is plausible. Use none only when you have no second species.",
     ])
     return NL.join(lines)
 
@@ -1903,21 +2023,18 @@ def resolve_model(raw=None, debug=False):
     return DEFAULT_XAI_MODEL
 
 
-def _vision_payload(jpeg_bytes, prompt, model):
+def _vision_payload(jpeg_bytes, prompt, model, extra_images=None):
     b64 = base64.b64encode(jpeg_bytes).decode("ascii")
     data_url = f"data:image/jpeg;base64,{b64}"
+    content = [{"type": "input_image", "image_url": data_url, "detail": "high"}]
+    for image_url in extra_images or []:
+        if image_url:
+            content.append({"type": "input_image", "image_url": image_url, "detail": "high"})
+    content.append({"type": "input_text", "text": prompt})
     return {
         "model": model,
         "temperature": XAI_TEMPERATURE,
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_image", "image_url": data_url, "detail": "high"},
-                    {"type": "input_text", "text": prompt},
-                ],
-            }
-        ],
+        "input": [{"role": "user", "content": content}],
     }
 
 
@@ -1973,7 +2090,7 @@ def resolve_fallback_model(primary):
     return raw
 
 
-def _identification_meta(mode, sent, available, truncated, source, list_ms, model_ms, tokens, token_source, model, image_px, fallback_used=False, attempts=None):
+def _identification_meta(mode, sent, available, truncated, source, list_ms, model_ms, tokens, token_source, model, image_px, fallback_used=False, attempts=None, verify_used=False, verify_ms=0, reference_fetch_ms=0):
     return {
         "species_list_mode": mode,
         "species_sent": sent,
@@ -1988,6 +2105,9 @@ def _identification_meta(mode, sent, available, truncated, source, list_ms, mode
         "image_px": image_px,
         "fallback_used": bool(fallback_used),
         "attempts": attempts or [],
+        "verify_used": bool(verify_used),
+        "verify_ms": int(verify_ms),
+        "reference_fetch_ms": int(reference_fetch_ms),
     }
 
 
@@ -2020,10 +2140,10 @@ def _attempt_record(model, elapsed_ms, ok, error=None):
     return record
 
 
-def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key):
+def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key, extra_images=None):
     """One model attempt. Retryable covers timeout, connection loss, and HTTP 5xx."""
     started = time.perf_counter()
-    payload = _vision_payload(jpeg_bytes, prompt, model)
+    payload = _vision_payload(jpeg_bytes, prompt, model, extra_images)
     try:
         resp = http.post(
             "https://api.x.ai/v1/responses",
@@ -2054,7 +2174,7 @@ def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key):
     return {"ok": True, "retryable": False, "model": model, "ms": elapsed, "data": data, "status": 200}
 
 
-def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started):
+def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, extra_reserve=0, extra_images=None):
     """Primary model gets most of the budget. One faster fallback uses what is left.
 
     Wall time stays under FINFINDR_TIME_BUDGET (default 110s) so a 120s worker
@@ -2069,10 +2189,11 @@ def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started):
     def remaining():
         return deadline - time.monotonic()
 
-    primary_timeout = min(primary_cap, max(1.0, remaining() - 15.0))
-    if remaining() < 8:
+    reserve = 15.0 + max(0.0, extra_reserve)
+    primary_timeout = min(primary_cap, max(1.0, remaining() - reserve))
+    if remaining() < reserve + 5:
         primary_timeout = max(1.0, remaining() - 1.0)
-    result = _call_vision_model(jpeg_bytes, prompt, model, primary_timeout, api_key)
+    result = _call_vision_model(jpeg_bytes, prompt, model, primary_timeout, api_key, extra_images)
     attempts.append(_attempt_record(model, result["ms"], result["ok"], None if result["ok"] else result.get("error")))
     if result["ok"] or not result["retryable"]:
         return result, attempts
@@ -2081,10 +2202,349 @@ def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started):
     left = remaining()
     if fallback and left >= 5:
         result = _call_vision_model(
-            jpeg_bytes, prompt, fallback, min(fallback_cap, left - 1.0), api_key
+            jpeg_bytes, prompt, fallback, min(fallback_cap, left - 1.0), api_key, extra_images
         )
         attempts.append(_attempt_record(fallback, result["ms"], result["ok"], None if result["ok"] else result.get("error")))
     return result, attempts
+
+
+_CANDIDATE_LINE = re.compile(r"^candidate\s*\d+\s*:\s*(.+)$", re.IGNORECASE)
+_PHOTO_CACHE = {}
+_PHOTO_LOCK = threading.Lock()
+_TAXA_URL = "https://api.inaturalist.org/v1/taxa"
+_OBS_URL = "https://api.inaturalist.org/v1/observations"
+SPARSE_SPECIES_MIN = 12
+WIDE_RADIUS_KM = 400
+
+
+def verification_enabled(debug, raw):
+    """On by default. A debug verify=0/1 field overrides FINFINDR_VERIFY."""
+    if debug and (raw or "").strip() in ("0", "1"):
+        return raw.strip() == "1"
+    flag = (os.environ.get("FINFINDR_VERIFY", "1") or "1").strip().lower()
+    return flag not in ("0", "false", "off", "no")
+
+
+def _time_left(request_started):
+    budget = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
+    return request_started + budget - time.monotonic()
+
+
+def load_species_for_request(region, lat, lng, mode):
+    """Use coordinates worldwide. Widen the radius once when the local list is sparse."""
+    query = species_query_for(region, lat, lng)
+    budget = 4.0 if mode == "short" else 12.0
+    payload = load_species_list(query, mode, budget)
+    if not query or not query.get("radius"):
+        return payload
+    count = len(payload.get("species") or [])
+    if count >= SPARSE_SPECIES_MIN or query["radius"] >= WIDE_RADIUS_KM:
+        return payload
+    wider = species_query_for(region, lat, lng, radius=WIDE_RADIUS_KM)
+    wider_payload = load_species_list(wider, mode, 3.0 if mode == "short" else 6.0)
+    if len(wider_payload.get("species") or []) > count:
+        return wider_payload
+    return payload
+
+
+def parse_model_candidates(text):
+    """Top species from the first pass. Falls back to the single named species."""
+    normalized = _result_lines(text or "")
+    found = []
+    seen = set()
+    for line in normalized.split("\n"):
+        match = _CANDIDATE_LINE.match(line.strip())
+        if not match:
+            continue
+        parts = [part.strip() for part in match.group(1).split("|")]
+        if not parts or parts[0].lower() in ("", "none"):
+            continue
+        scientific = exact_scientific_name(parts[0])
+        if not scientific or scientific.lower() in seen:
+            continue
+        confidence = parts[2].lower() if len(parts) > 2 else "medium"
+        if confidence not in ("high", "medium", "low"):
+            confidence = "medium"
+        found.append({
+            "scientific_name": scientific,
+            "common_name": parts[1] if len(parts) > 1 and parts[1].lower() != "none" else "",
+            "confidence": confidence,
+            "trait": parts[3] if len(parts) > 3 else "",
+            "reference_photo": None,
+        })
+        seen.add(scientific.lower())
+        if len(found) == 3:
+            break
+    if found:
+        return found
+    scientific = exact_scientific_name(_field_value(normalized, "Scientific name"))
+    if not scientific:
+        return []
+    confidence = _field_value(normalized, "Confidence").lower()
+    if confidence not in ("high", "medium", "low"):
+        confidence = "medium"
+    return [{
+        "scientific_name": scientific,
+        "common_name": _field_value(normalized, "Common name"),
+        "confidence": confidence,
+        "trait": "",
+        "reference_photo": None,
+    }]
+
+
+def _medium_photo_url(url):
+    if not url or not isinstance(url, str):
+        return ""
+    return (
+        url.replace("/square.", "/medium.")
+        .replace("/square.jpg", "/medium.jpg")
+        .replace("/large.", "/medium.")
+    )
+
+
+def _photo_record(photo, observation_id=None):
+    if not isinstance(photo, dict):
+        return None
+    url = _medium_photo_url(photo.get("url") or photo.get("medium_url") or "")
+    if not url.startswith("https://"):
+        return None
+    attribution = (photo.get("attribution") or "").strip()
+    license_code = (photo.get("license_code") or "").strip()
+    license_name = license_code.upper().replace("CC-", "CC ") if license_code else ""
+    photo_id = photo.get("id")
+    source = f"https://www.inaturalist.org/photos/{photo_id}" if photo_id else "https://www.inaturalist.org"
+    return {
+        "url": url,
+        "attribution": attribution or "iNaturalist contributor",
+        "license": license_name,
+        "source_url": source,
+        "observation_id": observation_id or photo.get("observation_id") or photo.get("native_photo_id"),
+    }
+
+
+def _cache_photos(key, photos, ttl):
+    with _PHOTO_LOCK:
+        if len(_PHOTO_CACHE) > 256:
+            _PHOTO_CACHE.clear()
+        _PHOTO_CACHE[key] = (time.monotonic() + ttl, photos)
+
+
+def _cached_photos(key):
+    now = time.monotonic()
+    with _PHOTO_LOCK:
+        hit = _PHOTO_CACHE.get(key)
+        if not hit or hit[0] <= now:
+            _PHOTO_CACHE.pop(key, None)
+            return None
+        return hit[1]
+
+
+def _inat_json(url, params, timeout):
+    try:
+        resp = http.get(
+            url,
+            params=params,
+            headers={
+                "User-Agent": "FinFindr/1.0 (reference photo lookup; https://github.com/fred123-eng/Finfindr)",
+                "Accept": "application/json",
+            },
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def fetch_reference_photos(scientific, lat, lng, exclude_observation_id=None, deadline=None):
+    """Research-grade reference photos for one species, preferring the user's area."""
+    if deadline is not None and time.monotonic() >= deadline:
+        return []
+    rounded = ""
+    if lat is not None and lng is not None:
+        rounded = f":{round(float(lat), 1):.1f}:{round(float(lng), 1):.1f}"
+    key = f"ref:{scientific.lower()}{rounded}:{exclude_observation_id or ''}"
+    cached = _cached_photos(key)
+    if cached is not None:
+        return cached
+    taxon_payload = _inat_json(
+        _TAXA_URL,
+        {"q": scientific, "rank": "species", "per_page": 5, "locale": "en"},
+        (1.0, 2.0),
+    )
+    taxon = None
+    for item in (taxon_payload or {}).get("results") or []:
+        if (
+            isinstance(item, dict)
+            and item.get("rank") in _SPECIES_RANKS
+            and (item.get("name") or "").lower() == scientific.lower()
+        ):
+            taxon = item
+            break
+    photos = []
+    if taxon:
+        for wrapper in taxon.get("taxon_photos") or []:
+            photo = wrapper.get("photo") if isinstance(wrapper, dict) else None
+            record = _photo_record(photo)
+            if record and isinstance(wrapper, dict) and wrapper.get("observation_id"):
+                record["observation_id"] = wrapper.get("observation_id")
+            if record:
+                photos.append(record)
+        if not photos:
+            record = _photo_record(taxon.get("default_photo"))
+            if record:
+                photos.append(record)
+        if lat is not None and lng is not None and (deadline is None or time.monotonic() < deadline):
+            obs_payload = _inat_json(
+                _OBS_URL,
+                {
+                    "taxon_id": taxon.get("id"),
+                    "quality_grade": "research",
+                    "photos": "true",
+                    "lat": lat,
+                    "lng": lng,
+                    "radius": 100,
+                    "per_page": 5,
+                    "order_by": "votes",
+                    "locale": "en",
+                },
+                (1.0, 2.0),
+            )
+            nearby = []
+            for obs in (obs_payload or {}).get("results") or []:
+                if not isinstance(obs, dict):
+                    continue
+                if exclude_observation_id and str(obs.get("id")) == str(exclude_observation_id):
+                    continue
+                for photo in obs.get("photos") or []:
+                    record = _photo_record(photo, obs.get("id"))
+                    if record and str(record.get("observation_id")) != str(exclude_observation_id or ""):
+                        nearby.append(record)
+                        break
+            if nearby:
+                photos = nearby + [photo for photo in photos if photo["url"] not in {item["url"] for item in nearby}]
+    if exclude_observation_id:
+        photos = [photo for photo in photos if str(photo.get("observation_id") or "") != str(exclude_observation_id)]
+    photos = photos[:2]
+    _cache_photos(key, photos, INAT_CACHE_TTL if photos else INAT_ERROR_TTL)
+    return photos
+
+
+def _attach_reference_photos(candidates, lat, lng, exclude_observation_id, deadline):
+    def one(candidate):
+        if deadline is not None and time.monotonic() >= deadline:
+            return candidate
+        photos = fetch_reference_photos(
+            candidate["scientific_name"], lat, lng, exclude_observation_id, deadline
+        )
+        if photos:
+            candidate["reference_photo"] = photos[0]
+            candidate["_reference_urls"] = [photo["url"] for photo in photos[:1]]
+        return candidate
+
+    if not candidates:
+        return candidates
+    with ThreadPoolExecutor(max_workers=min(3, len(candidates))) as pool:
+        return list(pool.map(one, candidates))
+
+
+def _verification_prompt(candidates):
+    lines = [
+        "The first image is the animal to identify.",
+        "Each later image is a research-grade reference photo of one candidate. Compare diagnostic traits you can see. Do not pick a candidate just because it was listed first.",
+        "If the photos do not separate the candidates, say you cannot decide.",
+        "",
+    ]
+    for index, candidate in enumerate(candidates, start=1):
+        photo = candidate.get("reference_photo") or {}
+        credit = photo.get("attribution") or "iNaturalist"
+        lines.append(
+            f"Reference {index}: {candidate['scientific_name']} ({candidate.get('common_name') or 'no common name'}). "
+            f"Photo: {credit}, {photo.get('license') or 'see iNaturalist'}."
+        )
+        if candidate.get("trait"):
+            lines.append(f"Trait already suggested: {candidate['trait']}")
+    lines.extend([
+        "",
+        "Reply in this exact format:",
+        "Decision: <scientific name of the matching candidate, or UNSURE>",
+        "Certainty: <confident / likely / unsure>",
+        "Trait: <the visible trait that separates the choice, or what is missing>",
+    ])
+    return "\n".join(lines)
+
+
+def _parse_verification(text, candidates):
+    normalized = _result_lines(text or "")
+    decision = _field_value(normalized, "Decision")
+    certainty = _field_value(normalized, "Certainty").lower()
+    trait = _field_value(normalized, "Trait")
+    if certainty not in ("confident", "likely", "unsure"):
+        certainty = "unsure"
+    if not decision or decision.upper() == "UNSURE":
+        return {"decision": "UNSURE", "certainty": "unsure", "trait": trait, "scientific_name": ""}
+    scientific = exact_scientific_name(decision)
+    if not scientific:
+        return {"decision": "UNSURE", "certainty": "unsure", "trait": trait, "scientific_name": ""}
+    known = {item["scientific_name"].lower() for item in candidates}
+    if scientific.lower() not in known:
+        return {"decision": "UNSURE", "certainty": "unsure", "trait": trait, "scientific_name": scientific}
+    return {"decision": scientific, "certainty": certainty, "trait": trait, "scientific_name": scientific}
+
+
+def _order_candidates(candidates, scientific):
+    if not scientific:
+        return candidates
+    ordered = [item for item in candidates if item["scientific_name"].lower() == scientific.lower()]
+    ordered.extend(item for item in candidates if item["scientific_name"].lower() != scientific.lower())
+    return ordered
+
+
+def certainty_for(candidates, verification):
+    """Confident only after reference photos agree. Otherwise say so."""
+    if not candidates:
+        return "unsure"
+    if verification is None:
+        return "unsure" if candidates[0].get("confidence") == "low" else "likely"
+    if verification.get("decision") == "UNSURE" or verification.get("certainty") == "unsure":
+        return "unsure"
+    if verification.get("certainty") == "confident":
+        return "confident"
+    return "likely"
+
+
+def public_candidates(candidates, species):
+    cleaned = []
+    for item in candidates[:3]:
+        common = standard_common_name(item["scientific_name"], species) or item.get("common_name") or ""
+        photo = item.get("reference_photo") or None
+        if photo:
+            photo = {
+                "url": photo.get("url") or "",
+                "attribution": photo.get("attribution") or "",
+                "license": photo.get("license") or "",
+                "source_url": photo.get("source_url") or "",
+            }
+        cleaned.append({
+            "scientific_name": item["scientific_name"],
+            "common_name": common,
+            "confidence": item.get("confidence") or "medium",
+            "trait": item.get("trait") or "",
+            "reference_photo": photo,
+        })
+    return cleaned
+
+
+def _result_text_for(candidate, group, alt, notes, confidence):
+    return "\n".join([
+        f"Common name: {candidate.get('common_name') or ''}",
+        f"Scientific name: {candidate['scientific_name']}",
+        f"Group: {group}",
+        f"Alternative group considered: {alt or 'none'}",
+        f"Confidence: {confidence}",
+        f"Notes: {notes}",
+    ])
 
 
 @app.route("/")
@@ -2117,6 +2577,8 @@ def identify():
     mode = resolve_species_mode(request.form.get("species_list"))
     debug = (request.form.get("debug") or "").strip() == "1"
     model = resolve_model(request.form.get("model"), debug=debug)
+    verify = verification_enabled(debug, request.form.get("verify"))
+    exclude_observation = (request.form.get("exclude_observation_id") or "").strip()
 
     xai_key = os.environ.get("XAI_API_KEY")
     if not xai_key:
@@ -2128,11 +2590,7 @@ def identify():
 
     request_started = time.monotonic()
     started = time.perf_counter()
-    species_payload = load_species_list(
-        species_query_for(region, lat, lng),
-        mode,
-        4.0 if mode == "short" else 12.0,
-    )
+    species_payload = load_species_for_request(region, lat, lng, mode)
     list_fetch_ms = int(round((time.perf_counter() - started) * 1000))
     species = species_payload.get("species") or []
     locality = locality_text(region, lat, lng, coord_source)
@@ -2152,7 +2610,9 @@ def identify():
     truncated = prompt_trimmed or (mode == "full" and not species_payload.get("complete"))
     source = species_payload.get("source") or "none"
 
-    result, attempts = _run_model_attempts(jpeg_bytes, prompt, model, xai_key, request_started)
+    result, attempts = _run_model_attempts(
+        jpeg_bytes, prompt, model, xai_key, request_started, extra_reserve=20 if verify else 0
+    )
     model_ms = sum(item["ms"] for item in attempts)
     answered = result.get("model") or model
     fallback_used = any(item["model"] != model for item in attempts)
@@ -2175,15 +2635,63 @@ def identify():
 
     data = result["data"]
     tokens, token_source = _prompt_tokens(data, prompt)
+    text = apply_standard_names(_extract_text(data), species)
+    candidates = parse_model_candidates(text)
+    verify_used = False
+    verify_ms = 0
+    reference_fetch_ms = 0
+    verification = None
+    if verify and candidates and _time_left(request_started) >= 12:
+        fetch_started = time.perf_counter()
+        candidates = _attach_reference_photos(
+            candidates, lat, lng, exclude_observation, request_started + _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115) - 8
+        )
+        reference_fetch_ms = int(round((time.perf_counter() - fetch_started) * 1000))
+        reference_urls = []
+        for candidate in candidates:
+            reference_urls.extend(candidate.get("_reference_urls") or [])
+        if reference_urls and _time_left(request_started) >= 8:
+            verify_started = time.perf_counter()
+            verify_result = _call_vision_model(
+                jpeg_bytes,
+                _verification_prompt(candidates),
+                answered,
+                min(20.0, max(5.0, _time_left(request_started) - 2.0)),
+                xai_key,
+                reference_urls[:3],
+            )
+            verify_ms = int(round((time.perf_counter() - verify_started) * 1000))
+            if verify_result.get("ok"):
+                verify_used = True
+                verification = _parse_verification(_extract_text(verify_result["data"]), candidates)
+                if verification.get("trait"):
+                    for candidate in candidates:
+                        if candidate["scientific_name"].lower() == (verification.get("scientific_name") or "").lower():
+                            candidate["trait"] = verification["trait"]
+                if verification.get("decision") not in ("", "UNSURE"):
+                    candidates = _order_candidates(candidates, verification["scientific_name"])
+                    group = _field_value(text, "Group")
+                    alt = _field_value(text, "Alternative group considered")
+                    notes = _field_value(text, "Notes")
+                    text = apply_standard_names(
+                        _result_text_for(candidates[0], group, alt, notes, candidates[0].get("confidence") or "medium"),
+                        species,
+                    )
+    for candidate in candidates:
+        candidate.pop("_reference_urls", None)
+    certainty = certainty_for(candidates, verification)
+    shown = public_candidates(candidates, species)
     meta = _identification_meta(
         mode, sent, available, truncated, source, list_fetch_ms, model_ms,
         tokens, token_source, answered, image_px, fallback_used, attempts,
+        verify_used, verify_ms, reference_fetch_ms,
     )
     _log_identification(region["id"], meta)
-    text = apply_standard_names(_extract_text(data), species)
     return jsonify({
         "result_text": text or "No response",
         "region_label": region_label,
+        "certainty": certainty,
+        "candidates": shown,
         "meta": meta,
     })
 
