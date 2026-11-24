@@ -3074,14 +3074,45 @@ def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key, extra_images
     return result
 
 
-def model_call_timeout():
-    """Seconds each model is allowed. Both grok-4 and grok-4.7 get this. Default 180."""
-    return _env_seconds("XAI_MODEL_TIMEOUT", 180, 30, 240)
+# Primary identification call budgets, in seconds.
+# Measured on the d17345a score-v1 baseline, first attempt per model only
+# (the 16s off-list follow-up is a separate cap and is not included here):
+#   grok-4:   n=220, p90=19.8s, max=30.5s, 0 timeouts  -> default 90s
+#   grok-4.7: n=220, p90=92.7s, successful max=178.6s, 1 timeout at the
+#             previous 180s cap (180.1s). That cap was censored.
+#             -> default 210s (about 30s above the highest successful call).
+# A 300s job wall leaves room for the 60s reference check after a long 4.7 call.
+DEFAULT_MODEL_TIMEOUTS_S = {
+    "grok-4": 90.0,
+    "grok-4.7": 210.0,
+}
+DEFAULT_MODEL_TIMEOUT_S = 210.0  # unknown models: slow-primary budget
+DEFAULT_JOB_WALL_S = 300.0
+
+
+def model_call_timeout(model=None):
+    """Seconds for one primary identification call.
+
+    grok-4 defaults to 90s and grok-4.7 to 210s. If XAI_MODEL_TIMEOUT is
+    set, that single value (clamped 30-300) applies to every model.
+    XAI_MODEL_TIMEOUT_GROK_4 and XAI_MODEL_TIMEOUT_GROK_47 override one
+    model. The reference check uses verify_timeout_cap() (default 60s).
+    The off-list follow-up keeps its own 16s cap.
+    """
+    if (os.environ.get("XAI_MODEL_TIMEOUT") or "").strip():
+        return _env_seconds("XAI_MODEL_TIMEOUT", DEFAULT_MODEL_TIMEOUT_S, 30, 300)
+    if model == "grok-4":
+        return _env_seconds("XAI_MODEL_TIMEOUT_GROK_4", DEFAULT_MODEL_TIMEOUTS_S["grok-4"], 30, 300)
+    if model == "grok-4.7":
+        return _env_seconds("XAI_MODEL_TIMEOUT_GROK_47", DEFAULT_MODEL_TIMEOUTS_S["grok-4.7"], 30, 300)
+    if model in DEFAULT_MODEL_TIMEOUTS_S:
+        return DEFAULT_MODEL_TIMEOUTS_S[model]
+    return DEFAULT_MODEL_TIMEOUT_S
 
 
 def job_wall_seconds():
-    """Hard cap for one identification. Default 240s, above the measured 109s max."""
-    return _env_seconds("FINFINDR_JOB_WALL", 240, 60, 360)
+    """Hard cap for one identification. Default 300s (210s grok-4.7 + 60s verify + slack)."""
+    return _env_seconds("FINFINDR_JOB_WALL", DEFAULT_JOB_WALL_S, 60, 420)
 
 
 _JOB_ID = contextvars.ContextVar("finfindr_job_id", default=None)
@@ -3140,18 +3171,20 @@ def _run_paired_models(jpeg_bytes, prompt, models, api_key, request_started, use
     """Run every configured model to completion, then return.
 
     grok-4.7 is not abandoned because it is slower. The only time its answer
-    is missing is when that call errors or reaches the 180s client timeout.
+    is missing is when that call errors or reaches that model's call timeout
+    (default 210s for grok-4.7, 90s for grok-4).
     Reference photos for grok-4 start when grok-4 returns, without stopping 4.7.
     """
     del request_started
-    timeout = model_call_timeout()
     holder = {}
     threads = {}
     fast_name = "grok-4" if "grok-4" in models else ""
     job_progress("Asking both models")
 
     def launch(name):
-        def run(name=name):
+        timeout = model_call_timeout(name)
+
+        def run(name=name, timeout=timeout):
             holder[name] = _call_vision_model(
                 jpeg_bytes, prompt, name, timeout, api_key, use_cache=use_cache
             )
@@ -3166,7 +3199,7 @@ def _run_paired_models(jpeg_bytes, prompt, models, api_key, request_started, use
     for name in models:
         launch(name)
     for name in models:
-        threads[name].join(timeout + 1.0)
+        threads[name].join(model_call_timeout(name) + 1.0)
     reports = []
     attempts = []
     for name in models:
