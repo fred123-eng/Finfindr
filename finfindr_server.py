@@ -1933,12 +1933,15 @@ def assemble_prompt(locality, species, lookalikes, lat, lng):
         "Group: <group>",
         "Alternative group considered: <other possible group or none>",
         "Confidence: <high / medium / low>",
+        "high: a diagnostic trait is clearly visible and look-alikes are excluded.",
+        "medium: the photo is consistent with the species, but some look-alikes are not excluded.",
+        "low: the evidence is weak or only partly visible.",
         "Notes: <one cool fact about the species>",
         "Candidate 1: <scientific name> | <common name> | <high/medium/low> | <one trait that separates it from the next candidate>",
         "Candidate 2: <scientific name> | <common name> | <high/medium/low> | <one trait>",
         "Candidate 3: <scientific name or none> | <common name> | <high/medium/low> | <one trait>",
-        "Off-list 1: <scientific name or none> | <common name> | <trait that the regional list does not cover>",
-        "Off-list 2: <scientific name or none> | <common name> | <trait>",
+        "Off-list 1: <scientific name or none> | <common name> | <high/medium/low> | <trait that the regional list does not cover>",
+        "Off-list 2: <scientific name or none> | <common name> | <high/medium/low> | <trait>",
         "List the best supported species first. Include a look-alike when one is plausible. Use none only when you have no second species.",
         "When the visible animal matches a listed species, set both off-list lines to none.",
         "When it does not, name up to two real species that are not in the regional list. Do not invent a name.",
@@ -2856,12 +2859,6 @@ def configured_models(requested=None, debug=False):
     return models[:2] or ["grok-4", "grok-4.7"]
 
 
-def resolve_fallback_model(primary):
-    """Retired. The pair in XAI_MODELS replaces the fallback race."""
-    del primary
-    return None
-
-
 def _identification_meta(mode, sent, available, truncated, source, list_ms, model_ms, tokens, token_source, model, image_px, fallback_used=False, attempts=None, verify_used=False, verify_ms=0, reference_fetch_ms=0, total_ms=None, verify_skipped=""):
     return {
         "species_list_mode": mode,
@@ -3061,64 +3058,6 @@ def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key, extra_images
     return result
 
 
-def plan_model_timeouts(remaining, primary_cap, fallback_cap, verify_reserve, fallback_enabled):
-    """Give the primary model its full cap. Do not reserve a fallback up front.
-
-    verify_reserve is unused on purpose: the reference check is trimmed after
-    the primary call, and a fallback is started only after a real fast failure.
-    fallback_timeout is how long one could run if the primary failed immediately.
-    """
-    del verify_reserve, fallback_enabled
-    slack = 3.0
-    primary = min(float(primary_cap), max(0.0, float(remaining) - slack))
-    spare = max(0.0, float(remaining) - slack)
-    fallback_timeout = min(float(fallback_cap), spare) if spare >= 8.0 else 0.0
-    return max(0.0, primary), max(0.0, fallback_timeout)
-
-
-def should_fallback(result, remaining, fallback_cap):
-    """Fall back only after a connection error, 5xx, or an early timeout.
-
-    A timeout counts only when the fallback can still finish. A short clock is
-    not itself a reason to switch models.
-    """
-    if not isinstance(result, dict) or result.get("ok") or not result.get("retryable"):
-        return False
-    error = str(result.get("error") or "")
-    if remaining < 8.0:
-        return False
-    if error == "connection" or error == "invalid_json" or error.startswith("http_5"):
-        return True
-    if error == "timeout":
-        return remaining >= min(float(fallback_cap), 12.0) + 2.0
-    return False
-
-
-def answer_used_fallback(result, primary_model):
-    """True only when the answer we return came from the fallback model.
-
-    A parallel grok-4 row that lost to grok-4.7 is not a fallback. Treating it
-    as one was downgrading confident identifications to likely.
-    """
-    if not isinstance(result, dict) or not result.get("ok"):
-        return False
-    return (result.get("model") or primary_model) != primary_model
-
-
-def _record_parallel_fallback(fallback_thread, holder, fallback_model, attempts):
-    """Keep the grok-4 attempt on the record even when the primary answer is the one we use."""
-    if fallback_thread is None:
-        return
-    fallback_thread.join(0.05)
-    fallback = holder.get("fallback")
-    if not fallback:
-        attempts.append(_attempt_record(fallback_model, 0, False, "still_running"))
-        return
-    attempts.append(_attempt_record(
-        fallback_model, fallback.get("ms") or 0, fallback.get("ok"), None if fallback.get("ok") else fallback.get("error")
-    ))
-
-
 def model_call_timeout():
     """Seconds each model is allowed. Both grok-4 and grok-4.7 get this. Default 180."""
     return _env_seconds("XAI_MODEL_TIMEOUT", 180, 30, 240)
@@ -3249,11 +3188,7 @@ def verification_enabled(debug, raw):
 
 
 def verify_timeout_cap():
-    """Seconds for the reference check. Never shortened to save time. Default 60.
-
-    A configured value below 45 is raised to 45. The old 12s cap was cutting
-    the check off while the job still had time.
-    """
+    """Seconds for the reference check. FINFINDR_VERIFY_TIMEOUT is used as set. Default 60."""
     raw = (os.environ.get("FINFINDR_VERIFY_TIMEOUT") or "").strip()
     if not raw:
         return 60.0
@@ -3261,7 +3196,7 @@ def verify_timeout_cap():
         value = float(raw)
     except ValueError:
         return 60.0
-    return min(120.0, max(45.0, value))
+    return min(120.0, max(5.0, value))
 
 
 def verify_image_px():
@@ -3272,7 +3207,7 @@ def verify_image_px():
     try:
         value = int(raw)
     except ValueError:
-        return 768
+        return 512
     return min(1536, max(256, value))
 
 
@@ -3570,7 +3505,12 @@ def _bundle_model_reports(models, reports, attempts):
             "error": report.get("error") or "",
             "top": listed[0]["scientific_name"] if listed else "",
             "candidates": listed,
+            "reply": report.get("text") or "",
         }
+        app.logger.info(
+            "model reply model=%s ok=%s ms=%s reply=%s",
+            report.get("model"), report.get("ok"), report.get("ms") or 0, report.get("text") or "",
+        )
     usable = [report for report in reports if _report_is_usable(report)]
     narrative = None
     for report in usable:
@@ -3649,14 +3589,12 @@ def _apply_model_bundle(meta, bundle, final_source=""):
 
 
 def _medium_photo_url(url):
+    """iNaturalist medium size, about 500px. Not the 240px small derivative."""
     if not url or not isinstance(url, str):
         return ""
-    return (
-        url.replace("/square.", "/small.")
-        .replace("/square.jpg", "/small.jpg")
-        .replace("/medium.", "/small.")
-        .replace("/large.", "/small.")
-    )
+    for size in ("square", "small", "large", "original"):
+        url = url.replace(f"/{size}.", "/medium.")
+    return url
 
 
 def _photo_record(photo, observation_id=None):
@@ -3836,6 +3774,7 @@ def fetch_reference_photos(scientific, lat, lng, exclude_observation_id=None, de
                 for photo in obs.get("photos") or []:
                     record = _photo_record(photo, obs.get("id"))
                     if record and str(record.get("observation_id")) != str(exclude_observation_id or ""):
+                        record["location"] = obs.get("place_guess") or ""
                         nearby.append(record)
                         break
             if nearby:
@@ -3877,23 +3816,30 @@ def _attach_reference_photos(candidates, lat, lng, exclude_observation_id, deadl
         return attached
 
 
-def _verification_prompt(candidates):
+def _verification_prompt(candidates, locality=""):
     lines = [
         "The first image is the animal to identify.",
-        "Each later image is a research-grade reference photo of one candidate. Compare diagnostic traits you can see. Do not pick a candidate just because it was listed first.",
+    ]
+    if locality:
+        lines.append(f"The animal was photographed in {locality}.")
+    lines.extend([
+        "Each later image is one photo from that species' iNaturalist species page, in the same order as the candidates below.",
+        "They are species-page photos, not a research-grade observation set.",
+        "Compare diagnostic traits you can see. Do not pick a candidate just because it was listed first.",
         "If the photos do not separate the candidates, say you cannot decide.",
         "Compare the leading candidate with the runner-up. Choose the leading one only when a visible diagnostic trait supports it over the other.",
         "If the animal matches none of the reference photos, the decision is NONE_OF_THESE. Do not force the closest name.",
         "NONE_OF_THESE is a valid answer. It means none of these species.",
         "If a clear trait such as color, shape, or pattern disagrees with every reference photo, the decision is NONE_OF_THESE.",
         "",
-    ]
+    ])
     for index, candidate in enumerate(candidates, start=1):
         photo = candidate.get("reference_photo") or {}
         credit = photo.get("attribution") or "iNaturalist"
+        place = photo.get("location") or "location not listed on the species page"
         lines.append(
             f"Reference {index}: {candidate['scientific_name']} ({candidate.get('common_name') or 'no common name'}). "
-            f"Photo: {credit}, {photo.get('license') or 'see iNaturalist'}."
+            f"Species-page photo from {place}. Credit: {credit}, {photo.get('license') or 'see iNaturalist'}."
         )
         if candidate.get("trait"):
             lines.append(f"Trait already suggested: {candidate['trait']}")
@@ -3902,7 +3848,12 @@ def _verification_prompt(candidates):
         "Reply in this exact format:",
         "Decision: <scientific name of the matching candidate, UNSURE, or NONE_OF_THESE>",
         "Certainty: <confident / likely / unsure>",
+        "Use these certainty levels exactly:",
+        "confident: a diagnostic trait is clearly visible and the runner-up is ruled out.",
+        "likely: a consistent diagnostic trait is visible, but the runner-up is not fully excluded.",
+        "unsure: no diagnostic trait is visible, or the photo is ambiguous.",
         "Trait: <the visible trait that separates the choice, or what is missing>",
+        "Reason: <why this certainty, especially when it is not confident>",
     ])
     return "\n".join(lines)
 
@@ -3910,21 +3861,27 @@ def _verification_prompt(candidates):
 def _parse_verification(text, candidates):
     normalized = _result_lines(text or "")
     decision = _field_value(normalized, "Decision")
-    certainty = _field_value(normalized, "Certainty").lower()
+    raw_certainty = _field_value(normalized, "Certainty")
+    certainty = raw_certainty.lower()
     trait = _field_value(normalized, "Trait")
+    why = _field_value(normalized, "Reason")
     if certainty not in ("confident", "likely", "unsure"):
         certainty = "unsure"
     normalized_decision = (decision or "").upper().replace(" ", "_").replace("-", "_")
     if normalized_decision in ("", "UNSURE", "NO_MATCH", "NONE", "NONE_OF_THESE", "NEITHER"):
         kind = "NO_MATCH" if normalized_decision in ("NO_MATCH", "NONE_OF_THESE", "NONE", "NEITHER") else "UNSURE"
-        return {"decision": kind, "certainty": "unsure", "trait": trait, "scientific_name": ""}
-    scientific = exact_scientific_name(decision)
-    if not scientific:
-        return {"decision": "UNSURE", "certainty": "unsure", "trait": trait, "scientific_name": ""}
-    known = {item["scientific_name"].lower() for item in candidates}
-    if scientific.lower() not in known:
-        return {"decision": "UNSURE", "certainty": "unsure", "trait": trait, "scientific_name": scientific}
-    return {"decision": scientific, "certainty": certainty, "trait": trait, "scientific_name": scientific}
+        parsed = {"decision": kind, "certainty": "unsure", "trait": trait, "scientific_name": ""}
+    else:
+        scientific = exact_scientific_name(decision)
+        known = {item["scientific_name"].lower() for item in candidates}
+        if not scientific or scientific.lower() not in known:
+            parsed = {"decision": "UNSURE", "certainty": "unsure", "trait": trait, "scientific_name": scientific or ""}
+        else:
+            parsed = {"decision": scientific, "certainty": certainty, "trait": trait, "scientific_name": scientific}
+    parsed["raw_certainty"] = raw_certainty
+    parsed["raw_reply"] = text or ""
+    parsed["why"] = why
+    return parsed
 
 
 def _order_candidates(candidates, scientific):
@@ -3979,6 +3936,12 @@ def explicit_diagnostic_trait(trait):
     return bool(_DIAGNOSTIC_TRAIT.search(lowered))
 
 
+def verify_accepts_likely():
+    """FINFINDR_VERIFY_ACCEPT_LIKELY defaults on. Set it to 0 to require Certainty: confident."""
+    raw = os.environ.get("FINFINDR_VERIFY_ACCEPT_LIKELY", "1")
+    return str(raw).strip().lower() not in ("0", "false", "off", "no")
+
+
 def passing_verification(verification):
     """True only when the reference check names a candidate, is confident, and cites a real trait."""
     if not isinstance(verification, dict):
@@ -3989,7 +3952,29 @@ def passing_verification(verification):
         return False
     if decision.upper().replace(" ", "_") in ("UNSURE", "NO_MATCH", "NO MATCH", "NONE_OF_THESE"):
         return False
+    if text_has_contradiction(verification.get("trait")):
+        return False
     if verification.get("certainty") != "confident":
+        return False
+    return explicit_diagnostic_trait(verification.get("trait"))
+
+
+def likely_names_the_leader(verification, leading_name):
+    """Likely passes only for the leading name, with a specific trait and no contradiction.
+
+    unsure, NONE_OF_THESE, a different species, and a missing reply do not pass.
+    FINFINDR_VERIFY_ACCEPT_LIKELY=0 turns this off. It does not undo an earlier gate.
+    """
+    if not verify_accepts_likely() or not isinstance(verification, dict) or not leading_name:
+        return False
+    if (verification.get("certainty") or "") != "likely":
+        return False
+    decision = (verification.get("scientific_name") or "").strip()
+    if not decision or decision.lower() != leading_name.lower():
+        return False
+    if decision.upper().replace(" ", "_") in ("UNSURE", "NO_MATCH", "NONE_OF_THESE"):
+        return False
+    if text_has_contradiction(verification.get("trait")):
         return False
     return explicit_diagnostic_trait(verification.get("trait"))
 
@@ -4010,49 +3995,20 @@ def verification_mismatch(verification):
         return False
     if (verification.get("decision") or "").upper().replace(" ", "_") == "NO_MATCH":
         return True
-    trait = (verification.get("trait") or "").lower()
-    cues = (
-        "does not match", "doesn't match", "do not match", "don't match",
-        "no match", "none of the reference", "wrong color", "wrong colour",
-        "different color", "different colour", "color does not", "colour does not",
-        "main color", "main colour",
-    )
-    return any(cue in trait for cue in cues)
+    return text_has_contradiction(verification.get("trait"))
 
 
-def verification_contradicts(verification):
-    """The reference check rejected the animal, rather than failing to separate it."""
-    if not isinstance(verification, dict):
-        return False
-    decision = (verification.get("decision") or "").upper().replace(" ", "_").replace("-", "_")
-    if decision in ("NO_MATCH", "NONE_OF_THESE", "NOMATCH"):
-        return True
-    trait = (verification.get("trait") or "").lower()
-    cues = (
-        "does not match", "doesn't match", "do not match", "don't match",
-        "no match", "none of the reference", "wrong color", "wrong colour",
-        "different color", "different colour", "color does not", "colour does not",
-        "contradict",
-    )
-    return any(cue in trait for cue in cues)
+CONTRADICTION_PHRASES = (
+    "does not match", "doesn't match", "do not match", "don't match",
+    "no match", "none of the reference", "wrong color", "wrong colour",
+    "different color", "different colour", "color does not", "colour does not",
+    "main color", "main colour", "contradict", "lattice", "not the", "wrong ",
+)
 
 
-def agreed_identification_holds(verification, agreed_name, verify_skipped):
-    """Both models named this species, and the reference check did not contradict it.
-
-    A passing check, an unsure check, or a timeout can stay. A NO_MATCH, a
-    contradicting trait, or a check that names a different species cannot.
-    """
-    if not agreed_name or verification_contradicts(verification):
-        return False
-    if verify_skipped == "timeout":
-        return True
-    if not isinstance(verification, dict):
-        return False
-    decision = (verification.get("scientific_name") or verification.get("decision") or "").strip().lower()
-    if decision in ("", "unsure"):
-        return True
-    return decision == agreed_name.lower()
+def text_has_contradiction(text):
+    lowered = (text or "").lower()
+    return any(phrase in lowered for phrase in CONTRADICTION_PHRASES)
 
 
 def cap_unconfirmed_confidence(candidates):
@@ -4086,8 +4042,9 @@ def sort_candidates(candidates):
     return [item for _, item in ranked]
 
 
-def public_candidates(candidates, species):
-    candidates = sort_candidates(candidates)
+def public_candidates(candidates, species, preserve_order=False):
+    if not preserve_order:
+        candidates = sort_candidates(candidates)
     chosen = []
     seen = set()
     in_list = 0
@@ -4810,42 +4767,13 @@ def stamp_meta(meta, request_started):
     stamped["external_calls"] = request_stat("external_calls")
     stamped["inat_throttled"] = request_stat("inat_throttled")
     stamped["commit"] = app_commit()
+    stamped.setdefault("verify_decision", "")
+    stamped.setdefault("verify_certainty", "")
+    stamped.setdefault("verify_trait", "")
+    stamped.setdefault("verify_reply", "")
+    stamped.setdefault("verify_why", "")
+    stamped.setdefault("verify_pass_via", "")
     return stamped
-
-
-def _prefer_bull_shark(candidates, text):
-    """A blunt snout or stocky body is Carcharhinus leucas, not the silky shark.
-
-    The model was ranking falciformis first even when its own trait said the
-    snout was blunt. Reorder when both names are present. If only falciformis
-    was named and the text says blunt or stocky, and it does not mention the
-    interdorsal ridge, replace that top name with leucas.
-    """
-    if not candidates:
-        return candidates
-    blob = (text or "").lower()
-    blunt = any(phrase in blob for phrase in ("blunt snout", "stocky", "no ridge", "without a ridge", "no interdorsal"))
-    ridge = "interdorsal ridge" in blob or "ridge between the dorsal" in blob
-    if not blunt or ridge:
-        return candidates
-    leucas = None
-    rest = []
-    for item in candidates:
-        if (item.get("scientific_name") or "").lower() == "carcharhinus leucas":
-            leucas = item
-        else:
-            rest.append(item)
-    if leucas is not None:
-        if rest and _CONFIDENCE_RANK.get(leucas.get("confidence") or "medium", 1) > _CONFIDENCE_RANK.get(rest[0].get("confidence") or "medium", 1):
-            leucas["confidence"] = rest[0].get("confidence") or "medium"
-        return [leucas] + rest
-    top = candidates[0]
-    if (top.get("scientific_name") or "").lower() == "carcharhinus falciformis":
-        top["scientific_name"] = "Carcharhinus leucas"
-        top["common_name"] = top.get("common_name") or "Bull shark"
-        if "silky" in (top.get("common_name") or "").lower():
-            top["common_name"] = "Bull shark"
-    return candidates
 
 
 def _result_payload(
@@ -4915,8 +4843,8 @@ def _offlist_followup_prompt(locality, candidates):
         "If the shark is stocky with a blunt snout, propose Carcharhinus leucas when falciformis was the only shark named.",
         "OFFLIST_FOLLOWUP",
         "Reply with only these lines:",
-        "Off-list 1: <scientific name or none> | <common name> | <trait>",
-        "Off-list 2: <scientific name or none> | <common name> | <trait>",
+        "Off-list 1: <scientific name or none> | <common name> | <high/medium/low> | <trait>",
+        "Off-list 2: <scientific name or none> | <common name> | <high/medium/low> | <trait>",
     ])
 
 
@@ -5329,7 +5257,7 @@ def _identify_http(image_bytes=None, fields=None):
     text = apply_standard_names(result.get("text") or "", species)
     photo_quality = parse_photo_quality(text)
     photo_issue = _field_value(text, "Photo issue")
-    parsed_candidates = _prefer_bull_shark(result.get("candidates") or parse_model_candidates(text), text)
+    parsed_candidates = result.get("candidates") or parse_model_candidates(text)
     # Gate 1. A no stops here. A yes does not mark the identification down.
     if not result.get("photo_usable", photo_is_usable(photo_quality, photo_issue)):
         meta = _identification_meta(
@@ -5384,6 +5312,7 @@ def _identify_http(image_bytes=None, fields=None):
             meta=meta,
         ))
     # Gate 3. Confidence is decided only from here on.
+    leading_before_verify = candidates[0]["scientific_name"] if candidates else ""
     verify_used = False
     verify_attempted = False
     verify_ms = 0
@@ -5408,10 +5337,12 @@ def _identify_http(image_bytes=None, fields=None):
             candidates = _attach_reference_photos(
                 candidates, lat, lng, exclude_observation, fetch_deadline
             )
-            photo_order = [item for item in candidates if item.get("off_list")] + [item for item in candidates if not item.get("off_list")]
-            for candidate in photo_order:
-                reference_urls.extend((candidate.get("_reference_urls") or [])[:1])
-            reference_urls = reference_urls[:2]
+            pictured = []
+            for candidate in candidates:
+                urls = (candidate.get("_reference_urls") or [])[:1]
+                if urls:
+                    pictured.append(candidate)
+                    reference_urls.append(urls[0])
         reference_fetch_ms = int(round((time.perf_counter() - fetch_started) * 1000))
         call_timeout = verify_call_budget(request_started)
         if verify_skipped == "no_time":
@@ -5425,12 +5356,13 @@ def _identify_http(image_bytes=None, fields=None):
             verify_started = time.perf_counter()
             verify_result = _call_vision_model(
                 _shrink_jpeg(jpeg_bytes, verify_image_px()),
-                _verification_prompt(candidates),
+                _verification_prompt(pictured, locality),
                 answered,
                 call_timeout,
                 xai_key,
                 reference_urls,
-                extra_detail="low",
+                extra_detail="high",
+                use_cache=use_cache,
             )
             verify_ms = int(round((time.perf_counter() - verify_started) * 1000))
             _record_verification(bool(verify_result.get("ok")))
@@ -5443,7 +5375,18 @@ def _identify_http(image_bytes=None, fields=None):
                         "certainty": "unsure",
                         "trait": verification.get("trait") or "",
                         "scientific_name": "",
+                        "raw_certainty": verification.get("raw_certainty") or "",
+                        "raw_reply": verification.get("raw_reply") or "",
+                        "why": verification.get("why") or "",
                     }
+                app.logger.info(
+                    "verify decision=%s certainty=%s trait=%s why=%s reply=%s",
+                    verification.get("decision"),
+                    verification.get("raw_certainty"),
+                    verification.get("trait"),
+                    verification.get("why"),
+                    verification.get("raw_reply"),
+                )
                 if verification.get("trait"):
                     for candidate in candidates:
                         if candidate["scientific_name"].lower() == (verification.get("scientific_name") or "").lower():
@@ -5461,13 +5404,7 @@ def _identify_http(image_bytes=None, fields=None):
                 verify_skipped = _verify_skip_reason(verify_result)
     for candidate in candidates:
         candidate.pop("_reference_urls", None)
-    agreed_top = candidates[0]["scientific_name"] if candidates and result.get("agreement") else ""
-    models_agree = bool(agreed_top) and agreed_identification_holds(verification, agreed_top, verify_skipped)
-    if (
-        not models_agree
-        and _needs_offlist_followup(candidates, verification, verify_skipped)
-        and _time_left(request_started) >= 12
-    ):
+    if _needs_offlist_followup(candidates, verification, verify_skipped) and _time_left(request_started) >= 12:
         follow_timeout = min(16.0, max(5.0, _time_left(request_started) - 4.0))
         follow = _call_vision_model(
             jpeg_bytes,
@@ -5507,13 +5444,16 @@ def _identify_http(image_bytes=None, fields=None):
                 candidates.extend(fresh)
             off_list_kept = sum(1 for item in candidates if item.get("off_list"))
     verification_disagreed = bool(
-        verify_used and verification is not None and not passing_verification(verification) and not models_agree
+        verify_used and verification is not None and not passing_verification(verification)
     )
-    certainty = certainty_for(candidates, verification if passing_verification(verification) else None)
+    certainty = certainty_for(candidates, verification)
     if verification_disagreed:
         cap_unconfirmed_confidence(candidates)
         certainty = "unsure"
-    shown = public_candidates(candidates, species)
+    verifier_ordered = bool(
+        verification and verification.get("decision") not in ("", "UNSURE", "NO_MATCH")
+    )
+    shown = public_candidates(candidates, species, preserve_order=verifier_ordered)
     notes_text = _field_value(text, "Notes")
     known_traits = SPECIES_TRAITS.get((shown[0].get("scientific_name") if shown else "").lower(), "") if shown else ""
     trait_conflict = bool(shown) and traits_contradict(
@@ -5539,14 +5479,11 @@ def _identify_http(image_bytes=None, fields=None):
     color_reject = False
     if isinstance(verification, dict):
         trait_line = (verification.get("trait") or "").lower()
-        color_reject = any(cue in trait_line for cue in (
-            "does not match", "doesn't match", "wrong color", "wrong colour",
-            "different color", "different colour", "color does not", "colour does not",
-        ))
+        color_reject = text_has_contradiction(trait_line)
     contradicts = trait_conflict or color_reject
     if isinstance(verification, dict) and (verification.get("decision") or "").upper() == "NO_MATCH":
         trait_line = (verification.get("trait") or "").lower()
-        if any(word in trait_line for word in ("lattice", "contradict", "does not match", "doesn't match", "wrong ", "not the")):
+        if text_has_contradiction(trait_line):
             contradicts = True
     if no_match and shown and not contradicts:
         # The top candidate is the closest name we have. Saying "no match"
@@ -5556,7 +5493,7 @@ def _identify_http(image_bytes=None, fields=None):
     if no_match:
         certainty = "unsure"
         cap_unconfirmed_confidence(candidates)
-        shown = public_candidates(candidates, species)
+        shown = public_candidates(candidates, species, preserve_order=verifier_ordered)
     strong_id = (
         not no_match
         and certainty == "confident"
@@ -5705,18 +5642,20 @@ def _identify_http(image_bytes=None, fields=None):
     if discovery and discovery.get("type") == "no_match" and not (rejected_all or trait_conflict):
         discovery = None
     checked = len(candidates) if verify_attempted else 0
-    passed = 1 if verify_used and passing_verification(verification) and verification_chose_top(verification, candidates) else 0
-    verified_id = bool(
-        verify_used and passing_verification(verification) and verification_chose_top(verification, candidates)
+    likely_pass = bool(
+        verify_used and not no_match and likely_names_the_leader(verification, leading_before_verify)
     )
-    if models_agree and (trait_conflict or no_match or verification_contradicts(verification)):
-        models_agree = False
-    if (verified_id or models_agree) and not no_match:
+    strict_pass = bool(
+        verify_used and passing_verification(verification) and verification_chose_top(verification, candidates)
+        and (verification or {}).get("certainty") == "confident"
+    )
+    passed = 1 if strict_pass or likely_pass else 0
+    verified_id = bool((strict_pass or likely_pass) and not no_match)
+    meta_pass_via = "confident" if strict_pass else ("likely" if likely_pass else "")
+    if verified_id and not no_match:
         certainty = "confident"
         for item in shown[:1]:
             item["confidence"] = "high"
-        if models_agree and not verified_id:
-            evidence.append("models_agreed")
     elif certainty != "confident":
         # Unconfirmed identifications are not labeled high. Photo quality is not an input.
         for item in shown:
@@ -5726,18 +5665,24 @@ def _identify_http(image_bytes=None, fields=None):
         text = _no_match_result_text(discovery)
         certainty = "unsure"
     elif shown and text:
+        text = _set_field(text, "Scientific name", shown[0].get("scientific_name") or "")
+        text = _set_field(text, "Common name", shown[0].get("common_name") or "")
         text = _set_field(text, "Confidence", shown[0].get("confidence") or "medium")
     off_list_kept = sum(1 for item in shown if item.get("off_list"))
-    if verify_skipped in ("timeout", "connection", "no_time") and certainty == "confident" and not models_agree:
-        certainty = "likely"
     if isinstance(verification, dict):
         meta["verify_decision"] = verification.get("decision") or ""
+        meta["verify_certainty"] = verification.get("raw_certainty") or verification.get("certainty") or ""
         meta["verify_trait"] = verification.get("trait") or ""
+        meta["verify_reply"] = verification.get("raw_reply") or ""
+        meta["verify_why"] = verification.get("why") or ""
+    if not meta.get("verify_why"):
+        meta["verify_why"] = verify_skipped or "not_run"
     meta["evidence"] = evidence
     meta["range_km"] = rule["radius_km"]
     meta["range_max"] = rule["max_records"]
     meta["range_rule"] = rule["text"]
     meta["verify_succeeded"] = verified_id
+    meta["verify_pass_via"] = meta_pass_via
     apply_verify_rates(meta, verify_attempted, verify_used, checked, passed, verify_skipped)
     meta["verify_timeout_s"] = verify_timeout_cap()
     meta["off_list_proposed"] = off_list_proposed

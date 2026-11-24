@@ -533,6 +533,7 @@ def answer_from_response(body, item, run, latency_ms, status=200):
         "server_range_km": meta.get("range_km"),
         "server_range_max": meta.get("range_max"),
         "evidence": meta.get("evidence") or [],
+        "verify_pass_via": meta.get("verify_pass_via") or "",
         "errored": klass == "error" or status not in (200, None),
     }
 
@@ -693,6 +694,16 @@ def summarize_answers(rows, include_sources=True):
         "confident_precision": _round(_rate(len(correct_confident), len(confident))),
         "confident_answers": len(confident),
         "confident_correct": len(correct_confident),
+        "confident_precision_via_confident": _round(_rate(
+            len([row for row in correct_confident if row.get("verify_pass_via") == "confident"]),
+            len([row for row in confident if row.get("verify_pass_via") == "confident"]),
+        )),
+        "confident_via_confident_answers": len([row for row in confident if row.get("verify_pass_via") == "confident"]),
+        "confident_precision_via_likely": _round(_rate(
+            len([row for row in correct_confident if row.get("verify_pass_via") == "likely"]),
+            len([row for row in confident if row.get("verify_pass_via") == "likely"]),
+        )),
+        "confident_via_likely_answers": len([row for row in confident if row.get("verify_pass_via") == "likely"]),
         "confident_wrong": len(false_accepts),
         "false_accepts_per_100": _round(100 * len(false_accepts) / n, 2) if n else None,
         "false_accepts": [
@@ -898,6 +909,8 @@ def markdown_report(report):
         "",
         f"- Headline accuracy: {_pct(verified['headline_accuracy'])}",
         f"- Confident precision: {_pct(verified['confident_precision'])} ({verified['confident_correct']} / {verified['confident_answers']})",
+        f"- Confident precision via confident: {_pct(verified.get('confident_precision_via_confident'))} (n={verified.get('confident_via_confident_answers')})",
+        f"- Confident precision via likely: {_pct(verified.get('confident_precision_via_likely'))} (n={verified.get('confident_via_likely_answers')})",
         f"- False accepts per 100: {verified['false_accepts_per_100']}",
         f"- Correct match rate: {_pct(verified['correct_match_rate'])}",
         f"- False reject rate: {_pct(verified['false_reject_rate'])}",
@@ -989,8 +1002,8 @@ def load_photo(session, limiter, photo_path, manifest_dir):
     return candidate.read_bytes()
 
 
-def identify_photo(session, base_url, image, item):
-    data = {"region": item.get("region") or "other"}
+def identify_photo(session, base_url, image, item, use_async=False):
+    data = {"region": item.get("region") or "other", "nocache": "1"}
     if item.get("lat") is not None and item.get("lng") is not None:
         data["lat"] = str(item["lat"])
         data["lng"] = str(item["lng"])
@@ -998,19 +1011,45 @@ def identify_photo(session, base_url, image, item):
     if observation_id:
         data["exclude_observation_id"] = observation_id
     started = time.perf_counter()
+    params = {} if use_async else {"sync": "1"}
     response = session.post(
         base_url.rstrip("/") + "/identify",
         files={"image": ("eval.jpg", image, "image/jpeg")},
         data=data,
-        params={"sync": "1"},
-        timeout=300,
+        params=params,
+        timeout=60 if use_async else 300,
     )
-    latency_ms = int(round((time.perf_counter() - started) * 1000))
+    if not use_async:
+        latency_ms = int(round((time.perf_counter() - started) * 1000))
+        try:
+            body = response.json()
+        except ValueError:
+            body = {"error": "non-json response"}
+        return body, latency_ms, response.status_code
     try:
-        body = response.json()
+        job = response.json()
     except ValueError:
-        body = {"error": "non-json response"}
-    return body, latency_ms, response.status_code
+        return {"error": "non-json response"}, int(round((time.perf_counter() - started) * 1000)), response.status_code
+    status_url = job.get("status_url") or ""
+    if status_url.startswith("/"):
+        status_url = base_url.rstrip("/") + status_url
+    deadline = time.monotonic() + 260
+    body = {"error": "job did not finish"}
+    status = 0
+    while time.monotonic() < deadline and status_url:
+        time.sleep(2)
+        poll = session.get(status_url, timeout=30)
+        status = poll.status_code
+        try:
+            payload = poll.json()
+        except ValueError:
+            body = {"error": "non-json status"}
+            break
+        if payload.get("status") in ("done", "timeout"):
+            body = payload.get("result") or {"error": "empty job result"}
+            break
+    latency_ms = int(round((time.perf_counter() - started) * 1000))
+    return body, latency_ms, status or response.status_code
 
 
 def _done_keys(rows):
@@ -1061,7 +1100,7 @@ def retry_outcome(first_status, final_status, final_has_error):
     }
 
 
-def identify_with_retry(session, base_url, image, item, delay):
+def identify_with_retry(session, base_url, image, item, delay, use_async=False):
     """Try twice so one network error does not end the run.
 
     The returned body records the first status. A 5xx on the first attempt
@@ -1071,7 +1110,7 @@ def identify_with_retry(session, base_url, image, item, delay):
     first_status = None
     for attempt in range(2):
         try:
-            body, latency_ms, status = identify_photo(session, base_url, image, item)
+            body, latency_ms, status = identify_photo(session, base_url, image, item, use_async=use_async)
         except requests.RequestException as exc:
             body, latency_ms, status = {"error": str(exc)}, 0, 0
         if first_status is None:
@@ -1090,7 +1129,7 @@ def identify_with_retry(session, base_url, image, item, delay):
     return body, latency_ms, status
 
 
-def evaluate_manifest(items, manifest_dir, base_url, runs, session=None, delay=10.0, concurrency=1, resume_path=""):
+def evaluate_manifest(items, manifest_dir, base_url, runs, session=None, delay=10.0, concurrency=1, resume_path="", use_async=False):
     session = session or requests.Session()
     session.headers.setdefault("User-Agent", USER_AGENT)
     limiter = RateLimiter(INAT_MIN_INTERVAL)
@@ -1107,7 +1146,7 @@ def evaluate_manifest(items, manifest_dir, base_url, runs, session=None, delay=1
         item, run = job
         try:
             image = load_photo(session, limiter, item["photo_path"], manifest_dir)
-            body, latency_ms, status = identify_with_retry(session, base_url, image, item, delay)
+            body, latency_ms, status = identify_with_retry(session, base_url, image, item, delay, use_async=use_async)
         except (OSError, requests.RequestException) as exc:
             body, latency_ms, status = {"error": str(exc)}, 0, 0
         if not (item.get("synonyms") or []):
@@ -1204,6 +1243,7 @@ def main():
     parser.add_argument("--concurrency", type=int, default=1, help="Parallel identify calls (default 1)")
     parser.add_argument("--delay", type=float, default=10.0, help="Seconds between identify calls (default 10)")
     parser.add_argument("--resume", action="store_true", help="Append to --json and skip rows already saved")
+    parser.add_argument("--async", dest="use_async", action="store_true", help="POST a job and poll /identify/status instead of sync=1")
     args = parser.parse_args()
     if args.runs < 1:
         raise SystemExit("--runs must be at least 1")
@@ -1221,6 +1261,7 @@ def main():
             items, manifest_dir, args.base_url, args.runs, session,
             delay=args.delay, concurrency=args.concurrency,
             resume_path=args.json_path if args.resume else "",
+            use_async=args.use_async,
         )
     else:
         params, label = region_params(args)

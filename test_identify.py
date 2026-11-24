@@ -816,7 +816,7 @@ class IdentifyTests(unittest.TestCase):
             photos = finfindr_server.fetch_reference_photos("Sphoeroides annulatus", 24.1, -110.3, "50")
         self.assertTrue(photos)
         self.assertEqual(photos[0]["attribution"], "Alex Example")
-        self.assertIn("small.jpg", photos[0]["url"])
+        self.assertIn("medium.jpg", photos[0]["url"])
         self.assertEqual(photos[0]["license"], "CC BY-NC")
         self.assertTrue(photos[0]["source_url"].startswith("https://www.inaturalist.org/photos/"))
 
@@ -1130,6 +1130,7 @@ class IdentifyTests(unittest.TestCase):
         finfindr_server._INAT_JSON_CACHE.clear()
         agreed = self.post_photo(lat="24.2", lng="-110.3").get_json()
         self.assertEqual(agreed["certainty"], "confident")
+        self.assertEqual(agreed["meta"]["verify_pass_via"], "confident")
         self.assertTrue(agreed["meta"]["verify_used"])
         self.assertTrue(agreed["meta"]["verify_succeeded"])
         self.assertEqual(agreed["meta"]["verify_success_rate"], 1)
@@ -1142,10 +1143,11 @@ class IdentifyTests(unittest.TestCase):
         finfindr_server._PHOTO_CACHE.clear()
         hedged = self.post_photo(lat="24.2", lng="-110.3").get_json()
         self.assertEqual(hedged["certainty"], "confident")
-        self.assertTrue(hedged["meta"]["agreement"])
+        self.assertEqual(hedged["meta"]["verify_pass_via"], "likely")
         self.assertTrue(hedged["meta"]["verify_used"])
-        self.assertFalse(hedged["meta"]["verify_succeeded"])
+        self.assertTrue(hedged["meta"]["verify_succeeded"])
         self.assertIsNone(hedged["discovery"])
+        self.assertEqual(hedged["meta"]["verify_certainty"].lower(), "likely")
 
         os.environ["FINFINDR_VERIFY_TIMEOUT"] = "18"
         self.captured["verify_raises"] = "timeout"
@@ -1158,8 +1160,8 @@ class IdentifyTests(unittest.TestCase):
         self.assertEqual(timed["meta"]["verify_skipped"], "timeout")
         self.assertTrue(timed["meta"]["verify_attempted"])
         self.assertFalse(timed["meta"]["verify_used"])
-        self.assertEqual(timed["certainty"], "confident")
-        self.assertTrue(timed["meta"]["agreement"])
+        self.assertNotEqual(timed["certainty"], "confident")
+        self.assertEqual(timed["meta"]["verify_pass_via"], "")
         self.assertIsNone(timed["discovery"])
         verify_calls = [call for call in self.captured["calls"] if call.get("verify")]
         self.assertTrue(verify_calls)
@@ -1226,10 +1228,10 @@ class IdentifyTests(unittest.TestCase):
             "Decision: UNSURE\nCertainty: unsure\nTrait: the arms are hidden\n"
         )
         unsure = self.post_photo(lat="24.2", lng="-110.3").get_json()
-        self.assertEqual(unsure["certainty"], "confident")
-        self.assertTrue(unsure["meta"]["agreement"])
+        self.assertNotEqual(unsure["certainty"], "confident")
+        self.assertEqual(unsure["meta"]["verify_pass_via"], "")
         self.assertIsNone(unsure["discovery"])
-        self.assertEqual(unsure["candidates"][0]["confidence"], "high")
+        self.assertNotEqual(unsure["candidates"][0]["confidence"], "high")
 
         self.captured["verify_text"] = (
             "Decision: Phataria unifascialis\n"
@@ -1385,9 +1387,9 @@ class IdentifyTests(unittest.TestCase):
         finally:
             self.captured.pop("verify_raises", None)
         self.assertEqual(body["meta"]["verify_skipped"], "timeout")
-        self.assertEqual(body["certainty"], "confident")
-        self.assertEqual(body["candidates"][0]["confidence"], "high")
-        self.assertTrue(body["meta"]["agreement"])
+        self.assertNotEqual(body["certainty"], "confident")
+        self.assertNotEqual(body["candidates"][0]["confidence"], "high")
+        self.assertEqual(body["meta"]["verify_pass_via"], "")
         self.assertIsNone(body["discovery"])
         self.assertEqual(body["candidates"][0]["scientific_name"], "Abudefduf troschelii")
 
@@ -1405,6 +1407,16 @@ class IdentifyTests(unittest.TestCase):
         self.assertEqual(body["certainty"], "unsure")
         self.assertTrue(finfindr_server.colors_contradict("red mesh pattern", "Blue Sea Star"))
         self.assertFalse(finfindr_server.colors_contradict("blue arms", "Blue Sea Star"))
+
+    def test_verifier_choice_stays_ahead_of_a_higher_model_confidence(self):
+        ordered = [
+            {"scientific_name": "Arctocephalus townsendi", "common_name": "Guadalupe Fur Seal", "confidence": "medium", "trait": "pointed snout"},
+            {"scientific_name": "Zalophus californianus", "common_name": "California Sea Lion", "confidence": "high", "trait": "sleek coat"},
+        ]
+        shown = finfindr_server.public_candidates(ordered, None, preserve_order=True)
+        self.assertEqual(shown[0]["scientific_name"], "Arctocephalus townsendi")
+        resorted = finfindr_server.public_candidates(ordered, None)
+        self.assertEqual(resorted[0]["scientific_name"], "Zalophus californianus")
 
     def test_candidates_are_sorted_by_confidence(self):
         shown = finfindr_server.public_candidates([
@@ -1443,26 +1455,9 @@ class IdentifyTests(unittest.TestCase):
         self.assertTrue(response.is_json)
         self.assertIn("error", response.get_json())
 
-    def test_model_timeouts_leave_room_for_fallback_and_verification(self):
-        primary, fallback = finfindr_server.plan_model_timeouts(110, 80, 25, 25, True)
-        self.assertGreaterEqual(primary, 80)
-        self.assertLessEqual(primary + 3, 110)
-        self.assertGreater(fallback, 0)
-        self.assertFalse(finfindr_server.should_fallback(
-            {"ok": False, "retryable": True, "error": "timeout"}, 10, 25
-        ))
-        self.assertTrue(finfindr_server.should_fallback(
-            {"ok": False, "retryable": True, "error": "timeout"}, 40, 25
-        ))
-        self.assertTrue(finfindr_server.should_fallback(
-            {"ok": False, "retryable": True, "error": "connection"}, 30, 25
-        ))
-        self.assertTrue(finfindr_server.should_fallback(
-            {"ok": False, "retryable": True, "error": "http_502"}, 20, 25
-        ))
-        self.assertFalse(finfindr_server.should_fallback(
-            {"ok": False, "retryable": False, "error": "http_400"}, 100, 25
-        ))
+    def test_both_models_wait_up_to_the_client_timeout(self):
+        self.assertEqual(finfindr_server.model_call_timeout(), 180)
+        self.assertEqual(finfindr_server.job_wall_seconds(), 240)
 
 
     def _felis_taxon(self, url, params):
@@ -1722,8 +1717,8 @@ class IdentifyTests(unittest.TestCase):
         body = self.post_photo(lat="24.2", lng="-110.3").get_json()
         self.assertEqual(body["meta"]["verify_skipped"], "timeout")
         self.assertEqual(body["candidates"][0]["scientific_name"], "Carcharhinus leucas")
-        self.assertEqual(body["candidates"][0]["confidence"], "high")
-        self.assertEqual(body["certainty"], "confident")
+        self.assertNotEqual(body["candidates"][0]["confidence"], "high")
+        self.assertNotEqual(body["certainty"], "confident")
         self.assertNotIn("quality_lowered_confidence", body["meta"]["evidence"])
         self.assertNotIn("Can't identify", body.get("message") or "")
         self.assertIsNone(body["discovery"])
@@ -1838,17 +1833,7 @@ class IdentifyTests(unittest.TestCase):
         self.assertNotEqual((body.get("discovery") or {}).get("type"), "no_match")
         self.assertEqual(body["candidates"][0]["scientific_name"], "Nerita scabricosta")
 
-    def test_parallel_fallback_is_recorded_without_replacing_the_primary(self):
-        attempts = []
-        holder = {"fallback": {"ok": True, "ms": 1200, "model": "grok-4"}}
-
-        class Finished(object):
-            def join(self, timeout):
-                return None
-
-        finfindr_server._record_parallel_fallback(Finished(), holder, "grok-4", attempts)
-        self.assertEqual(attempts[0]["model"], "grok-4")
-        self.assertTrue(attempts[0]["ok"])
+    def test_parallel_models_are_both_recorded(self):
         self.captured["model_text"] = (
             "Photo quality: good\n"
             "Scientific name: Octopus hubbsorum\n"
@@ -2113,16 +2098,59 @@ class IdentifyTests(unittest.TestCase):
         )
         body = self.post_photo(lat="24.2", lng="-110.3").get_json()
         self.assertTrue(body["meta"]["agreement"])
-        self.assertEqual(body["certainty"], "confident")
+        self.assertNotEqual(body["certainty"], "confident")
+        self.assertEqual(body["meta"]["verify_pass_via"], "")
         self.assertEqual(body["candidates"][0]["scientific_name"], "Zalophus californianus")
-        self.assertEqual(body["candidates"][0]["confidence"], "high")
-        self.assertIn("models_agreed", body["meta"]["evidence"])
         self.captured["verify_text"] = (
             "Decision: NO_MATCH\nCertainty: unsure\nTrait: the ear flaps do not match these seals\n"
         )
         finfindr_server._PHOTO_CACHE.clear()
         blocked = self.post_photo(lat="24.2", lng="-110.3").get_json()
         self.assertNotEqual(blocked["certainty"], "confident")
+
+    def test_likely_passes_only_for_the_leading_species(self):
+        self.assertFalse(finfindr_server.likely_names_the_leader(
+            {"decision": "UNSURE", "certainty": "likely", "scientific_name": "", "trait": "yellow tail"},
+            "Zebrasoma xanthurum",
+        ))
+        self.assertFalse(finfindr_server.likely_names_the_leader(
+            {"decision": "NONE_OF_THESE", "certainty": "likely", "scientific_name": "", "trait": "yellow tail"},
+            "Zebrasoma xanthurum",
+        ))
+        self.assertFalse(finfindr_server.likely_names_the_leader(
+            {"decision": "Abudefduf saxatilis", "certainty": "likely", "scientific_name": "Abudefduf saxatilis", "trait": "a yellow back"},
+            "Abudefduf troschelii",
+        ))
+        self.assertFalse(finfindr_server.likely_names_the_leader(
+            {"decision": "Zebrasoma xanthurum", "certainty": "likely", "scientific_name": "Zebrasoma xanthurum", "trait": "the color does not match"},
+            "Zebrasoma xanthurum",
+        ))
+        self.assertTrue(finfindr_server.likely_names_the_leader(
+            {"decision": "Zebrasoma xanthurum", "certainty": "likely", "scientific_name": "Zebrasoma xanthurum", "trait": "yellow tail"},
+            "Zebrasoma xanthurum",
+        ))
+        os.environ["FINFINDR_VERIFY_ACCEPT_LIKELY"] = "0"
+        try:
+            self.assertFalse(finfindr_server.likely_names_the_leader(
+                {"decision": "Zebrasoma xanthurum", "certainty": "likely", "scientific_name": "Zebrasoma xanthurum", "trait": "yellow tail"},
+                "Zebrasoma xanthurum",
+            ))
+        finally:
+            os.environ.pop("FINFINDR_VERIFY_ACCEPT_LIKELY", None)
+        prompt = finfindr_server._verification_prompt([], "the Sea of Cortez")
+        self.assertIn("confident: a diagnostic trait is clearly visible and the runner-up is ruled out.", prompt)
+        self.assertIn("likely: a consistent diagnostic trait is visible, but the runner-up is not fully excluded.", prompt)
+        self.assertIn("unsure: no diagnostic trait is visible, or the photo is ambiguous.", prompt)
+        self.post_photo()
+        self.assertIn("high: a diagnostic trait is clearly visible and look-alikes are excluded.", self.prompt())
+        self.assertIn("medium: the photo is consistent with the species, but some look-alikes are not excluded.", self.prompt())
+        self.assertIn("low: the evidence is weak or only partly visible.", self.prompt())
+        parsed = finfindr_server.parse_model_candidates(
+            "Off-list 1: Octopus rubescens | Red octopus | low | reddish body without eye spots\n"
+        )
+        self.assertEqual(parsed[0]["confidence"], "low")
+        self.assertEqual(parsed[0]["trait"], "reddish body without eye spots")
+        del identify_prompt, page
 
     def test_disagreement_shows_both_species_until_verify_separates_them(self):
         self.captured["model_text_by_model"] = {
@@ -2147,16 +2175,14 @@ class IdentifyTests(unittest.TestCase):
         self.assertFalse(body["meta"]["fallback_used"])
         self.assertIn(body["meta"]["final_source"], ("grok-4", "grok-4.7", "both"))
 
-    def test_parallel_grok4_does_not_count_as_fallback_used(self):
-        self.assertFalse(finfindr_server.answer_used_fallback(
-            {"ok": True, "model": "grok-4.7"}, "grok-4.7"
-        ))
-        self.assertTrue(finfindr_server.answer_used_fallback(
-            {"ok": True, "model": "grok-4"}, "grok-4.7"
-        ))
-        self.assertFalse(finfindr_server.answer_used_fallback(
-            {"ok": False, "model": "grok-4"}, "grok-4.7"
-        ))
+    def test_both_model_replies_are_kept(self):
+        body = self.post_photo().get_json()
+        self.assertEqual(body["meta"]["models_run"], ["grok-4", "grok-4.7"])
+        for name in body["meta"]["models_run"]:
+            self.assertIn("reply", body["meta"]["model_candidates"][name])
+        self.assertIn("verify_reply", body["meta"])
+        self.assertIn("verify_why", body["meta"])
+        self.assertIn("verify_pass_via", body["meta"])
 
     def test_long_primary_gives_verify_the_time_that_is_left(self):
         started = time.monotonic() - 70
@@ -2259,7 +2285,7 @@ class IdentifyTests(unittest.TestCase):
             "Candidate 2: Carcharhinus leucas | Bull shark | medium | small eyes\n"
         )
         body = self.post_photo().get_json()
-        self.assertEqual(body["candidates"][0]["scientific_name"], "Carcharhinus leucas")
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Carcharhinus falciformis")
         self.assertIn("Rank Carcharhinus leucas first", "\n".join(finfindr_server.CORTEZ_LOOKALIKE_LINES))
 
     def test_prefetched_reference_photo_is_reused(self):
