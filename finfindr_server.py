@@ -1321,7 +1321,7 @@ def resolve_common_names(scientific_names, species=None):
         if scientific.lower() not in seen_pending:
             seen_pending.add(scientific.lower())
             pending.append(scientific)
-    if not pending:
+    if not pending or not nature_data_enabled():
         return found
     workers = min(8, len(pending))
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -2353,6 +2353,8 @@ def _http_get_bounded(url, params, headers, timeout):
 
 def _inat_get(url, params, timeout, headers):
     """One paced external GET. Successful JSON is cached for hours. 429s are retried."""
+    if not nature_data_enabled():
+        return None
     cached = _inat_cache_get(url, params)
     if cached is not None:
         return cached
@@ -2832,13 +2834,27 @@ def _env_seconds(name, default, low, high):
     return min(float(high), max(float(low), value))
 
 
-def configured_models(requested=None, debug=False):
+def _parse_model_list(raw):
+    """Comma-separated model names. Empty when nothing in the string is usable."""
+    chosen = []
+    for part in (raw or "").split(","):
+        name = part.strip()
+        if _safe_model_name(name) and name not in chosen:
+            chosen.append(name)
+    return chosen[:2]
+
+
+def configured_models(requested=None, debug=False, models_field=None):
     """The models that identify every photo.
 
     XAI_MODELS defaults to grok-4,grok-4.7. They run together. XAI_MODEL, or a
-    debug form value, runs that one model instead. XAI_FALLBACK_AFTER is unused.
+    debug form value, runs that one model instead. With debug=1, `models` is a
+    comma-separated alias for that switch. XAI_FALLBACK_AFTER is unused.
     """
     if debug:
+        chosen = _parse_model_list(models_field)
+        if chosen:
+            return chosen
         candidate = (requested or "").strip()
         if _safe_model_name(candidate):
             return [candidate]
@@ -3069,6 +3085,12 @@ def job_wall_seconds():
 
 
 _JOB_ID = contextvars.ContextVar("finfindr_job_id", default=None)
+# Default True. debug=1 and species_list=none sets this False for that request only.
+_NATURE_DATA = contextvars.ContextVar("finfindr_nature_data", default=True)
+
+
+def nature_data_enabled():
+    return _NATURE_DATA.get()
 
 
 def job_directory():
@@ -3709,6 +3731,8 @@ def fetch_reference_photos(scientific, lat, lng, exclude_observation_id=None, de
     Startup prefetch stores photos without coordinates. A later check reuses
     that cache instead of waiting on iNaturalist again.
     """
+    if not nature_data_enabled():
+        return []
     if deadline is not None and time.monotonic() >= deadline:
         return []
     specific = _reference_cache_key(scientific, lat, lng, exclude_observation_id)
@@ -4773,6 +4797,8 @@ def stamp_meta(meta, request_started):
     stamped.setdefault("verify_reply", "")
     stamped.setdefault("verify_why", "")
     stamped.setdefault("verify_pass_via", "")
+    if not nature_data_enabled():
+        stamped["nature_data"] = "off"
     return stamped
 
 
@@ -5154,7 +5180,32 @@ def _identify_http(image_bytes=None, fields=None):
     discover = discovery_enabled(debug, fields.get("discovery"))
     exclude_observation = (fields.get("exclude_observation_id") or "").strip()
     use_cache = (fields.get("nocache") or "").strip().lower() not in ("1", "true", "yes", "on")
+    nature_off = bool(debug and (fields.get("species_list") or "").strip().lower() == "none")
+    nature_token = _NATURE_DATA.set(False) if nature_off else None
+    if nature_off:
+        mode = "none"
+        verify = False
+        discover = False
+        app.logger.info(
+            "nature_data=off species_list=none; no iNaturalist species list, reference photos, OBIS, or FishBase"
+        )
 
+    try:
+        return _identify_with_nature(
+            image_bytes, fields, jpeg_bytes, image_px, region, lat, lng, coord_source,
+            location_fallback, region_label, mode, debug, model, verify, discover,
+            exclude_observation, use_cache, nature_off,
+        )
+    finally:
+        if nature_token is not None:
+            _NATURE_DATA.reset(nature_token)
+
+
+def _identify_with_nature(
+    image_bytes, fields, jpeg_bytes, image_px, region, lat, lng, coord_source,
+    location_fallback, region_label, mode, debug, model, verify, discover,
+    exclude_observation, use_cache, nature_off,
+):
     xai_key = os.environ.get("XAI_API_KEY")
     if not xai_key:
         app.logger.error("XAI_API_KEY is not set")
@@ -5166,9 +5217,12 @@ def _identify_http(image_bytes=None, fields=None):
 
     request_started = g.identify_started
     set_call_deadline(request_started + job_wall_seconds())
-    species_payload, list_fetch_ms = load_species_alongside_model(
-        region, lat, lng, mode, exclude_observation
-    )
+    if nature_off:
+        species_payload, list_fetch_ms = _empty_species(), 0
+    else:
+        species_payload, list_fetch_ms = load_species_alongside_model(
+            region, lat, lng, mode, exclude_observation
+        )
     species = species_payload.get("species") or []
     locality = locality_text(region, lat, lng, coord_source)
     if location_fallback:
@@ -5187,7 +5241,7 @@ def _identify_http(image_bytes=None, fields=None):
     truncated = prompt_trimmed or (mode == "full" and not species_payload.get("complete"))
     source = species_payload.get("source") or "none"
 
-    models = configured_models(fields.get("model"), debug)
+    models = configured_models(fields.get("model"), debug, fields.get("models"))
 
     def _warm_fast_references(fast_result):
         early = parse_model_candidates(_extract_text(fast_result.get("data") or {}))

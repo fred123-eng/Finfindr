@@ -179,6 +179,7 @@ class IdentifyTests(unittest.TestCase):
 
     def fake_get(self, url, params=None, **kwargs):
         params = params or {}
+        self.captured.setdefault("gets", []).append(str(url))
         if "species_counts" in url:
             with self._calls_lock:
                 self.species_calls.append(params)
@@ -379,6 +380,11 @@ class IdentifyTests(unittest.TestCase):
         finfindr_server._SPECIES_CACHE.clear()
         response = self.post_photo(species_list="nope")
         self.assertEqual(response.get_json()["meta"]["species_list_mode"], "short")
+        plain = self.post_photo(species_list="none", models="grok-4")
+        plain_body = plain.get_json()
+        self.assertEqual(plain_body["meta"]["species_list_mode"], "short")
+        self.assertNotIn("nature_data", plain_body["meta"])
+        self.assertEqual(plain_body["meta"]["models_run"], ["grok-4", "grok-4.7"])
 
     def test_my_location_uses_browser_or_exif_coordinates(self):
         response = self.post_photo(region="my-location", lat="21.30", lng="-157.80")
@@ -2150,7 +2156,6 @@ class IdentifyTests(unittest.TestCase):
         )
         self.assertEqual(parsed[0]["confidence"], "low")
         self.assertEqual(parsed[0]["trait"], "reddish body without eye spots")
-        del identify_prompt, page
 
     def test_disagreement_shows_both_species_until_verify_separates_them(self):
         self.captured["model_text_by_model"] = {
@@ -2394,6 +2399,43 @@ class IdentifyTests(unittest.TestCase):
         self.assertIn("Confidence: none", body["result_text"])
         self.assertNotIn("Confidence: medium", body["result_text"])
         self.assertIn("No matching species", body["result_text"])
+
+    def test_debug_species_list_none_skips_nature_data(self):
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Thalassoma lucasanum\n"
+            "Common name: Cortez rainbow wrasse\n"
+            "Confidence: high\n"
+            "Candidate 1: Thalassoma lucasanum | Cortez rainbow wrasse | high | yellow tail\n"
+        )
+        with self.assertLogs("finfindr_server", level="INFO") as logs:
+            body = self.post_photo(
+                debug="1",
+                species_list="none",
+                models="grok-4,grok-4.7",
+                lat="24.2",
+                lng="-110.3",
+                region="sea-of-cortez",
+            ).get_json()
+        self.assertEqual(body["meta"]["species_list_mode"], "none")
+        self.assertEqual(body["meta"]["nature_data"], "off")
+        self.assertEqual(body["meta"]["models_run"], ["grok-4", "grok-4.7"])
+        self.assertEqual(body["meta"]["species_sent"], 0)
+        self.assertFalse(body["meta"]["verify_used"])
+        self.assertEqual(body["meta"]["verify_skipped"], "disabled")
+        self.assertIsNone(body["discovery"])
+        self.assertIn("No regional species list was available", self.prompt())
+        nature = ("inaturalist.org", "obis.org", "fishbase", "sealifebase", "marinespecies.org")
+        for url in self.captured.get("gets") or []:
+            self.assertFalse(any(host in url for host in nature), url)
+        logged = "\n".join(logs.output)
+        self.assertIn("nature_data=off", logged)
+        self.assertNotIn("api.inaturalist.org", logged)
+        self.assertNotIn("api.obis.org", logged)
+        self.assertNotIn("fishbase.ropensci.org", logged)
+        only = self.post_photo(debug="1", species_list="none", models="grok-4").get_json()
+        self.assertEqual(only["meta"]["models_run"], ["grok-4"])
+        self.assertEqual(only["meta"]["nature_data"], "off")
 
 
 class EvalScoreTests(unittest.TestCase):
