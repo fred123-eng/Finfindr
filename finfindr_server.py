@@ -3323,8 +3323,13 @@ def load_species_for_request(region, lat, lng, mode, exclude_observation_id=None
         query = dict(query)
         query["not_id"] = str(exclude_observation_id)
         query["key"] = f"{query['key']}:not:{exclude_observation_id}"
+    started = time.monotonic()
     left = call_time_left()
     budget = 20.0 if mode == "short" else 30.0
+    wait = species_list_wait_seconds()
+    if not legacy_list_wait(wait):
+        # FF-16: the crawl gets the whole wait, so a cold list can finish.
+        budget = wait
     reserve = _env_seconds("XAI_PRIMARY_TIMEOUT", 80, 5, 100) + 4.0
     if left is not None:
         budget = min(budget, max(2.0, left - reserve))
@@ -3341,35 +3346,82 @@ def load_species_for_request(region, lat, lng, mode, exclude_observation_id=None
         wider = dict(wider)
         wider["not_id"] = str(exclude_observation_id)
         wider["key"] = f"{wider['key']}:not:{exclude_observation_id}"
-    wider_payload = load_species_list(wider, mode, 8.0 if mode == "short" else 12.0)
+    wider_budget = 8.0 if mode == "short" else 12.0
+    if not legacy_list_wait(wait):
+        wider_budget = max(wider_budget, budget - (time.monotonic() - started))
+    wider_payload = load_species_list(wider, mode, wider_budget)
     if len(wider_payload.get("species") or []) > count:
         return wider_payload
     return payload
 
 
-def load_species_alongside_model(region, lat, lng, mode, exclude_observation_id=None):
-    """Start the regional list beside the model. Wait at most two seconds.
+LIST_WAIT_DEFAULT = 60.0
+LIST_WAIT_LEGACY = 2.0
+# A crawl stops itself at its budget; allow one in-flight request to finish.
+LIST_WAIT_GRACE = 10.0
 
-    A cached or prefetched list returns immediately. A slow iNaturalist crawl
-    does not delay grok-4.7; this request then uses the curated names and the
-    crawl fills the disk cache for the next photo.
+
+def species_list_wait_seconds():
+    """FF-16: seconds a request waits for its regional list. Default 60.
+
+    FINFINDR_LIST_WAIT=2 restores the d17345a behavior exactly (2s wait, then
+    curated or none, with the old 20s/8s crawl budgets).
+    """
+    return _env_seconds("FINFINDR_LIST_WAIT", LIST_WAIT_DEFAULT, LIST_WAIT_LEGACY, 150)
+
+
+def legacy_list_wait(wait=None):
+    return (species_list_wait_seconds() if wait is None else wait) <= LIST_WAIT_LEGACY
+
+
+def load_species_alongside_model(region, lat, lng, mode, exclude_observation_id=None):
+    """Load the regional list before the model call.
+
+    A cached or prefetched list returns immediately. On a cold cache the request
+    waits for the iNaturalist crawl (bounded by FINFINDR_LIST_WAIT, default 60s)
+    so the model gets the same list a warm request would. Only a crawl that is
+    still running at the bound falls back to the curated names or none.
     """
     started = time.perf_counter()
     holder = {}
+    wait = species_list_wait_seconds()
+    legacy = legacy_list_wait(wait)
 
     def run():
         holder["payload"] = load_species_for_request(region, lat, lng, mode, exclude_observation_id)
 
     worker = _start_thread(run, "finfindr-list")
-    worker.join(2.0)
+    worker.join(LIST_WAIT_LEGACY if legacy else wait + LIST_WAIT_GRACE)
     if "payload" in holder:
-        return holder["payload"], int(round((time.perf_counter() - started) * 1000))
+        payload = holder["payload"]
+        elapsed = int(round((time.perf_counter() - started) * 1000))
+        _log_species_wait(region, payload, elapsed, wait, False)
+        return payload, elapsed
     query = species_query_for(region, lat, lng)
     cached = _species_cache_get((mode, query["key"])) if query else None
     if cached and cached.get("species"):
-        return cached, int(round((time.perf_counter() - started) * 1000))
+        elapsed = int(round((time.perf_counter() - started) * 1000))
+        _log_species_wait(region, cached, elapsed, wait, True)
+        return cached, elapsed
     payload = _curated_species_payload() if query and query.get("curated_fallback") else _empty_species()
-    return payload, int(round((time.perf_counter() - started) * 1000))
+    elapsed = int(round((time.perf_counter() - started) * 1000))
+    _log_species_wait(region, payload, elapsed, wait, True)
+    return payload, elapsed
+
+
+def _log_species_wait(region, payload, elapsed_ms, wait, waited_out):
+    app.logger.info(
+        "species_list job=%s region=%s list_source=%s list_fetch_ms=%s species=%s complete=%s "
+        "list_wait_s=%s waited_out=%s",
+        _JOB_ID.get(),
+        (region or {}).get("id"),
+        (payload or {}).get("source") or "none",
+        int(elapsed_ms),
+        len((payload or {}).get("species") or []),
+        bool((payload or {}).get("complete")),
+        wait,
+        bool(waited_out),
+    )
 
 
 def _candidate_from_parts(parts, off_list=False):

@@ -2438,6 +2438,115 @@ class IdentifyTests(unittest.TestCase):
         self.assertEqual(only["meta"]["nature_data"], "off")
 
 
+    # FF-16: a cold cache waits for the full iNaturalist list instead of the 2s fallback.
+    def _slow_species_get(self, delay):
+        def slow(url, params=None, **kwargs):
+            if "species_counts" in url:
+                time.sleep(delay)
+            return self.fake_get(url, params, **kwargs)
+        return slow
+
+    def _ff16_join_list_threads(self):
+        # A legacy 2s fallback leaves the crawl running; finish it before the http patch stops.
+        for thread in threading.enumerate():
+            if thread.name in ("finfindr-list", "finfindr-http"):
+                thread.join(30)
+
+    def _ff16_post(self, delay):
+        self.get_patch.stop()
+        self.get_patch = patch("finfindr_server.http.get", side_effect=self._slow_species_get(delay))
+        self.get_patch.start()
+        return self.post_photo(region="sea-of-cortez").get_json()
+
+    def test_ff16_cold_start_waits_for_inat_list_not_curated(self):
+        os.environ.pop("FINFINDR_LIST_WAIT", None)
+        with self.assertLogs("finfindr_server", level="INFO") as logs:
+            body = self._ff16_post(0.25)
+        meta = body["meta"]
+        self.assertEqual(meta["list_source"], "inaturalist")
+        self.assertGreaterEqual(meta["list_fetch_ms"], 2500)
+        self.assertGreater(meta["species_sent"], 0)
+        self.assertNotEqual(meta["species_sent"], len(finfindr_server._curated_species_payload()["species"]))
+        lines = [line for line in logs.output if "species_list job=" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("list_source=inaturalist", lines[0])
+        self.assertIn("list_fetch_ms=", lines[0])
+        self.assertIn("waited_out=False", lines[0])
+        self.assertTrue(any("list_source=inaturalist" in line and "list_fetch_ms=" in line
+                            for line in logs.output if line.startswith("INFO:finfindr_server:identify ")))
+
+    def test_ff16_legacy_flag_keeps_the_two_second_fallback(self):
+        os.environ["FINFINDR_LIST_WAIT"] = "2"
+        try:
+            body = self._ff16_post(0.25)
+        finally:
+            os.environ.pop("FINFINDR_LIST_WAIT", None)
+            self._ff16_join_list_threads()
+        self.assertEqual(body["meta"]["list_source"], "curated")
+        self.assertLess(body["meta"]["list_fetch_ms"], 2600)
+
+    def test_ff16_warm_cache_is_near_zero_and_same_list(self):
+        os.environ.pop("FINFINDR_LIST_WAIT", None)
+        cold = self._ff16_post(0.25)
+        cold_prompt = self.prompt()
+        calls_after_cold = len(self.species_calls)
+        warm = self.post_photo(region="sea-of-cortez").get_json()
+        self.assertEqual(warm["meta"]["list_source"], "inaturalist")
+        self.assertLess(warm["meta"]["list_fetch_ms"], 200)
+        self.assertEqual(len(self.species_calls), calls_after_cold)
+        self.assertEqual(warm["meta"]["species_sent"], cold["meta"]["species_sent"])
+        self.assertEqual(self.prompt(), cold_prompt)
+
+    def test_ff16_waited_list_matches_a_fast_warm_path_list(self):
+        os.environ.pop("FINFINDR_LIST_WAIT", None)
+        self._ff16_post(0.0)
+        fast_prompt = self.prompt()
+        fast_calls = [dict(item) for item in self.species_calls]
+        finfindr_server._SPECIES_CACHE.clear()
+        finfindr_server._INAT_JSON_CACHE.clear()
+        finfindr_server.clear_persisted_caches()
+        self.species_calls.clear()
+        slow = self._ff16_post(0.25)
+        self.assertEqual(slow["meta"]["list_source"], "inaturalist")
+        self.assertEqual(self.prompt(), fast_prompt)
+        key = lambda item: json.dumps(item, sort_keys=True, default=str)
+        self.assertEqual(sorted(map(key, self.species_calls)), sorted(map(key, fast_calls)))
+
+    def test_ff16_wait_is_bounded_then_falls_back(self):
+        os.environ["FINFINDR_LIST_WAIT"] = "3"
+        try:
+            started = time.monotonic()
+            body = self._ff16_post(1.0)
+            elapsed = time.monotonic() - started
+        finally:
+            os.environ.pop("FINFINDR_LIST_WAIT", None)
+            self._ff16_join_list_threads()
+        self.assertEqual(body["meta"]["list_source"], "curated")
+        self.assertLess(elapsed, 3 + finfindr_server.LIST_WAIT_GRACE + 2)
+
+    def test_ff16_async_job_record_has_list_fields(self):
+        os.environ.pop("FINFINDR_LIST_WAIT", None)
+        self.get_patch.stop()
+        self.get_patch = patch("finfindr_server.http.get", side_effect=self._slow_species_get(0.25))
+        self.get_patch.start()
+        response = self.client.post(
+            "/identify",
+            data={"image": (io.BytesIO(jpeg_bytes()), "reef.jpg"), "region": "sea-of-cortez"},
+            content_type="multipart/form-data",
+        )
+        job_id = response.get_json()["job_id"]
+        deadline = time.monotonic() + 30
+        job = {}
+        while time.monotonic() < deadline:
+            job = self.client.get("/identify/status/" + job_id).get_json()
+            if job.get("status") not in ("pending", "running"):
+                break
+            time.sleep(0.1)
+        meta = job["result"]["meta"]
+        self.assertEqual(meta["list_source"], "inaturalist")
+        self.assertGreaterEqual(meta["list_fetch_ms"], 2500)
+
+
 class EvalScoreTests(unittest.TestCase):
     def test_default_targets_are_the_stricter_gates(self):
         targets, path = eval_region.load_targets()
