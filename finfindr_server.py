@@ -4110,6 +4110,239 @@ def certainty_for(candidates, verification):
     return "likely"
 
 
+# --- Look-alike comparison pass (LA-v1) -------------------------------------
+# One extra model call over the first pass's own top 2-3 candidates. OFF by
+# default. The rules below are enforced in code, not only in the prompt:
+#   * the result can only be keep, a switch to a listed candidate, or UNCERTAIN;
+#   * certainty is never raised (a switch is capped at "likely");
+#   * a keep or switch without a visible diagnostic feature per candidate
+#     becomes UNCERTAIN;
+#   * a name that was not listed becomes UNCERTAIN;
+#   * a failed, timed-out, or unparseable call keeps the original answer.
+
+LOOKALIKE_MARKER = "LOOKALIKE_CHECK"
+_CERTAINTY_ORDER = {"unsure": 0, "likely": 1, "confident": 2}
+LOOKALIKE_MAX_CANDIDATES = 3
+LOOKALIKE_MIN_SECONDS = 5.0
+
+
+def lookalike_enabled(debug=False, raw=None):
+    """FINFINDR_LOOKALIKE_PASS=1 turns the look-alike pass on. Default OFF.
+
+    A debug lookalike=0/1 form field overrides the environment for one request.
+    """
+    if debug and (raw or "").strip() in ("0", "1"):
+        return raw.strip() == "1"
+    flag = (os.environ.get("FINFINDR_LOOKALIKE_PASS", "0") or "0").strip().lower()
+    return flag in ("1", "true", "on", "yes")
+
+
+def lookalike_model():
+    """The model used for the look-alike pass. FINFINDR_LOOKALIKE_MODEL, default grok-4.7."""
+    name = (os.environ.get("FINFINDR_LOOKALIKE_MODEL") or "").strip()
+    return name if _safe_model_name(name) else "grok-4.7"
+
+
+def cap_certainty(current, cap):
+    """The lower of two certainty levels. Unknown values count as unsure."""
+    if cap is None:
+        return current
+    a = _CERTAINTY_ORDER.get(current or "unsure", 0)
+    b = _CERTAINTY_ORDER.get(cap or "unsure", 0)
+    return current if a <= b else cap
+
+
+def lookalike_listed(candidates, limit=LOOKALIKE_MAX_CANDIDATES):
+    """The first pass's own top candidates, in shown order, distinct names only."""
+    listed = []
+    seen = set()
+    for item in candidates or []:
+        name = (item.get("scientific_name") or "").strip()
+        if not name or name.lower() in seen:
+            continue
+        listed.append(item)
+        seen.add(name.lower())
+        if len(listed) >= limit:
+            break
+    return listed
+
+
+def lookalike_prompt(listed, locality=""):
+    lines = [LOOKALIKE_MARKER, "The image is the animal to identify."]
+    if locality:
+        lines.append(f"It was photographed in {locality}.")
+    lines.append("A first pass suggested these candidates, in this order:")
+    for index, item in enumerate(listed, start=1):
+        common = item.get("common_name") or "no common name"
+        trait = item.get("trait") or ""
+        lines.append(
+            f"{index}. {item['scientific_name']} ({common})" + (f". First-pass note: {trait}" if trait else "")
+        )
+    lines.extend([
+        "",
+        "These may be look-alikes. Compare ONLY these candidates.",
+        "For EACH candidate, name the one diagnostic feature that separates it from the others,",
+        "and say whether that feature is clearly visible in this photo.",
+        "Then decide:",
+        '- "keep": candidate 1 is supported by a feature that is visible in this photo.',
+        '- "switch": a different listed candidate is supported by a feature that is visible in this photo.',
+        '- "uncertain": the separating features are not visible, or the photo cannot separate the candidates.',
+        "Never name a species that is not in the list. Do not give a confidence level.",
+        "Reply with JSON only, no other text, in exactly this shape:",
+        '{"decision": "keep | switch | uncertain", '
+        '"chosen": "<exact scientific name from the list, or empty for uncertain>", '
+        '"candidates": [{"scientific_name": "<name>", "diagnostic_feature": "<feature>", "visible": true}], '
+        '"reason": "<one sentence>"}',
+    ])
+    return "\n".join(lines)
+
+
+def parse_lookalike_reply(text):
+    """The JSON object from the reply, or None when it is missing or malformed."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", raw, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        raw = fenced.group(1).strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        parsed = json.loads(raw[start:end + 1])
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _truthy_visible(value):
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ("true", "yes", "visible", "1")
+
+
+def decide_lookalike(parsed, listed, original_certainty):
+    """Apply the LA-v1 rules to a parsed reply. Pure function; no model calls.
+
+    Returns a dict with outcome (keep / switch / uncertain / fallback),
+    scientific_name (the answer to show first), certainty (never above
+    original_certainty), and reason.
+    """
+    names = [(item.get("scientific_name") or "").strip() for item in listed]
+    lower = [name.lower() for name in names]
+    original = names[0] if names else ""
+
+    def result(outcome, name, certainty, reason):
+        return {
+            "outcome": outcome,
+            "scientific_name": name,
+            "certainty": cap_certainty(certainty, original_certainty),
+            "reason": reason,
+        }
+
+    if not isinstance(parsed, dict):
+        return result("fallback", original, original_certainty, "malformed_reply")
+    decision = str(parsed.get("decision") or "").strip().lower()
+    if decision not in ("keep", "switch", "uncertain"):
+        return result("fallback", original, original_certainty, "unknown_decision")
+    if decision == "uncertain":
+        return result("uncertain", original, "unsure", "model_uncertain")
+
+    chosen_raw = str(parsed.get("chosen") or "").strip()
+    chosen = exact_scientific_name(chosen_raw) if chosen_raw else ""
+    if decision == "keep" and not chosen:
+        chosen = original
+    if not chosen or chosen.lower() not in lower:
+        return result("uncertain", original, "unsure", "unlisted_choice")
+    if decision == "keep" and chosen.lower() != original.lower():
+        return result("uncertain", original, "unsure", "inconsistent_keep")
+    if decision == "switch" and chosen.lower() == original.lower():
+        decision = "keep"
+
+    features = {}
+    for entry in parsed.get("candidates") if isinstance(parsed.get("candidates"), list) else []:
+        if not isinstance(entry, dict):
+            continue
+        name = exact_scientific_name(str(entry.get("scientific_name") or ""))
+        if name:
+            features[name.lower()] = entry
+    for name in lower:
+        entry = features.get(name)
+        if not entry or not explicit_diagnostic_trait(str(entry.get("diagnostic_feature") or "")):
+            return result("uncertain", original, "unsure", "uncited_feature")
+    if not _truthy_visible(features[chosen.lower()].get("visible")):
+        return result("uncertain", original, "unsure", "feature_not_visible")
+
+    chosen_name = names[lower.index(chosen.lower())]
+    if decision == "keep":
+        return result("keep", chosen_name, original_certainty, "kept_with_visible_feature")
+    return result("switch", chosen_name, cap_certainty(original_certainty, "likely"), "switched_with_visible_feature")
+
+
+def run_lookalike_pass(jpeg_bytes, candidates, certainty, locality, api_key, request_started, use_cache=True):
+    """Run LA-v1 once. Returns (meta, new_candidates, new_certainty).
+
+    new_certainty is never above certainty. On any failure the inputs come back unchanged.
+    """
+    listed = lookalike_listed(candidates)
+    meta = {
+        "enabled": True,
+        "model": lookalike_model(),
+        "listed": [item["scientific_name"] for item in listed],
+        "certainty_before": certainty,
+        "outcome": "skipped",
+        "reason": "",
+        "ms": 0,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "token_source": "",
+        "error": "",
+        "raw_reply": "",
+    }
+    if certainty not in ("likely", "confident"):
+        meta["reason"] = "not_named"
+        return meta, candidates, certainty
+    if len(listed) < 2:
+        meta["reason"] = "single_candidate"
+        return meta, candidates, certainty
+    timeout = min(model_call_timeout(), _time_left(request_started) - 2.0)
+    if timeout < LOOKALIKE_MIN_SECONDS:
+        meta["reason"] = "no_time"
+        return meta, candidates, certainty
+    prompt = lookalike_prompt(listed, locality)
+    started = time.perf_counter()
+    try:
+        reply = _call_vision_model(jpeg_bytes, prompt, meta["model"], timeout, api_key, use_cache=use_cache)
+    except Exception as exc:  # never let the extra pass break an answer
+        reply = {"ok": False, "error": f"exception:{type(exc).__name__}"}
+    meta["ms"] = int(round((time.perf_counter() - started) * 1000))
+    if not reply.get("ok"):
+        error = str(reply.get("error") or "failed")
+        meta["outcome"] = "fallback"
+        meta["reason"] = "timeout" if error == "timeout" else "call_failed"
+        meta["error"] = error[:60]
+        return meta, candidates, certainty
+    data = reply.get("data") or {}
+    usage = data.get("usage") if isinstance(data, dict) else None
+    tokens, source = _prompt_tokens(data, prompt)
+    meta["prompt_tokens"], meta["token_source"] = tokens, source
+    if isinstance(usage, dict):
+        out = usage.get("output_tokens", usage.get("completion_tokens"))
+        meta["completion_tokens"] = out if isinstance(out, int) and not isinstance(out, bool) else None
+    text = _extract_text(data)
+    meta["raw_reply"] = (text or "")[:2000]
+    decided = decide_lookalike(parse_lookalike_reply(text), listed, certainty)
+    meta["outcome"] = decided["outcome"]
+    meta["reason"] = decided["reason"]
+    meta["chosen"] = decided["scientific_name"]
+    new_certainty = cap_certainty(decided["certainty"], certainty)
+    new_candidates = candidates
+    if decided["outcome"] == "switch":
+        new_candidates = _order_candidates(list(candidates), decided["scientific_name"])
+    meta["certainty_after"] = new_certainty
+    return meta, new_candidates, new_certainty
+
+
 _CONFIDENCE_RANK = {"high": 0, "medium": 1, "low": 2}
 
 
@@ -5565,6 +5798,25 @@ def _identify_with_nature(
         verification and verification.get("decision") not in ("", "UNSURE", "NO_MATCH")
     )
     shown = public_candidates(candidates, species, preserve_order=verifier_ordered)
+    la_meta = None
+    la_cap = None
+    if lookalike_enabled(debug, fields.get("lookalike")) and not nature_off:
+        job_progress("Comparing look-alikes")
+        la_meta, _, la_certainty = run_lookalike_pass(
+            jpeg_bytes, shown, certainty, locality, xai_key, request_started, use_cache=use_cache,
+        )
+        if la_meta.get("ms"):
+            attempts.append(_attempt_record(
+                la_meta["model"], la_meta["ms"], not la_meta.get("error"), la_meta.get("error") or None,
+            ))
+        if la_meta["outcome"] in ("switch", "uncertain"):
+            la_cap = la_certainty
+            certainty = cap_certainty(certainty, la_cap)
+        if la_meta["outcome"] == "switch":
+            chosen = la_meta.get("chosen") or ""
+            candidates = _order_candidates(sort_candidates(candidates), chosen)
+            shown = _order_candidates(shown, chosen)
+            verifier_ordered = True
     notes_text = _field_value(text, "Notes")
     known_traits = SPECIES_TRAITS.get((shown[0].get("scientific_name") if shown else "").lower(), "") if shown else ""
     trait_conflict = bool(shown) and traits_contradict(
@@ -5773,6 +6025,13 @@ def _identify_with_nature(
         for item in shown:
             if item.get("confidence") == "high":
                 item["confidence"] = "medium"
+    if la_cap is not None:
+        # LA-v1: nothing after the look-alike pass may raise certainty above its cap.
+        certainty = cap_certainty(certainty, la_cap)
+        if certainty != "confident":
+            for item in shown:
+                if item.get("confidence") == "high":
+                    item["confidence"] = "medium"
     if no_match or (discovery and discovery.get("type") == "no_match"):
         text = _no_match_result_text(discovery)
         certainty = "unsure"
@@ -5799,6 +6058,9 @@ def _identify_with_nature(
     meta["verify_timeout_s"] = verify_timeout_cap()
     meta["off_list_proposed"] = off_list_proposed
     meta["off_list_kept"] = off_list_kept
+    if la_meta is not None:
+        la_meta["certainty_final"] = certainty
+        meta["lookalike"] = la_meta
     source_candidate = (shown[0] if shown else None) or (candidates[0] if candidates else None)
     _apply_model_bundle(meta, result, final_source_for(source_candidate))
     meta = stamp_meta(meta, request_started)

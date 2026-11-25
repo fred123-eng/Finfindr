@@ -145,6 +145,7 @@ class IdentifyTests(unittest.TestCase):
         os.environ.pop("FINFINDR_VERIFY", None)
         os.environ.pop("FINFINDR_VERIFY_TIMEOUT", None)
         os.environ.pop("FINFINDR_VERIFY_IMAGE_PX", None)
+        os.environ.pop("FINFINDR_LOOKALIKE_PASS", None)
         os.environ["FINFINDR_INAT_MIN_INTERVAL"] = "0"
         os.environ["FINFINDR_MODEL_CACHE"] = "0"
         self.cache_dir = tempfile.mkdtemp(prefix="finfindr-cache-")
@@ -214,6 +215,18 @@ class IdentifyTests(unittest.TestCase):
         if self.captured.get("delay"):
             time.sleep(self.captured["delay"])
         by_model = self.captured.get("model_text_by_model") or {}
+        if finfindr_server.LOOKALIKE_MARKER in prompt:
+            self.captured.setdefault("lookalike_calls", []).append({"model": model, "timeout": kwargs.get("timeout"), "prompt": prompt})
+            if self.captured.get("lookalike_raises") == "timeout":
+                raise requests.Timeout("lookalike slow")
+            if self.captured.get("lookalike_raises") == "error":
+                return FakeResponse({"error": "upstream"}, status=503)
+            text = self.captured.get("lookalike_text", "")
+            body = {
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}],
+                "usage": {"input_tokens": 1500, "output_tokens": 120, "total_tokens": 1620},
+            }
+            return FakeResponse(body)
         if "OFFLIST_FOLLOWUP" in prompt and self.captured.get("offlist_text"):
             text = self.captured["offlist_text"]
         elif model in by_model and "The first image is the animal" not in prompt:
@@ -2580,6 +2593,289 @@ class IdentifyTests(unittest.TestCase):
         self.assertEqual(body["meta"]["list_wait_s"], 3.0)
         self.assertEqual(body["meta"]["list_fetch_ms"], 3100)
         self.assertEqual(body["meta"]["list_source"], "curated")
+
+
+    # --- LA-v1 look-alike pass: end-to-end through /identify (mocked model) ---
+
+    LA_FIRST_PASS = (
+        "Photo quality: good\nPhoto issue: none\n"
+        "Common name: Cortez damselfish\nScientific name: Stegastes rectifraenum\n"
+        "Group: damselfish\nAlternative group considered: none\nConfidence: medium\n"
+        "Notes: A reef damselfish.\n"
+        "Candidate 1: Stegastes rectifraenum | Cortez damselfish | medium | dark oval body with a yellow tail\n"
+        "Candidate 2: Microspathodon dorsalis | Giant damselfish | low | larger body with scattered blue spots\n"
+    )
+
+    @staticmethod
+    def la_reply(decision, chosen, features=None, extra=None):
+        features = features if features is not None else [
+            {"scientific_name": "Stegastes rectifraenum", "diagnostic_feature": "bright yellow caudal fin", "visible": True},
+            {"scientific_name": "Microspathodon dorsalis", "diagnostic_feature": "scattered blue spots on the flanks", "visible": True},
+        ]
+        payload = {"decision": decision, "chosen": chosen, "candidates": features, "reason": "test"}
+        payload.update(extra or {})
+        return json.dumps(payload)
+
+    def la_post(self, **fields):
+        self.captured["model_text"] = self.LA_FIRST_PASS
+        base = {"debug": "1", "verify": "0", "models": "grok-4.7", "discovery": "0"}
+        base.update(fields)
+        return self.post_photo(**base).get_json()
+
+    @staticmethod
+    def stable(body):
+        out = {k: v for k, v in body.items() if k != "meta"}
+        return json.dumps(out, sort_keys=True)
+
+    def test_lookalike_flag_off_means_no_behaviour_change(self):
+        os.environ.pop("FINFINDR_LOOKALIKE_PASS", None)
+        self.assertFalse(finfindr_server.lookalike_enabled())
+        baseline = self.la_post()
+        self.assertNotIn("lookalike", baseline["meta"])
+        self.assertFalse(self.captured.get("lookalike_calls"))
+        # A switch reply is waiting, but with the flag off it must never be requested.
+        self.captured["lookalike_text"] = self.la_reply("switch", "Microspathodon dorsalis")
+        for value in (None, "0", "false", "off"):
+            if value is None:
+                os.environ.pop("FINFINDR_LOOKALIKE_PASS", None)
+            else:
+                os.environ["FINFINDR_LOOKALIKE_PASS"] = value
+            try:
+                body = self.la_post()
+            finally:
+                os.environ.pop("FINFINDR_LOOKALIKE_PASS", None)
+            self.assertEqual(self.stable(body), self.stable(baseline))
+            self.assertNotIn("lookalike", body["meta"])
+            self.assertEqual(len(body["meta"]["attempts"]), len(baseline["meta"]["attempts"]))
+        self.assertFalse(self.captured.get("lookalike_calls"))
+        self.assertEqual(baseline["certainty"], "likely")
+        self.assertEqual(baseline["candidates"][0]["scientific_name"], "Stegastes rectifraenum")
+
+    def test_lookalike_switch_to_listed_candidate_at_likely(self):
+        self.captured["lookalike_text"] = self.la_reply("switch", "Microspathodon dorsalis", extra={"certainty": "confident"})
+        body = self.la_post(lookalike="1")
+        self.assertEqual(len(self.captured["lookalike_calls"]), 1)
+        self.assertEqual(self.captured["lookalike_calls"][0]["model"], "grok-4.7")
+        self.assertIn("Stegastes rectifraenum", self.captured["lookalike_calls"][0]["prompt"])
+        self.assertIn("Microspathodon dorsalis", self.captured["lookalike_calls"][0]["prompt"])
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Microspathodon dorsalis")
+        self.assertEqual(body["certainty"], "likely")  # a "confident" in the reply is ignored
+        self.assertIn("Microspathodon dorsalis", body["result_text"])
+        la = body["meta"]["lookalike"]
+        self.assertEqual(la["outcome"], "switch")
+        self.assertEqual(la["certainty_final"], "likely")
+        self.assertEqual(la["prompt_tokens"], 1500)
+        self.assertEqual(la["completion_tokens"], 120)
+
+    def test_lookalike_keep_leaves_answer_unchanged(self):
+        off = self.la_post()
+        self.captured["lookalike_text"] = self.la_reply("keep", "Stegastes rectifraenum")
+        on = self.la_post(lookalike="1")
+        self.assertEqual(on["meta"]["lookalike"]["outcome"], "keep")
+        self.assertEqual(self.stable(on), self.stable(off))
+
+    def test_lookalike_uncited_switch_becomes_uncertain(self):
+        self.captured["lookalike_text"] = self.la_reply("switch", "Microspathodon dorsalis", features=[])
+        body = self.la_post(lookalike="1")
+        self.assertEqual(body["certainty"], "unsure")
+        self.assertEqual(body["meta"]["lookalike"]["outcome"], "uncertain")
+        self.assertEqual(body["meta"]["lookalike"]["reason"], "uncited_feature")
+
+    def test_lookalike_unlisted_choice_becomes_uncertain(self):
+        feats = [
+            {"scientific_name": "Stegastes rectifraenum", "diagnostic_feature": "bright yellow caudal fin", "visible": True},
+            {"scientific_name": "Microspathodon dorsalis", "diagnostic_feature": "scattered blue spots", "visible": True},
+            {"scientific_name": "Holacanthus passer", "diagnostic_feature": "white vertical bar", "visible": True},
+        ]
+        self.captured["lookalike_text"] = self.la_reply("switch", "Holacanthus passer", features=feats)
+        body = self.la_post(lookalike="1")
+        self.assertEqual(body["certainty"], "unsure")
+        self.assertNotIn("Holacanthus passer", [c["scientific_name"] for c in body["candidates"]])
+        self.assertEqual(body["meta"]["lookalike"]["reason"], "unlisted_choice")
+
+    def test_lookalike_timeout_and_error_fall_back_to_original(self):
+        off = self.la_post()
+        for mode in ("timeout", "error"):
+            self.captured["lookalike_raises"] = mode
+            self.captured["lookalike_text"] = self.la_reply("switch", "Microspathodon dorsalis")
+            body = self.la_post(lookalike="1")
+            self.assertEqual(self.stable(body), self.stable(off), mode)
+            self.assertEqual(body["meta"]["lookalike"]["outcome"], "fallback")
+            self.assertEqual(body["meta"]["lookalike"]["reason"], "timeout" if mode == "timeout" else "call_failed")
+        timeouts = [call["timeout"] for call in self.captured["lookalike_calls"]]
+        self.assertTrue(all(t is not None and t <= finfindr_server.model_call_timeout() for t in timeouts))
+
+    def test_lookalike_malformed_json_falls_back_to_original(self):
+        off = self.la_post()
+        for reply in ("", "not json at all", '{"decision": "switch", "chosen": ', "[1, 2, 3]", '{"decision": "maybe"}'):
+            self.captured["lookalike_text"] = reply
+            body = self.la_post(lookalike="1")
+            self.assertEqual(self.stable(body), self.stable(off), reply)
+            self.assertEqual(body["meta"]["lookalike"]["outcome"], "fallback", reply)
+
+
+
+    def test_lookalike_does_not_run_when_usable_or_marine_gate_stops(self):
+        """Gates stay usable -> marine -> identify. LA runs only after both pass."""
+        os.environ["FINFINDR_LOOKALIKE_PASS"] = "1"
+        try:
+            self.captured["lookalike_text"] = self.la_reply("switch", "Microspathodon dorsalis")
+            self.captured["model_text"] = (
+                "Photo quality: invalid\n"
+                "Photo issue: too blurry to see the animal\n"
+                "Scientific name: Stegastes rectifraenum\n"
+                "Confidence: medium\n"
+                "Candidate 1: Stegastes rectifraenum | Cortez damselfish | medium | yellow tail\n"
+                "Candidate 2: Microspathodon dorsalis | Giant damselfish | low | blue spots\n"
+            )
+            unusable = self.post_photo(debug="1", verify="0", models="grok-4.7", lookalike="1", discovery="0").get_json()
+            self.assertEqual(unusable["message"], "Can't identify from this photo.")
+            self.assertFalse(self.captured.get("lookalike_calls"))
+            self.assertNotIn("lookalike", unusable["meta"])
+
+            self.captured["lookalike_calls"] = []
+            self.inat_handler = self._felis_taxon
+            self.captured["model_text"] = (
+                "Photo quality: good\n"
+                "Common name: Domestic Cat\n"
+                "Scientific name: Felis catus\n"
+                "Confidence: high\n"
+                "Candidate 1: Felis catus | Domestic Cat | high | pointed ears and whiskers\n"
+                "Candidate 2: Felis silvestris | Wildcat | low | striped flanks\n"
+            )
+            marine = self.post_photo(debug="1", verify="0", models="grok-4.7", lookalike="1", discovery="0").get_json()
+            self._assert_not_marine(marine)
+            self.assertFalse(self.captured.get("lookalike_calls"))
+            self.assertNotIn("lookalike", marine["meta"])
+        finally:
+            os.environ.pop("FINFINDR_LOOKALIKE_PASS", None)
+
+class LookalikeRuleTests(unittest.TestCase):
+    """LA-v1 rules as pure functions. No model calls."""
+
+    LISTED = [
+        {"scientific_name": "Octopus hubbsorum", "confidence": "medium"},
+        {"scientific_name": "Octopus bimaculatus", "confidence": "low"},
+        {"scientific_name": "Octopus digueti", "confidence": "low"},
+    ]
+
+    def feats(self, visible=True, feature="paired ocelli below the eyes"):
+        return [{"scientific_name": c["scientific_name"], "diagnostic_feature": feature, "visible": visible} for c in self.LISTED]
+
+    def decide(self, payload, certainty="likely"):
+        return finfindr_server.decide_lookalike(payload, self.LISTED, certainty)
+
+    def tearDown(self):
+        os.environ.pop("FINFINDR_LOOKALIKE_PASS", None)
+
+    def test_flag_is_off_by_default_and_named(self):
+        os.environ.pop("FINFINDR_LOOKALIKE_PASS", None)
+        self.assertFalse(finfindr_server.lookalike_enabled())
+        self.assertFalse(finfindr_server.lookalike_enabled(False, "1"))  # form field needs debug
+        self.assertTrue(finfindr_server.lookalike_enabled(True, "1"))
+        os.environ["FINFINDR_LOOKALIKE_PASS"] = "1"
+        self.assertTrue(finfindr_server.lookalike_enabled())
+        self.assertFalse(finfindr_server.lookalike_enabled(True, "0"))
+
+    def test_never_raises_certainty(self):
+        order = {"unsure": 0, "likely": 1, "confident": 2}
+        payloads = [
+            {"decision": "keep", "chosen": "Octopus hubbsorum", "candidates": self.feats(), "certainty": "confident"},
+            {"decision": "switch", "chosen": "Octopus bimaculatus", "candidates": self.feats(), "certainty": "confident"},
+            {"decision": "uncertain"},
+            None,
+            {"decision": "switch", "chosen": "Octopus bimaculatus", "candidates": []},
+        ]
+        for before in ("unsure", "likely", "confident"):
+            for payload in payloads:
+                out = self.decide(payload, before)
+                self.assertLessEqual(order[out["certainty"]], order[before], (before, payload))
+        switched = self.decide(payloads[1], "confident")
+        self.assertEqual(switched["outcome"], "switch")
+        self.assertEqual(switched["certainty"], "likely")
+        self.assertEqual(finfindr_server.cap_certainty("confident", "likely"), "likely")
+        self.assertEqual(finfindr_server.cap_certainty("likely", "confident"), "likely")
+        self.assertEqual(finfindr_server.cap_certainty("unsure", "likely"), "unsure")
+
+    def test_pass_does_not_run_on_unsure_answers(self):
+        with patch.object(finfindr_server, "_call_vision_model") as call:
+            meta, cands, certainty = finfindr_server.run_lookalike_pass(
+                b"jpeg", self.LISTED, "unsure", "", "key", time.monotonic()
+            )
+        call.assert_not_called()
+        self.assertEqual((meta["outcome"], meta["reason"], certainty), ("skipped", "not_named", "unsure"))
+        with patch.object(finfindr_server, "_call_vision_model") as call:
+            meta, _, certainty = finfindr_server.run_lookalike_pass(
+                b"jpeg", self.LISTED[:1], "likely", "", "key", time.monotonic()
+            )
+        call.assert_not_called()
+        self.assertEqual(meta["reason"], "single_candidate")
+
+    def test_uncited_switch_becomes_uncertain(self):
+        cases = [
+            {"decision": "switch", "chosen": "Octopus bimaculatus"},
+            {"decision": "switch", "chosen": "Octopus bimaculatus", "candidates": self.feats(feature="")},
+            {"decision": "switch", "chosen": "Octopus bimaculatus", "candidates": self.feats(feature="similar")},
+            {"decision": "switch", "chosen": "Octopus bimaculatus", "candidates": self.feats()[:2]},
+            {"decision": "keep", "chosen": "Octopus hubbsorum", "candidates": self.feats()[1:]},
+        ]
+        for payload in cases:
+            out = self.decide(payload)
+            self.assertEqual((out["outcome"], out["certainty"], out["reason"]), ("uncertain", "unsure", "uncited_feature"), payload)
+        hidden = self.decide({"decision": "switch", "chosen": "Octopus bimaculatus", "candidates": self.feats(visible=False)})
+        self.assertEqual((hidden["outcome"], hidden["reason"]), ("uncertain", "feature_not_visible"))
+
+    def test_only_listed_candidates_are_allowed(self):
+        for chosen in ("Octopus vulgaris", "Holacanthus passer", "octopus", "UNSURE"):
+            out = self.decide({"decision": "switch", "chosen": chosen, "candidates": self.feats()})
+            self.assertEqual((out["outcome"], out["certainty"]), ("uncertain", "unsure"), chosen)
+            self.assertEqual(out["scientific_name"], "Octopus hubbsorum")
+        mixed = self.decide({"decision": "keep", "chosen": "Octopus bimaculatus", "candidates": self.feats()})
+        self.assertEqual((mixed["outcome"], mixed["reason"]), ("uncertain", "inconsistent_keep"))
+        ok = self.decide({"decision": "switch", "chosen": "octopus BIMACULATUS", "candidates": self.feats()})
+        self.assertEqual((ok["outcome"], ok["scientific_name"]), ("switch", "Octopus bimaculatus"))
+        same = self.decide({"decision": "switch", "chosen": "Octopus hubbsorum", "candidates": self.feats()})
+        self.assertEqual(same["outcome"], "keep")
+
+    def test_malformed_json(self):
+        parse = finfindr_server.parse_lookalike_reply
+        for text in ("", "   ", "keep", "{", '{"decision": "keep",}', "[]", '"keep"', "null"):
+            self.assertIsNone(parse(text), text)
+            out = self.decide(parse(text))
+            self.assertEqual((out["outcome"], out["certainty"], out["scientific_name"]), ("fallback", "likely", "Octopus hubbsorum"))
+        fenced = parse('Here you go:\n```json\n{"decision": "uncertain"}\n```')
+        self.assertEqual(fenced, {"decision": "uncertain"})
+        self.assertEqual(self.decide({"decision": 7})["outcome"], "fallback")
+
+    def test_timeout_and_error_fallback(self):
+        cases = [
+            {"ok": False, "retryable": True, "error": "timeout", "ms": 5},
+            {"ok": False, "retryable": True, "error": "http_503", "ms": 5},
+            {"ok": False, "retryable": True, "error": "invalid_json", "ms": 5},
+        ]
+        for reply in cases:
+            with patch.object(finfindr_server, "_call_vision_model", return_value=reply) as call:
+                meta, cands, certainty = finfindr_server.run_lookalike_pass(
+                    b"jpeg", self.LISTED, "likely", "", "key", time.monotonic()
+                )
+            self.assertEqual(meta["outcome"], "fallback")
+            self.assertEqual(meta["reason"], "timeout" if reply["error"] == "timeout" else "call_failed")
+            self.assertEqual(certainty, "likely")
+            self.assertIs(cands, self.LISTED)
+            timeout = call.call_args[0][3]
+            self.assertLessEqual(timeout, finfindr_server.model_call_timeout())
+        with patch.object(finfindr_server, "_call_vision_model", side_effect=RuntimeError("boom")):
+            meta, cands, certainty = finfindr_server.run_lookalike_pass(
+                b"jpeg", self.LISTED, "likely", "", "key", time.monotonic()
+            )
+        self.assertEqual((meta["outcome"], meta["reason"], certainty), ("fallback", "call_failed", "likely"))
+        with patch.object(finfindr_server, "_time_left", return_value=3.0), \
+                patch.object(finfindr_server, "_call_vision_model") as call:
+            meta, _, certainty = finfindr_server.run_lookalike_pass(
+                b"jpeg", self.LISTED, "likely", "", "key", time.monotonic()
+            )
+        call.assert_not_called()
+        self.assertEqual((meta["reason"], certainty), ("no_time", "likely"))
 
 
 class EvalScoreTests(unittest.TestCase):
