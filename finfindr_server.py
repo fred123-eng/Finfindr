@@ -2875,7 +2875,7 @@ def configured_models(requested=None, debug=False, models_field=None):
     return models[:2] or ["grok-4", "grok-4.7"]
 
 
-def _identification_meta(mode, sent, available, truncated, source, list_ms, model_ms, tokens, token_source, model, image_px, fallback_used=False, attempts=None, verify_used=False, verify_ms=0, reference_fetch_ms=0, total_ms=None, verify_skipped=""):
+def _identification_meta(mode, sent, available, truncated, source, list_ms, model_ms, tokens, token_source, model, image_px, fallback_used=False, attempts=None, verify_used=False, verify_ms=0, reference_fetch_ms=0, total_ms=None, verify_skipped="", list_wait_s=0, waited_out=False):
     return {
         "species_list_mode": mode,
         "species_sent": sent,
@@ -2885,6 +2885,8 @@ def _identification_meta(mode, sent, available, truncated, source, list_ms, mode
         "prompt_tokens": tokens,
         "prompt_tokens_source": token_source,
         "list_fetch_ms": int(list_ms),
+        "list_wait_s": list_wait_s,
+        "waited_out": bool(waited_out),
         "model_call_ms": int(model_ms),
         "model": model,
         "image_px": image_px,
@@ -3396,17 +3398,17 @@ def load_species_alongside_model(region, lat, lng, mode, exclude_observation_id=
         payload = holder["payload"]
         elapsed = int(round((time.perf_counter() - started) * 1000))
         _log_species_wait(region, payload, elapsed, wait, False)
-        return payload, elapsed
+        return payload, elapsed, wait, False
     query = species_query_for(region, lat, lng)
     cached = _species_cache_get((mode, query["key"])) if query else None
     if cached and cached.get("species"):
         elapsed = int(round((time.perf_counter() - started) * 1000))
         _log_species_wait(region, cached, elapsed, wait, True)
-        return cached, elapsed
+        return cached, elapsed, wait, True
     payload = _curated_species_payload() if query and query.get("curated_fallback") else _empty_species()
     elapsed = int(round((time.perf_counter() - started) * 1000))
     _log_species_wait(region, payload, elapsed, wait, True)
-    return payload, elapsed
+    return payload, elapsed, wait, True
 
 
 def _log_species_wait(region, payload, elapsed_ms, wait, waited_out):
@@ -5270,9 +5272,9 @@ def _identify_with_nature(
     request_started = g.identify_started
     set_call_deadline(request_started + job_wall_seconds())
     if nature_off:
-        species_payload, list_fetch_ms = _empty_species(), 0
+        species_payload, list_fetch_ms, list_wait_s, waited_out = _empty_species(), 0, 0, False
     else:
-        species_payload, list_fetch_ms = load_species_alongside_model(
+        species_payload, list_fetch_ms, list_wait_s, waited_out = load_species_alongside_model(
             region, lat, lng, mode, exclude_observation
         )
     species = species_payload.get("species") or []
@@ -5347,6 +5349,7 @@ def _identify_with_nature(
             mode, sent, available, truncated, source, list_fetch_ms, model_ms,
             None, "unavailable", answered, image_px, fallback_used, attempts,
             False, 0, 0, total_ms, "model_timeout" if result.get("error") == "timeout" else "model_failed",
+            list_wait_s=list_wait_s, waited_out=waited_out,
         )
         apply_verify_rates(meta, False, False, 0, 0, meta["verify_skipped"])
         _apply_model_bundle(meta, result)
@@ -5370,6 +5373,7 @@ def _identify_with_nature(
             mode, sent, available, truncated, source, list_fetch_ms, model_ms,
             tokens, token_source, answered, image_px, fallback_used, attempts,
             False, 0, 0, None, "photo_unusable",
+            list_wait_s=list_wait_s, waited_out=waited_out,
         )
         meta["photo_quality"] = photo_quality
         meta["evidence"] = [f"photo_{photo_quality or 'unusable'}"]
@@ -5400,6 +5404,7 @@ def _identify_with_nature(
             mode, sent, available, truncated, source, list_fetch_ms, model_ms,
             tokens, token_source, answered, image_px, fallback_used, attempts,
             False, 0, 0, None, "not_marine",
+            list_wait_s=list_wait_s, waited_out=waited_out,
         )
         meta["photo_quality"] = photo_quality
         meta["off_list_proposed"] = off_list_proposed
@@ -5732,6 +5737,7 @@ def _identify_with_nature(
         mode, sent, available, truncated, source, list_fetch_ms, model_ms,
         tokens, token_source, answered, image_px, fallback_used, attempts,
         verify_used, verify_ms, reference_fetch_ms, total_ms, verify_skipped,
+        list_wait_s=list_wait_s, waited_out=waited_out,
     )
     meta["photo_quality"] = photo_quality
     meta["discovery_checked"] = discovery_checked

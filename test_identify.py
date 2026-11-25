@@ -2546,6 +2546,41 @@ class IdentifyTests(unittest.TestCase):
         self.assertEqual(meta["list_source"], "inaturalist")
         self.assertGreaterEqual(meta["list_fetch_ms"], 2500)
 
+    def test_ff16_client_meta_includes_list_wait_and_waited_out(self):
+        # list_wait_s and waited_out were already on the species_list log line;
+        # this only checks they are also returned on the client meta.
+        os.environ.pop("FINFINDR_LIST_WAIT", None)
+        with self.assertLogs("finfindr_server", level="INFO") as logs:
+            cold = self._ff16_post(0.25)
+        meta = cold["meta"]
+        self.assertEqual(meta["list_wait_s"], finfindr_server.species_list_wait_seconds())
+        self.assertFalse(meta["waited_out"])
+        self.assertEqual(meta["list_source"], "inaturalist")
+        self.assertGreaterEqual(meta["list_fetch_ms"], 2500)
+        lines = [line for line in logs.output if "species_list job=" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("list_wait_s=%s" % meta["list_wait_s"], lines[0])
+        self.assertIn("waited_out=%s" % meta["waited_out"], lines[0])
+
+        warm = self.post_photo(region="sea-of-cortez").get_json()
+        self.assertEqual(warm["meta"]["list_wait_s"], finfindr_server.species_list_wait_seconds())
+        self.assertFalse(warm["meta"]["waited_out"])
+        self.assertLess(warm["meta"]["list_fetch_ms"], 200)
+
+        # A crawl that is still running after the wait+grace bound is the
+        # waited_out=True path already logged by _log_species_wait.
+        payload = finfindr_server._curated_species_payload()
+        with patch.object(
+            finfindr_server,
+            "load_species_alongside_model",
+            return_value=(payload, 3100, 3.0, True),
+        ):
+            body = self.post_photo(region="sea-of-cortez").get_json()
+        self.assertTrue(body["meta"]["waited_out"])
+        self.assertEqual(body["meta"]["list_wait_s"], 3.0)
+        self.assertEqual(body["meta"]["list_fetch_ms"], 3100)
+        self.assertEqual(body["meta"]["list_source"], "curated")
+
 
 class EvalScoreTests(unittest.TestCase):
     def test_default_targets_are_the_stricter_gates(self):
