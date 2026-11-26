@@ -88,6 +88,7 @@ HTML = """
   .discovery-card ul { margin: 0.45rem 0 0.2rem 1.1rem; }
   .discovery-card a { color: var(--aqua); }
   .quiet-note { margin-top: 0.55rem; opacity: 0.85; }
+  .not-in-region { margin-top: 0.75rem; padding: 0.7rem 0.8rem; border-radius: 12px; border: 1px solid rgba(255, 196, 80, 0.45); background: rgba(255, 196, 80, 0.08); line-height: 1.45; }
   #fileInput { display: block; width: 100%; max-width: 100%; margin: 1rem auto; font-size: 1rem; color: var(--white); }
   #results { max-width: 800px; margin: 0 auto; }
   .result-card { background: rgba(0,0,0,0.35); border-radius: 16px; margin-bottom: 1.25rem; border: 1px solid rgba(255,255,255,0.1); overflow: hidden; }
@@ -404,6 +405,16 @@ function showCandidates(card, candidates, allowHigh) {
     list.appendChild(block);
   });
   card.querySelector(".result-body").appendChild(list);
+}
+
+function showNotInRegion(card, data) {
+  const flag = data && data.not_in_region;
+  if (!flag) return;
+  const note = document.createElement("p");
+  note.className = "not-in-region";
+  note.textContent = flag.display || flag.text || "";
+  if (!note.textContent) return;
+  card.querySelector(".result-body").appendChild(note);
 }
 
 function showRegion(card, label) {
@@ -882,6 +893,7 @@ async function handleFile(file) {
           card.querySelector(".result-body").appendChild(note);
         }
         if (data.discovery && data.discovery.type === "off_list") appendExternalRange(card, data.discovery);
+        showNotInRegion(card, data);
       } else {
         showPhotoRejection(card, data);
       }
@@ -927,6 +939,7 @@ async function handleFile(file) {
       card.querySelector(".result-body").appendChild(n);
     }
     if (data.discovery && data.discovery.type === "off_list") appendExternalRange(card, data.discovery);
+    showNotInRegion(card, data);
     if (!common && !scientific) card.querySelector(".sci").textContent = text;
 
     const sciWrap = card.querySelector(".scientific");
@@ -1738,6 +1751,46 @@ def display_region_label(region, lat, lng, location_fallback=False):
             return f"Other · near {match['label']}"
         return f"Other · {lat:.2f}, {lng:.2f}"
     return region["label"]
+
+
+def effective_region_label(region, lat, lng, location_fallback=False):
+    """Region name that determined the species list, for the not-in-region flag.
+
+    When the list and the card already agree, this is the same string as
+    display_region_label. When GPS builds the list from a different place
+    than the picker, this names the list's place so the sentence is true.
+    """
+    if location_fallback:
+        return "Sea of Cortez / La Paz (location unavailable)"
+    if lat is not None and lng is not None:
+        match = region_matching_point(lat, lng)
+        if region["id"] == "my-location":
+            if match:
+                return f"Near you · {match['label']}"
+            return f"Near {lat:.2f}, {lng:.2f}"
+        if region["id"] == "other":
+            if match:
+                return f"Other · near {match['label']}"
+            return f"Other · {lat:.2f}, {lng:.2f}"
+        if match:
+            return match["label"]
+        return f"{lat:.2f}, {lng:.2f}"
+    return display_region_label(region, lat, lng, location_fallback)
+
+
+def not_in_region_text(region_name):
+    return f"not found in {region_name}"
+
+
+def not_in_region_display(common, scientific, region_name):
+    """Exact wording shown on the card, e.g. 'Goldfish (Carassius auratus) — not found in Sea of Cortez / La Paz.'"""
+    name = (common or "").strip()
+    sci = (scientific or "").strip()
+    if name and sci:
+        lead = f"{name} ({sci})"
+    else:
+        lead = name or sci or "This species"
+    return f"{lead} — {not_in_region_text(region_name)}."
 
 
 def locality_text(region, lat, lng, coord_source):
@@ -4143,6 +4196,19 @@ def lookalike_enabled(debug=False, raw=None):
     return flag in ("1", "true", "on", "yes")
 
 
+def not_in_region_enabled(debug=False, raw=None):
+    """FINFINDR_NOT_IN_REGION=1 turns the out-of-region flag on. Default OFF.
+
+    This is a design change: freshwater and other inland taxa that pass the
+    marine gate are named, then flagged as not found in the effective region.
+    A debug not_in_region=0/1 form field overrides the environment for one request.
+    """
+    if debug and (raw or "").strip() in ("0", "1"):
+        return raw.strip() == "1"
+    flag = (os.environ.get("FINFINDR_NOT_IN_REGION", "0") or "0").strip().lower()
+    return flag in ("1", "true", "on", "yes")
+
+
 def lookalike_model():
     """The model used for the look-alike pass. FINFINDR_LOOKALIKE_MODEL, default grok-4.7."""
     name = (os.environ.get("FINFINDR_LOOKALIKE_MODEL") or "").strip()
@@ -4787,8 +4853,37 @@ def _taxon_from_payload(payload, scientific):
     return None
 
 
-def _worms_is_marine(scientific):
-    """WoRMS/OBIS isMarine. True, False, or None when the lookup does not answer."""
+# Clearly freshwater groups used only as a positive inland check when WoRMS
+# does not already say the taxon is marine. This is not a complete taxonomy.
+FRESHWATER_INLAND_ANCESTORS = frozenset({
+    "cyprinidae",
+    "carassius",
+    "centrarchidae",
+    "micropterus",
+    "lepomis",
+    "ictaluridae",
+    "catostomidae",
+    "poeciliidae",
+    "esocidae",
+    "percidae",
+})
+
+
+def _worms_bool(row, *keys):
+    if not isinstance(row, dict):
+        return None
+    for key in keys:
+        if key not in row or row.get(key) is None:
+            continue
+        if row.get(key) is True or str(row.get(key)).lower() in ("true", "1"):
+            return True
+        if row.get(key) is False or str(row.get(key)).lower() in ("false", "0"):
+            return False
+    return None
+
+
+def _worms_habitat(scientific):
+    """WoRMS habitat flags. None when the lookup does not answer."""
     if not scientific or (call_time_left() is not None and call_time_left() < 1.5):
         return None
     quoted = requests.utils.quote(scientific)
@@ -4801,23 +4896,76 @@ def _worms_is_marine(scientific):
         rows = payload.get("results") or payload.get("data")
     if not isinstance(rows, list):
         return None
+    wanted = scientific.lower()
     for row in rows:
         if not isinstance(row, dict):
             continue
         name = (row.get("scientificname") or row.get("scientificName") or row.get("name") or "")
-        if name and name.lower() != scientific.lower():
+        if name and name.lower() != wanted:
             continue
-        for key in ("isMarine", "is_marine", "marine"):
-            if key not in row or row.get(key) is None:
-                continue
-            if row.get(key) is True or str(row.get(key)).lower() in ("true", "1"):
-                return True
-            if row.get(key) is False or str(row.get(key)).lower() in ("false", "0"):
-                brackish = row.get("isBrackish", row.get("is_brackish"))
-                if brackish is True or str(brackish).lower() in ("true", "1"):
-                    return True
-                return False
+        habitat = {
+            "marine": _worms_bool(row, "isMarine", "is_marine", "marine"),
+            "freshwater": _worms_bool(row, "isFreshwater", "is_freshwater", "freshwater"),
+            "brackish": _worms_bool(row, "isBrackish", "is_brackish", "brackish"),
+            "terrestrial": _worms_bool(row, "isTerrestrial", "is_terrestrial", "terrestrial"),
+        }
+        if any(value is not None for value in habitat.values()):
+            return habitat
     return None
+
+
+def _worms_is_marine(scientific):
+    """WoRMS/OBIS isMarine. True, False, or None when the lookup does not answer."""
+    habitat = _worms_habitat(scientific)
+    if not habitat:
+        return None
+    if habitat["marine"] is True:
+        return True
+    if habitat["marine"] is False:
+        if habitat["brackish"] is True:
+            return True
+        return False
+    return None
+
+
+def species_on_list(scientific, species):
+    wanted = (scientific or "").strip().lower()
+    if not wanted:
+        return False
+    for item in species or []:
+        if isinstance(item, dict) and (item.get("scientific") or "").strip().lower() == wanted:
+            return True
+    return False
+
+
+def taxon_is_freshwater_or_inland(scientific):
+    """True only with positive inland evidence and no marine flag.
+
+    Unknown habitat is False so a rare or poorly recorded ocean species is
+    not given a not-in-region flag. Those stay on the discovery path.
+    """
+    if not scientific:
+        return False
+    habitat = _worms_habitat(scientific)
+    if habitat and habitat.get("marine") is True:
+        return False
+    if habitat and habitat.get("freshwater") is True:
+        return True
+    if habitat and habitat.get("terrestrial") is True:
+        return True
+    taxon = fetch_inat_taxon(scientific)
+    if taxon and (_ancestor_names(taxon) & FRESHWATER_INLAND_ANCESTORS):
+        return True
+    return False
+
+
+def build_not_in_region_flag(common, scientific, region, lat, lng, location_fallback=False):
+    region_name = effective_region_label(region, lat, lng, location_fallback)
+    return {
+        "region": region_name,
+        "text": not_in_region_text(region_name),
+        "display": not_in_region_display(common, scientific, region_name),
+    }
 
 
 def fetch_inat_taxon(scientific):
@@ -5108,6 +5256,7 @@ def _result_payload(
     reason="",
     notable_note=None,
     photo_issue="",
+    not_in_region=None,
 ):
     """The only identification body. Gates and the final decision both use it."""
     if not isinstance(meta, dict):
@@ -5129,6 +5278,8 @@ def _result_payload(
         body["notable_note"] = notable_note
     if photo_issue:
         body["photo_issue"] = photo_issue
+    if not_in_region:
+        body["not_in_region"] = not_in_region
     return body
 
 
@@ -5987,9 +6138,19 @@ def _identify_with_nature(
                 "but this photo is not strong enough to flag a range extension."
             )
             evidence.append("notable_if_confirmed")
+    inland_off_list = bool(
+        not_in_region_enabled(debug, fields.get("not_in_region"))
+        and not nature_off
+        and not no_match
+        and focus
+        and photo_quality == "good"
+        and not species_on_list(focus, species)
+        and taxon_is_freshwater_or_inland(focus)
+    )
     focus_off_list = bool(shown and shown[0].get("off_list"))
     if focus_off_list and not (discovery and discovery.get("type") == "possible_range_extension"):
-        certainty = "unsure"
+        if not inland_off_list:
+            certainty = "unsure"
     total_ms = int(round((time.monotonic() - request_started) * 1000))
     meta = _identification_meta(
         mode, sent, available, truncated, source, list_fetch_ms, model_ms,
@@ -6067,6 +6228,27 @@ def _identify_with_nature(
     if la_meta is not None:
         la_meta["certainty_final"] = certainty
         meta["lookalike"] = la_meta
+    not_in_region = None
+    if inland_off_list and shown and not no_match and certainty != "unsure":
+        # Likely-level flag only. Never raise certainty. Never attach a
+        # discovery / KNOWN_OUT_OF_RANGE badge.
+        if certainty == "confident":
+            certainty = "likely"
+            for item in shown:
+                if item.get("confidence") == "high":
+                    item["confidence"] = "medium"
+            if text:
+                text = _set_field(text, "Confidence", shown[0].get("confidence") or "medium")
+        if certainty == "likely":
+            not_in_region = build_not_in_region_flag(
+                shown[0].get("common_name") or "",
+                shown[0].get("scientific_name") or focus,
+                region, lat, lng, location_fallback,
+            )
+            if discovery and discovery.get("type") in ("possible_range_extension", "off_list"):
+                discovery = None
+            evidence.append("not_in_region")
+            meta["evidence"] = evidence
     source_candidate = (shown[0] if shown else None) or (candidates[0] if candidates else None)
     _apply_model_bundle(meta, result, final_source_for(source_candidate))
     meta = stamp_meta(meta, request_started)
@@ -6080,6 +6262,7 @@ def _identify_with_nature(
         discovery=discovery,
         notable_note=notable_note,
         meta=meta,
+        not_in_region=not_in_region,
     ))
 
 

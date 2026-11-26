@@ -146,6 +146,7 @@ class IdentifyTests(unittest.TestCase):
         os.environ.pop("FINFINDR_VERIFY_TIMEOUT", None)
         os.environ.pop("FINFINDR_VERIFY_IMAGE_PX", None)
         os.environ.pop("FINFINDR_LOOKALIKE_PASS", None)
+        os.environ.pop("FINFINDR_NOT_IN_REGION", None)
         os.environ["FINFINDR_INAT_MIN_INTERVAL"] = "0"
         os.environ["FINFINDR_MODEL_CACHE"] = "0"
         self.cache_dir = tempfile.mkdtemp(prefix="finfindr-cache-")
@@ -568,7 +569,11 @@ class IdentifyTests(unittest.TestCase):
             self.assertEqual(self.captured["json"]["model"], "grok-4.3")
             self.assertEqual(chosen.get_json()["meta"]["model"], "grok-4.3")
             rejected = self.post_photo(model="not a model", debug="1")
-            self.assertEqual(self.captured["json"]["model"], "grok-4.5")
+            # Both grok-4 and XAI_MODEL run as a pair; which POST is captured
+            # last is not guaranteed. The invalid debug model must still fall
+            # back to grok-4.5 as the answering model.
+            self.assertIn("grok-4.5", {call["model"] for call in self.captured["calls"]})
+            self.assertEqual(rejected.get_json()["meta"]["model"], "grok-4.5")
             sized = self.client.post(
                 "/identify",
                 data={"image": (io.BytesIO(wide), "wide.jpg"), "sync": "1"},
@@ -2780,6 +2785,309 @@ class IdentifyTests(unittest.TestCase):
             self.assertNotIn("lookalike", marine["meta"])
         finally:
             os.environ.pop("FINFINDR_LOOKALIKE_PASS", None)
+
+
+    def _freshwater_handler(self, scientific, common, ancestors, iconic="Actinopterygii"):
+        def handler(url, params):
+            if "marinespecies.org" in url:
+                return FakeResponse([{
+                    "scientificname": scientific,
+                    "isMarine": False,
+                    "isFreshwater": True,
+                    "isBrackish": False,
+                    "isTerrestrial": False,
+                }])
+            if "taxa" in url:
+                name = params.get("q") or scientific
+                if (name or "").lower() != scientific.lower() and "taxa/" not in url:
+                    return FakeResponse({"results": []})
+                return FakeResponse({"results": [{
+                    "id": 1,
+                    "name": scientific,
+                    "rank": "species",
+                    "iconic_taxon_name": iconic,
+                    "preferred_common_name": common,
+                    "ancestors": ancestors,
+                }]})
+            return None
+        return handler
+
+    def _land_handler(self, scientific, common, iconic, ancestors):
+        def handler(url, params):
+            if "taxa" in url:
+                return FakeResponse({"results": [{
+                    "id": 2,
+                    "name": scientific,
+                    "rank": "species",
+                    "iconic_taxon_name": iconic,
+                    "preferred_common_name": common,
+                    "ancestors": ancestors,
+                }]})
+            if "marinespecies.org" in url:
+                return FakeResponse([{
+                    "scientificname": scientific,
+                    "isMarine": False,
+                    "isFreshwater": False,
+                    "isBrackish": False,
+                    "isTerrestrial": True,
+                }])
+            return None
+        return handler
+
+    def _post_named(self, scientific, common, trait, region="sea-of-cortez", **fields):
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            f"Common name: {common}\n"
+            f"Scientific name: {scientific}\n"
+            "Confidence: medium\n"
+            f"Candidate 1: {scientific} | {common} | medium | {trait}\n"
+        )
+        data = {"region": region, "sync": "1", "debug": "1", "verify": "0", "discovery": "0"}
+        data.update(fields)
+        return self.post_photo(**data).get_json()
+
+    def test_ff27_flag_off_is_identical_and_omits_the_new_field(self):
+        os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+        self.assertFalse(finfindr_server.not_in_region_enabled())
+        off = self.post_photo(region="sea-of-cortez", debug="1", verify="0", discovery="0", not_in_region="0").get_json()
+        default = self.post_photo(region="sea-of-cortez", debug="1", verify="0", discovery="0").get_json()
+        self.assertNotIn("not_in_region", off)
+        self.assertNotIn("not_in_region", default)
+        self.assertEqual(off["certainty"], default["certainty"])
+        self.assertEqual(off["candidates"][0]["scientific_name"], "Thalassoma lucasanum")
+        self.assertEqual(default["candidates"][0]["scientific_name"], "Thalassoma lucasanum")
+        self.assertEqual(off["reason"] if "reason" in off else None, default.get("reason"))
+        self.assertEqual(off["discovery"], default["discovery"])
+        self.assertNotIn("not_in_region", off["meta"].get("evidence") or [])
+
+    def test_ff27_freshwater_fish_are_named_and_flagged_in_the_selected_region(self):
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        cases = [
+            ("Carassius auratus", "Goldfish", "Cyprinidae", "orange body and no dorsal spines"),
+            ("Micropterus salmoides", "Largemouth Bass", "Centrarchidae", "a wide mouth and a dark lateral stripe"),
+            ("Lepomis gibbosus", "Pumpkinseed", "Centrarchidae", "orange spots and a red ear flap"),
+        ]
+        try:
+            page = self.client.get("/").get_data(as_text=True)
+            self.assertIn("function showNotInRegion", page)
+            self.assertIn("not-in-region", page)
+            for scientific, common, family, trait in cases:
+                self.inat_handler = self._freshwater_handler(scientific, common, [
+                    {"name": "Actinopterygii", "rank": "class"},
+                    {"name": family, "rank": "family"},
+                ])
+                body = self._post_named(scientific, common, trait)
+                self.assertNotEqual(body.get("reason"), "not_marine", scientific)
+                self.assertNotEqual(body["certainty"], "unsure", scientific)
+                self.assertEqual(body["certainty"], "likely", scientific)
+                self.assertEqual(body["candidates"][0]["scientific_name"], scientific)
+                self.assertEqual(body["region_label"], "Sea of Cortez / La Paz")
+                flag = body["not_in_region"]
+                self.assertEqual(flag["region"], "Sea of Cortez / La Paz")
+                self.assertEqual(flag["text"], "not found in Sea of Cortez / La Paz")
+                self.assertIn("not found in Sea of Cortez", flag["text"])
+                self.assertEqual(
+                    flag["display"],
+                    f"{common} ({scientific}) — not found in Sea of Cortez / La Paz.",
+                )
+                self.assertIsNone(body["discovery"])
+                self.assertIn("not_in_region", body["meta"]["evidence"])
+                self.assertNotIn("FinFindr focuses on marine animal identification only.", body.get("message") or "")
+        finally:
+            os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+
+    def test_ff27_land_animals_stay_not_marine_when_the_flag_is_on(self):
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        cases = [
+            ("Felis catus", "Domestic Cat", "Mammalia", "Felidae", "pointed ears and whiskers"),
+            ("Canis familiaris", "Domestic Dog", "Mammalia", "Canidae", "a muzzle and floppy ears"),
+            ("Cardinalis cardinalis", "Northern Cardinal", "Aves", "Cardinalidae", "a red crest"),
+            ("Sceloporus occidentalis", "Western Fence Lizard", "Reptilia", "Phrynosomatidae", "keeled scales"),
+            ("Caracara cheriway", "Crested Caracara", "Aves", "Falconidae", "a bare orange face"),
+        ]
+        try:
+            for scientific, common, iconic, family, trait in cases:
+                self.inat_handler = self._land_handler(scientific, common, iconic, [
+                    {"name": iconic, "rank": "class"},
+                    {"name": family, "rank": "family"},
+                ])
+                body = self._post_named(scientific, common, trait)
+                self._assert_not_marine(body)
+                self.assertNotIn("not_in_region", body, scientific)
+        finally:
+            os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+
+    def test_ff27_in_region_marine_answer_is_unchanged_when_the_flag_is_on(self):
+        os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+        off = self.post_photo(region="sea-of-cortez", debug="1", verify="0", discovery="0").get_json()
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        try:
+            on = self.post_photo(region="sea-of-cortez", debug="1", verify="0", discovery="0").get_json()
+        finally:
+            os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+        self.assertEqual(on["certainty"], off["certainty"])
+        self.assertEqual(on["candidates"][0]["scientific_name"], off["candidates"][0]["scientific_name"])
+        self.assertEqual(on["candidates"][0]["scientific_name"], "Thalassoma lucasanum")
+        self.assertEqual(on["discovery"], off["discovery"])
+        self.assertEqual(on.get("reason"), off.get("reason"))
+        self.assertEqual(on["region_label"], off["region_label"])
+        self.assertNotIn("not_in_region", on)
+        self.assertNotIn("not_in_region", off)
+        self.assertNotIn("not_in_region", on["meta"].get("evidence") or [])
+
+    def test_ff27_marine_off_list_species_are_not_given_the_inland_flag(self):
+        def handler(url, params):
+            if "marinespecies.org" in url:
+                return FakeResponse([{
+                    "scientificname": "Octopus rubescens",
+                    "isMarine": True,
+                    "isFreshwater": False,
+                    "isBrackish": False,
+                    "isTerrestrial": False,
+                }])
+            if "obis.org" in url:
+                return FakeResponse({"total": 0})
+            if "fishbase" in url:
+                return FakeResponse({"data": []})
+            if "taxa" in url:
+                return FakeResponse({"results": [{
+                    "name": params.get("q") or "Octopus rubescens",
+                    "rank": "species",
+                    "iconic_taxon_name": "Mollusca",
+                    "ancestors": [{"name": "Mollusca", "rank": "phylum"}],
+                }]})
+            if "observations" in url and str(params.get("per_page")) == "1":
+                return FakeResponse({"total_results": 0, "results": []})
+            return None
+
+        self.inat_handler = handler
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Octopus rubescens\n"
+            "Common name: Red octopus\n"
+            "Confidence: medium\n"
+            "Candidate 1: Octopus rubescens | Red octopus | medium | reddish body without eye spots\n"
+        )
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        try:
+            body = self.post_photo(region="sea-of-cortez", lat="24.2", lng="-110.3", debug="1", verify="0", discovery="0").get_json()
+        finally:
+            os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+        self.assertNotIn("not_in_region", body)
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Octopus rubescens")
+        self.assertNotEqual(body.get("reason"), "not_marine")
+
+    def test_ff27_flag_uses_the_effective_region_name(self):
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        self.inat_handler = self._freshwater_handler(
+            "Carassius auratus", "Goldfish",
+            [{"name": "Actinopterygii", "rank": "class"}, {"name": "Cyprinidae", "rank": "family"}],
+        )
+        try:
+            caribbean = self._post_named(
+                "Carassius auratus", "Goldfish", "orange body and no dorsal spines",
+                region="caribbean",
+            )
+            self.assertEqual(caribbean["not_in_region"]["region"], "Caribbean")
+            self.assertEqual(caribbean["not_in_region"]["text"], "not found in Caribbean")
+            self.assertEqual(
+                caribbean["not_in_region"]["display"],
+                "Goldfish (Carassius auratus) — not found in Caribbean.",
+            )
+            inland = self._post_named(
+                "Carassius auratus", "Goldfish", "orange body and no dorsal spines",
+                region="other", lat="30.70", lng="-96.47",
+            )
+            self.assertEqual(inland["not_in_region"]["region"], "Other · 30.70, -96.47")
+            self.assertEqual(inland["not_in_region"]["text"], "not found in Other · 30.70, -96.47")
+        finally:
+            os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+
+    def test_ff27_does_not_flag_unsure_or_unusable_photos(self):
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        self.inat_handler = self._freshwater_handler(
+            "Carassius auratus", "Goldfish",
+            [{"name": "Actinopterygii", "rank": "class"}, {"name": "Cyprinidae", "rank": "family"}],
+        )
+        try:
+            self.captured["model_text"] = (
+                "Photo quality: invalid\n"
+                "Photo issue: too blurry to see the animal\n"
+                "Common name: Goldfish\n"
+                "Scientific name: Carassius auratus\n"
+                "Confidence: medium\n"
+                "Candidate 1: Carassius auratus | Goldfish | medium | orange body\n"
+            )
+            unusable = self.post_photo(region="sea-of-cortez", debug="1", verify="0", discovery="0").get_json()
+            self.assertEqual(unusable["message"], "Can't identify from this photo.")
+            self.assertNotIn("not_in_region", unusable)
+        finally:
+            os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+
+
+class NotInRegionRuleTests(unittest.TestCase):
+    def tearDown(self):
+        os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+
+    def test_flag_is_off_by_default(self):
+        os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+        self.assertFalse(finfindr_server.not_in_region_enabled())
+        for value in ("0", "false", "off", ""):
+            os.environ["FINFINDR_NOT_IN_REGION"] = value
+            self.assertFalse(finfindr_server.not_in_region_enabled(), value)
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        self.assertTrue(finfindr_server.not_in_region_enabled())
+        self.assertTrue(finfindr_server.not_in_region_enabled(debug=True, raw="1"))
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        self.assertFalse(finfindr_server.not_in_region_enabled(debug=True, raw="0"))
+
+    def test_display_text_names_the_species_and_region(self):
+        self.assertEqual(
+            finfindr_server.not_in_region_display(
+                "Pumpkinseed", "Lepomis gibbosus", "Sea of Cortez / La Paz"
+            ),
+            "Pumpkinseed (Lepomis gibbosus) — not found in Sea of Cortez / La Paz.",
+        )
+        self.assertIn(
+            "not found in Sea of Cortez",
+            finfindr_server.not_in_region_text("Sea of Cortez / La Paz"),
+        )
+
+    def test_effective_region_follows_the_species_list(self):
+        cortez = finfindr_server._REGIONS_BY_ID["sea-of-cortez"]
+        other = finfindr_server._REGIONS_BY_ID["other"]
+        my_loc = finfindr_server._REGIONS_BY_ID["my-location"]
+        self.assertEqual(
+            finfindr_server.effective_region_label(cortez, None, None),
+            "Sea of Cortez / La Paz",
+        )
+        self.assertEqual(
+            finfindr_server.effective_region_label(other, 30.70, -96.47),
+            "Other · 30.70, -96.47",
+        )
+        # GPS in the Cortez box builds the list from that point.
+        self.assertEqual(
+            finfindr_server.effective_region_label(cortez, 24.2, -110.3),
+            "Sea of Cortez / La Paz",
+        )
+        self.assertEqual(
+            finfindr_server.effective_region_label(my_loc, None, None, location_fallback=True),
+            "Sea of Cortez / La Paz (location unavailable)",
+        )
+
+    def test_freshwater_check_requires_positive_inland_evidence(self):
+        self.assertTrue(finfindr_server.taxon_is_freshwater_or_inland.__doc__)
+        self.assertFalse(finfindr_server.taxon_is_freshwater_or_inland(""))
+        with patch("finfindr_server._worms_habitat", return_value={"marine": True, "freshwater": False, "brackish": False, "terrestrial": False}):
+            with patch("finfindr_server.fetch_inat_taxon") as fetch:
+                self.assertFalse(finfindr_server.taxon_is_freshwater_or_inland("Thalassoma lucasanum"))
+                fetch.assert_not_called()
+        with patch("finfindr_server._worms_habitat", return_value={"marine": False, "freshwater": True, "brackish": False, "terrestrial": False}):
+            self.assertTrue(finfindr_server.taxon_is_freshwater_or_inland("Carassius auratus"))
+        with patch("finfindr_server._worms_habitat", return_value=None):
+            with patch("finfindr_server.fetch_inat_taxon", return_value=None):
+                self.assertFalse(finfindr_server.taxon_is_freshwater_or_inland("Unknownus species"))
+
 
 class LookalikeRuleTests(unittest.TestCase):
     """LA-v1 rules as pure functions. No model calls."""
