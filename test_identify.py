@@ -1412,6 +1412,33 @@ class IdentifyTests(unittest.TestCase):
         self.assertIsNone(body["discovery"])
         self.assertEqual(body["candidates"][0]["scientific_name"], "Abudefduf troschelii")
 
+    def _list_named_species(self, entries):
+        """Put exact scientific/common pairs on page 1 of the mocked regional list."""
+        original = self.fake_get
+
+        def wrapped(url, params=None, **kwargs):
+            params = params or {}
+            if "species_counts" in url:
+                with self._calls_lock:
+                    self.species_calls.append(params)
+                payload = species_payload(params)
+                if int(params.get("page") or 1) == 1:
+                    for name, common in reversed(entries):
+                        payload["results"].insert(0, {
+                            "count": 20000,
+                            "taxon": {
+                                "name": name,
+                                "rank": "species",
+                                "preferred_common_name": common,
+                            },
+                        })
+                return FakeResponse(payload)
+            return original(url, params, **kwargs)
+
+        self.get_patch.stop()
+        self.get_patch = patch("finfindr_server.http.get", side_effect=wrapped)
+        self.get_patch.start()
+
     def test_color_contradiction_becomes_no_match(self):
         self.captured["model_text"] = (
             "Photo quality: good\n"
@@ -1426,6 +1453,75 @@ class IdentifyTests(unittest.TestCase):
         self.assertEqual(body["certainty"], "unsure")
         self.assertTrue(finfindr_server.colors_contradict("red mesh pattern", "Blue Sea Star"))
         self.assertFalse(finfindr_server.colors_contradict("blue arms", "Blue Sea Star"))
+        # The identify path now uses the trait card, not the common name.
+        self.assertTrue(finfindr_server.traits_contradict(
+            "red mesh pattern A red mesh star.",
+            finfindr_server.species_trait_text("Phataria unifascialis"),
+        ))
+
+    def test_ff28a_common_name_color_is_not_a_trait_authority(self):
+        # The raw helper still sees a color-word clash in the common name.
+        # That clash must not be used as the species color authority.
+        self.assertTrue(finfindr_server.colors_contradict(
+            "chocolate-brown chestnut-brown", "Panamic green moray",
+        ))
+        self.assertTrue(finfindr_server.colors_contradict(
+            "orange black", "Yellow Mesh Sea Star",
+        ))
+        self.assertEqual(finfindr_server.species_trait_text("Gymnothorax castaneus"), "")
+        self.assertEqual(finfindr_server.species_trait_text("Nardoa novaecaledoniae"), "")
+        self.assertFalse(finfindr_server.traits_contradict(
+            "chocolate-brown chestnut-brown",
+            finfindr_server.species_trait_text("Gymnothorax castaneus"),
+        ))
+        self.assertFalse(finfindr_server.traits_contradict(
+            "orange / black",
+            finfindr_server.species_trait_text("Nardoa novaecaledoniae"),
+        ))
+        self.assertTrue(finfindr_server.traits_contradict(
+            "red mesh pattern",
+            finfindr_server.species_trait_text("Phataria unifascialis"),
+        ))
+
+    def test_ff28a_castaneus_brown_is_not_rejected_for_green_in_common_name(self):
+        # Photo 414705526: correct medium ID of Gymnothorax castaneus was
+        # no-matched because "Panamic green moray" contains "green".
+        self._list_named_species([("Gymnothorax castaneus", "Panamic green moray")])
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Gymnothorax castaneus\n"
+            "Common name: Panamic green moray\n"
+            "Confidence: medium\n"
+            "Notes: A chocolate-brown moray.\n"
+            "Candidate 1: Gymnothorax castaneus | Panamic green moray | medium | chocolate-brown chestnut-brown body\n"
+        )
+        body = self.post_photo(debug="1", verify="0", discovery="0").get_json()
+        self.assertNotEqual((body.get("discovery") or {}).get("type"), "no_match")
+        self.assertEqual(body["certainty"], "likely")
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Gymnothorax castaneus")
+        self.assertEqual(body["candidates"][0]["common_name"], "Panamic green moray")
+        self.assertNotEqual(body["certainty"], "confident")
+
+    def test_ff28a_nardoa_wrong_id_is_not_raised_to_confident(self):
+        # Photo 416487053: wrong medium ID Nardoa novaecaledoniae was also
+        # no-matched because "Yellow Mesh Sea Star" contains "yellow".
+        # Dropping that false reject must not create a confident-wrong answer;
+        # verify is off, so certainty stays at likely.
+        self._list_named_species([("Nardoa novaecaledoniae", "Yellow Mesh Sea Star")])
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Scientific name: Nardoa novaecaledoniae\n"
+            "Common name: Yellow Mesh Sea Star\n"
+            "Confidence: medium\n"
+            "Notes: An orange and black sea star.\n"
+            "Candidate 1: Nardoa novaecaledoniae | Yellow Mesh Sea Star | medium | orange / black\n"
+        )
+        body = self.post_photo(debug="1", verify="0", discovery="0").get_json()
+        self.assertNotEqual((body.get("discovery") or {}).get("type"), "no_match")
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Nardoa novaecaledoniae")
+        self.assertEqual(body["certainty"], "likely")
+        self.assertNotEqual(body["certainty"], "confident")
+        self.assertNotEqual(body["candidates"][0].get("confidence"), "high")
 
     def test_verifier_choice_stays_ahead_of_a_higher_model_confidence(self):
         ordered = [
