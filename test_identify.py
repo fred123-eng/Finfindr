@@ -3003,6 +3003,50 @@ class IdentifyTests(unittest.TestCase):
         finally:
             os.environ.pop("FINFINDR_NOT_IN_REGION", None)
 
+    def test_ff27_picked_region_is_named_even_when_gps_is_elsewhere(self):
+        """Fred: the note names the region the user selected, not the GPS list."""
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        self.inat_handler = self._freshwater_handler(
+            "Carassius auratus", "Goldfish",
+            [{"name": "Actinopterygii", "rank": "class"}, {"name": "Cyprinidae", "rank": "family"}],
+        )
+        try:
+            body = self._post_named(
+                "Carassius auratus", "Goldfish", "orange body and no dorsal spines",
+                region="sea-of-cortez", lat="18.0", lng="-66.0",
+            )
+            self.assertEqual(body["region_label"], "Sea of Cortez / La Paz")
+            self.assertEqual(body["not_in_region"]["region"], "Sea of Cortez / La Paz")
+            self.assertEqual(body["not_in_region"]["text"], "not found in Sea of Cortez / La Paz")
+            self.assertEqual(
+                body["not_in_region"]["display"],
+                "Goldfish (Carassius auratus) — not found in Sea of Cortez / La Paz.",
+            )
+            self.assertEqual(body["not_in_region"]["region"], body["region_label"])
+        finally:
+            os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+
+    def test_ff27_unpicked_region_uses_the_gps_list_region(self):
+        """When no named region was picked, the note names the GPS-built list's region."""
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        self.inat_handler = self._freshwater_handler(
+            "Carassius auratus", "Goldfish",
+            [{"name": "Actinopterygii", "rank": "class"}, {"name": "Cyprinidae", "rank": "family"}],
+        )
+        try:
+            body = self._post_named(
+                "Carassius auratus", "Goldfish", "orange body and no dorsal spines",
+                region="other", lat="24.2", lng="-110.3",
+            )
+            self.assertEqual(body["not_in_region"]["region"], "Sea of Cortez / La Paz")
+            self.assertEqual(body["not_in_region"]["text"], "not found in Sea of Cortez / La Paz")
+            self.assertEqual(
+                body["not_in_region"]["display"],
+                "Goldfish (Carassius auratus) — not found in Sea of Cortez / La Paz.",
+            )
+        finally:
+            os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+
     def test_ff27_does_not_flag_unsure_or_unusable_photos(self):
         os.environ["FINFINDR_NOT_IN_REGION"] = "1"
         self.inat_handler = self._freshwater_handler(
@@ -3053,7 +3097,7 @@ class NotInRegionRuleTests(unittest.TestCase):
             finfindr_server.not_in_region_text("Sea of Cortez / La Paz"),
         )
 
-    def test_effective_region_follows_the_species_list(self):
+    def test_effective_region_follows_the_picked_region(self):
         cortez = finfindr_server._REGIONS_BY_ID["sea-of-cortez"]
         other = finfindr_server._REGIONS_BY_ID["other"]
         my_loc = finfindr_server._REGIONS_BY_ID["my-location"]
@@ -3065,9 +3109,26 @@ class NotInRegionRuleTests(unittest.TestCase):
             finfindr_server.effective_region_label(other, 30.70, -96.47),
             "Other · 30.70, -96.47",
         )
-        # GPS in the Cortez box builds the list from that point.
         self.assertEqual(
             finfindr_server.effective_region_label(cortez, 24.2, -110.3),
+            "Sea of Cortez / La Paz",
+        )
+        # Named picker wins over GPS in another ocean region.
+        self.assertEqual(
+            finfindr_server.effective_region_label(cortez, 18.0, -66.0),
+            "Sea of Cortez / La Paz",
+        )
+        self.assertEqual(
+            finfindr_server.display_region_label(cortez, 18.0, -66.0),
+            "Sea of Cortez / La Paz",
+        )
+        # No named region picked: use the GPS-built list's region.
+        self.assertEqual(
+            finfindr_server.effective_region_label(other, 24.2, -110.3),
+            "Sea of Cortez / La Paz",
+        )
+        self.assertEqual(
+            finfindr_server.effective_region_label(my_loc, 24.2, -110.3),
             "Sea of Cortez / La Paz",
         )
         self.assertEqual(

@@ -1754,27 +1754,21 @@ def display_region_label(region, lat, lng, location_fallback=False):
 
 
 def effective_region_label(region, lat, lng, location_fallback=False):
-    """Region name that determined the species list, for the not-in-region flag.
+    """Region name for the not-in-region flag.
 
-    When the list and the card already agree, this is the same string as
-    display_region_label. When GPS builds the list from a different place
-    than the picker, this names the list's place so the sentence is true.
+    When the user picked a named region, this is that name, which is also the
+    card's region_label, even if GPS built the species list from elsewhere.
+    The GPS-built list's region is used only when no named region was picked
+    (Other, or Use my location).
     """
     if location_fallback:
-        return "Sea of Cortez / La Paz (location unavailable)"
+        return display_region_label(region, lat, lng, location_fallback)
+    if region["id"] not in ("other", "my-location"):
+        return region["label"]
     if lat is not None and lng is not None:
         match = region_matching_point(lat, lng)
-        if region["id"] == "my-location":
-            if match:
-                return f"Near you · {match['label']}"
-            return f"Near {lat:.2f}, {lng:.2f}"
-        if region["id"] == "other":
-            if match:
-                return f"Other · near {match['label']}"
-            return f"Other · {lat:.2f}, {lng:.2f}"
         if match:
             return match["label"]
-        return f"{lat:.2f}, {lng:.2f}"
     return display_region_label(region, lat, lng, location_fallback)
 
 
