@@ -4659,21 +4659,12 @@ def _color_set(text):
 
 
 def colors_contradict(visible_text, species_text):
-    """True when the photo notes name a color the species text does not share."""
+    """True when the photo notes name a color the species name does not share."""
     visible = _color_set(visible_text)
     named = _color_set(species_text)
     if not visible or not named:
         return False
     return visible.isdisjoint(named)
-
-
-def species_trait_text(scientific_name):
-    """Trait-card text used as the color and shape authority.
-
-    Common names are not used. A color word in a name such as
-    "Panamic green moray" is a label, not an observed or required color.
-    """
-    return SPECIES_TRAITS.get((scientific_name or "").lower(), "")
 
 
 def _without_negations(text):
@@ -5833,10 +5824,10 @@ def _identify_with_nature(
             shown = _order_candidates(shown, chosen)
             verifier_ordered = True
     notes_text = _field_value(text, "Notes")
-    known_traits = species_trait_text(shown[0].get("scientific_name") if shown else "")
+    known_traits = SPECIES_TRAITS.get((shown[0].get("scientific_name") if shown else "").lower(), "") if shown else ""
     trait_conflict = bool(shown) and traits_contradict(
         f"{shown[0].get('trait') or ''} {notes_text}",
-        known_traits,
+        f"{shown[0].get('common_name') or ''} {known_traits}",
     )
     discovery = None
     notable_note = ""
