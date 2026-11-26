@@ -2560,13 +2560,17 @@ class IdentifyTests(unittest.TestCase):
         self.assertGreaterEqual(meta["list_fetch_ms"], 2500)
 
     def test_ff16_client_meta_includes_list_wait_and_waited_out(self):
-        # list_wait_s and waited_out were already on the species_list log line;
-        # this only checks they are also returned on the client meta.
+        # list_wait_s is the measured wait, not the configured FINFINDR_LIST_WAIT bound.
         os.environ.pop("FINFINDR_LIST_WAIT", None)
         with self.assertLogs("finfindr_server", level="INFO") as logs:
             cold = self._ff16_post(0.25)
         meta = cold["meta"]
-        self.assertEqual(meta["list_wait_s"], finfindr_server.species_list_wait_seconds())
+        bound = finfindr_server.species_list_wait_seconds()
+        self.assertEqual(bound, 60.0)
+        self.assertEqual(meta["list_wait_s"], round(meta["list_fetch_ms"] / 1000.0, 3))
+        self.assertGreaterEqual(meta["list_wait_s"], 2.5)
+        self.assertLess(meta["list_wait_s"], bound)
+        self.assertNotEqual(meta["list_wait_s"], bound)
         self.assertFalse(meta["waited_out"])
         self.assertEqual(meta["list_source"], "inaturalist")
         self.assertGreaterEqual(meta["list_fetch_ms"], 2500)
@@ -2574,9 +2578,12 @@ class IdentifyTests(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertIn("list_wait_s=%s" % meta["list_wait_s"], lines[0])
         self.assertIn("waited_out=%s" % meta["waited_out"], lines[0])
+        self.assertNotIn("list_wait_s=60.0", lines[0])
 
         warm = self.post_photo(region="sea-of-cortez").get_json()
-        self.assertEqual(warm["meta"]["list_wait_s"], finfindr_server.species_list_wait_seconds())
+        self.assertEqual(warm["meta"]["list_wait_s"], round(warm["meta"]["list_fetch_ms"] / 1000.0, 3))
+        self.assertLess(warm["meta"]["list_wait_s"], 0.2)
+        self.assertNotEqual(warm["meta"]["list_wait_s"], bound)
         self.assertFalse(warm["meta"]["waited_out"])
         self.assertLess(warm["meta"]["list_fetch_ms"], 200)
 
@@ -2593,6 +2600,30 @@ class IdentifyTests(unittest.TestCase):
         self.assertEqual(body["meta"]["list_wait_s"], 3.0)
         self.assertEqual(body["meta"]["list_fetch_ms"], 3100)
         self.assertEqual(body["meta"]["list_source"], "curated")
+
+    def test_list_wait_s_logs_measured_wait_not_the_configured_bound(self):
+        os.environ.pop("FINFINDR_LIST_WAIT", None)
+        region = finfindr_server.resolve_region("sea-of-cortez")
+
+        def slow_load(*args, **kwargs):
+            time.sleep(0.2)
+            return finfindr_server._curated_species_payload()
+
+        with self.assertLogs("finfindr_server", level="INFO") as logs:
+            with patch.object(finfindr_server, "load_species_for_request", side_effect=slow_load):
+                payload, fetch_ms, list_wait_s, waited_out = finfindr_server.load_species_alongside_model(
+                    region, None, None, "short",
+                )
+        self.assertFalse(waited_out)
+        self.assertGreaterEqual(fetch_ms, 200)
+        self.assertEqual(list_wait_s, round(fetch_ms / 1000.0, 3))
+        self.assertGreaterEqual(list_wait_s, 0.2)
+        self.assertLess(list_wait_s, 2.0)
+        self.assertNotEqual(list_wait_s, finfindr_server.species_list_wait_seconds())
+        lines = [line for line in logs.output if "species_list job=" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("list_wait_s=%s" % list_wait_s, lines[0])
+        self.assertNotIn("list_wait_s=60.0", lines[0])
 
 
     # --- LA-v1 look-alike pass: end-to-end through /identify (mocked model) ---

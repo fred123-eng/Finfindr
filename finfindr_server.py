@@ -3396,22 +3396,28 @@ def load_species_alongside_model(region, lat, lng, mode, exclude_observation_id=
     worker.join(LIST_WAIT_LEGACY if legacy else wait + LIST_WAIT_GRACE)
     if "payload" in holder:
         payload = holder["payload"]
-        elapsed = int(round((time.perf_counter() - started) * 1000))
-        _log_species_wait(region, payload, elapsed, wait, False)
-        return payload, elapsed, wait, False
+        return _finish_species_wait(region, payload, started, waited_out=False)
     query = species_query_for(region, lat, lng)
     cached = _species_cache_get((mode, query["key"])) if query else None
     if cached and cached.get("species"):
-        elapsed = int(round((time.perf_counter() - started) * 1000))
-        _log_species_wait(region, cached, elapsed, wait, True)
-        return cached, elapsed, wait, True
+        return _finish_species_wait(region, cached, started, waited_out=True)
     payload = _curated_species_payload() if query and query.get("curated_fallback") else _empty_species()
-    elapsed = int(round((time.perf_counter() - started) * 1000))
-    _log_species_wait(region, payload, elapsed, wait, True)
-    return payload, elapsed, wait, True
+    return _finish_species_wait(region, payload, started, waited_out=True)
 
 
-def _log_species_wait(region, payload, elapsed_ms, wait, waited_out):
+def _measured_list_wait(started):
+    """Actual seconds spent waiting for the list fetch, aligned with list_fetch_ms."""
+    elapsed_ms = int(round((time.perf_counter() - started) * 1000))
+    return elapsed_ms, round(elapsed_ms / 1000.0, 3)
+
+
+def _finish_species_wait(region, payload, started, waited_out):
+    elapsed_ms, list_wait_s = _measured_list_wait(started)
+    _log_species_wait(region, payload, elapsed_ms, list_wait_s, waited_out)
+    return payload, elapsed_ms, list_wait_s, waited_out
+
+
+def _log_species_wait(region, payload, elapsed_ms, list_wait_s, waited_out):
     app.logger.info(
         "species_list job=%s region=%s list_source=%s list_fetch_ms=%s species=%s complete=%s "
         "list_wait_s=%s waited_out=%s",
@@ -3421,7 +3427,7 @@ def _log_species_wait(region, payload, elapsed_ms, wait, waited_out):
         int(elapsed_ms),
         len((payload or {}).get("species") or []),
         bool((payload or {}).get("complete")),
-        wait,
+        list_wait_s,
         bool(waited_out),
     )
 
