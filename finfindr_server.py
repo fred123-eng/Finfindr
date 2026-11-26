@@ -6132,12 +6132,14 @@ def _identify_with_nature(
                 "but this photo is not strong enough to flag a range extension."
             )
             evidence.append("notable_if_confirmed")
+    # Any photo that already passed the usable gate can get the note,
+    # including a poor-quality but identifiable frame. Unusable photos
+    # return before this point.
     inland_off_list = bool(
         not_in_region_enabled(debug, fields.get("not_in_region"))
         and not nature_off
         and not no_match
         and focus
-        and photo_quality == "good"
         and not species_on_list(focus, species)
         and taxon_is_freshwater_or_inland(focus)
     )

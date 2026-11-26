@@ -3068,6 +3068,40 @@ class IdentifyTests(unittest.TestCase):
         finally:
             os.environ.pop("FINFINDR_NOT_IN_REGION", None)
 
+    def test_ff27_poor_quality_usable_goldfish_is_likely_with_the_note(self):
+        """A poor but usable goldfish still gets the likely not-in-region note."""
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        self.inat_handler = self._freshwater_handler(
+            "Carassius auratus", "Goldfish",
+            [{"name": "Actinopterygii", "rank": "class"}, {"name": "Cyprinidae", "rank": "family"}],
+        )
+        try:
+            self.assertTrue(finfindr_server.photo_is_usable("poor", "murky water and soft focus"))
+            self.captured["model_text"] = (
+                "Photo quality: poor\n"
+                "Photo issue: murky water and soft focus\n"
+                "Common name: Goldfish\n"
+                "Scientific name: Carassius auratus\n"
+                "Confidence: medium\n"
+                "Candidate 1: Carassius auratus | Goldfish | medium | orange body and no dorsal spines\n"
+            )
+            body = self.post_photo(
+                region="sea-of-cortez", debug="1", verify="0", discovery="0",
+            ).get_json()
+            self.assertNotEqual(body.get("reason"), "not_marine")
+            self.assertEqual(body["photo_quality"], "poor")
+            self.assertEqual(body["certainty"], "likely")
+            self.assertEqual(body["candidates"][0]["scientific_name"], "Carassius auratus")
+            self.assertEqual(body["region_label"], "Sea of Cortez / La Paz")
+            self.assertEqual(
+                body["not_in_region"]["display"],
+                "Goldfish (Carassius auratus) — not found in Sea of Cortez / La Paz.",
+            )
+            self.assertEqual(body["not_in_region"]["region"], body["region_label"])
+            self.assertEqual(body["not_in_region"]["text"], "not found in Sea of Cortez / La Paz")
+        finally:
+            os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+
 
 class NotInRegionRuleTests(unittest.TestCase):
     def tearDown(self):
