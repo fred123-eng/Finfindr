@@ -2998,8 +2998,11 @@ class IdentifyTests(unittest.TestCase):
                 "Carassius auratus", "Goldfish", "orange body and no dorsal spines",
                 region="other", lat="30.70", lng="-96.47",
             )
-            self.assertEqual(inland["not_in_region"]["region"], "Other · 30.70, -96.47")
-            self.assertEqual(inland["not_in_region"]["text"], "not found in Other · 30.70, -96.47")
+            self.assertNotIn("not_in_region", inland)
+            self.assertEqual(inland["region_label"], "Other · 30.70, -96.47")
+            decision = inland["meta"]["not_in_region_decision"]
+            self.assertFalse(decision["fired"])
+            self.assertEqual(decision["reason"], "no_real_region_name")
         finally:
             os.environ.pop("FINFINDR_NOT_IN_REGION", None)
 
@@ -3099,6 +3102,219 @@ class IdentifyTests(unittest.TestCase):
             )
             self.assertEqual(body["not_in_region"]["region"], body["region_label"])
             self.assertEqual(body["not_in_region"]["text"], "not found in Sea of Cortez / La Paz")
+            decision = body["meta"]["not_in_region_decision"]
+            self.assertTrue(decision["fired"])
+            self.assertEqual(decision["reason"], "attached")
+            self.assertIsNone(decision["records_in_radius"])
+        finally:
+            os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+
+    def _heron_handler(self):
+        return self._combo_wildlife_handler(
+            "Ardea herodias",
+            "Great Blue Heron",
+            iconic="Aves",
+            ancestors=[{"name": "Aves", "rank": "class"}, {"name": "Ardeidae", "rank": "family"}],
+            worms={"isMarine": False, "isFreshwater": True, "isBrackish": False, "isTerrestrial": True},
+        )
+
+    def _combo_wildlife_handler(self, scientific, common, iconic, ancestors, worms, record_total=None, photos=False):
+        def handler(url, params):
+            if "marinespecies.org" in url:
+                row = {"scientificname": scientific}
+                row.update(worms)
+                return FakeResponse([row])
+            if "taxa" in url:
+                name = params.get("q") or scientific
+                if (name or "").lower() != scientific.lower() and "taxa/" not in url:
+                    return FakeResponse({"results": []})
+                taxon = {
+                    "id": 11,
+                    "name": scientific,
+                    "rank": "species",
+                    "iconic_taxon_name": iconic,
+                    "preferred_common_name": common,
+                    "ancestors": ancestors,
+                }
+                if photos:
+                    taxon["default_photo"] = {
+                        "id": 11,
+                        "url": "https://inaturalist-open-data.s3.amazonaws.com/photos/11/square.jpg",
+                        "attribution": "Riley Example",
+                        "license_code": "cc-by",
+                    }
+                return FakeResponse({"results": [taxon]})
+            if "observations" in url and str(params.get("per_page")) == "1" and record_total is not None:
+                return FakeResponse({"total_results": record_total, "results": []})
+            return None
+        return handler
+
+    def test_ff27_v2_in_region_heron_gets_no_note(self):
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        self.inat_handler = self._heron_handler()
+        try:
+            body = self._post_named(
+                "Ardea herodias", "Great Blue Heron", "a long dagger bill and an S-curved neck",
+            )
+            self.assertNotEqual(body.get("reason"), "not_marine")
+            self.assertEqual(body["candidates"][0]["scientific_name"], "Ardea herodias")
+            self.assertNotIn("not_in_region", body)
+            decision = body["meta"]["not_in_region_decision"]
+            self.assertFalse(decision["fired"])
+            self.assertIn(decision["reason"], ("worms_terrestrial", "not_freshwater_fish"))
+            self.assertTrue(decision["worms_terrestrial"])
+        finally:
+            os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+
+    def test_ff27_v2_caracara_gets_no_note(self):
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        self.inat_handler = self._land_handler(
+            "Caracara cheriway", "Crested Caracara", "Aves",
+            [{"name": "Aves", "rank": "class"}, {"name": "Falconidae", "rank": "family"}],
+        )
+        try:
+            body = self._post_named(
+                "Caracara cheriway", "Crested Caracara", "a bare orange face",
+            )
+            self.assertNotIn("not_in_region", body)
+            if body.get("reason") == "not_marine":
+                self._assert_not_marine(body)
+            else:
+                decision = body["meta"]["not_in_region_decision"]
+                self.assertFalse(decision["fired"])
+                self.assertIn(decision["reason"], ("worms_terrestrial", "not_freshwater_fish"))
+        finally:
+            os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+
+    def test_ff27_v2_goldfish_and_sunfish_in_cortez_with_no_gps_get_the_note(self):
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        cases = [
+            ("Carassius auratus", "Goldfish", "Cyprinidae", "orange body and no dorsal spines"),
+            ("Lepomis gibbosus", "Pumpkinseed", "Centrarchidae", "orange spots and a red ear flap"),
+        ]
+        try:
+            for scientific, common, family, trait in cases:
+                self.inat_handler = self._freshwater_handler(scientific, common, [
+                    {"name": "Actinopterygii", "rank": "class"},
+                    {"name": family, "rank": "family"},
+                ])
+                body = self._post_named(scientific, common, trait, region="sea-of-cortez")
+                self.assertEqual(
+                    body["not_in_region"]["display"],
+                    f"{common} ({scientific}) — not found in Sea of Cortez / La Paz.",
+                    scientific,
+                )
+                decision = body["meta"]["not_in_region_decision"]
+                self.assertTrue(decision["fired"], scientific)
+                self.assertEqual(decision["reason"], "attached", scientific)
+                self.assertIsNone(decision["records_in_radius"], scientific)
+                self.assertIsNone(decision["gps_in_region"], scientific)
+        finally:
+            os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+
+    def test_ff27_v2_picked_cortez_with_inland_gps_and_records_still_gets_the_note(self):
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        self.inat_handler = self._combo_wildlife_handler(
+            "Carassius auratus", "Goldfish", "Actinopterygii",
+            [{"name": "Actinopterygii", "rank": "class"}, {"name": "Cyprinidae", "rank": "family"}],
+            {"isMarine": False, "isFreshwater": True, "isBrackish": False, "isTerrestrial": False},
+            record_total=89,
+        )
+        try:
+            body = self._post_named(
+                "Carassius auratus", "Goldfish", "orange body and no dorsal spines",
+                region="sea-of-cortez", lat="30.70", lng="-96.47", discovery="1",
+            )
+            self.assertEqual(
+                body["not_in_region"]["display"],
+                "Goldfish (Carassius auratus) — not found in Sea of Cortez / La Paz.",
+            )
+            decision = body["meta"]["not_in_region_decision"]
+            self.assertTrue(decision["fired"])
+            self.assertEqual(decision["reason"], "attached")
+            self.assertEqual(decision["records_in_radius"], 89)
+            self.assertFalse(decision["gps_in_region"])
+        finally:
+            os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+
+    def test_ff27_v2_gps_inside_cortez_with_records_gets_no_note(self):
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        self.inat_handler = self._combo_wildlife_handler(
+            "Carassius auratus", "Goldfish", "Actinopterygii",
+            [{"name": "Actinopterygii", "rank": "class"}, {"name": "Cyprinidae", "rank": "family"}],
+            {"isMarine": False, "isFreshwater": True, "isBrackish": False, "isTerrestrial": False},
+            record_total=34,
+        )
+        try:
+            body = self._post_named(
+                "Carassius auratus", "Goldfish", "orange body and no dorsal spines",
+                region="sea-of-cortez", lat="24.2", lng="-110.3", discovery="1",
+            )
+            self.assertNotIn("not_in_region", body)
+            self.assertEqual(body["candidates"][0]["scientific_name"], "Carassius auratus")
+            decision = body["meta"]["not_in_region_decision"]
+            self.assertFalse(decision["fired"])
+            self.assertEqual(decision["reason"], "records_in_region")
+            self.assertEqual(decision["records_in_radius"], 34)
+            self.assertTrue(decision["gps_in_region"])
+        finally:
+            os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+
+    def test_ff27_v2_does_not_cap_a_confident_answer(self):
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        self.inat_handler = self._combo_wildlife_handler(
+            "Carassius auratus", "Goldfish", "Actinopterygii",
+            [{"name": "Actinopterygii", "rank": "class"}, {"name": "Cyprinidae", "rank": "family"}],
+            {"isMarine": False, "isFreshwater": True, "isBrackish": False, "isTerrestrial": False},
+            photos=True,
+        )
+        self.captured["model_text"] = (
+            "Photo quality: good\n"
+            "Common name: Goldfish\n"
+            "Scientific name: Carassius auratus\n"
+            "Confidence: high\n"
+            "Candidate 1: Carassius auratus | Goldfish | high | orange body and no dorsal spines\n"
+        )
+        self.captured["verify_text"] = (
+            "Decision: Carassius auratus\nCertainty: confident\nTrait: orange body and no dorsal spines\n"
+        )
+        try:
+            body = self.post_photo(
+                region="sea-of-cortez", debug="1", verify="1", discovery="0", model="grok-4.7",
+            ).get_json()
+            self.assertEqual(body["certainty"], "confident")
+            self.assertEqual(body["candidates"][0]["confidence"], "high")
+            self.assertEqual(
+                body["not_in_region"]["display"],
+                "Goldfish (Carassius auratus) — not found in Sea of Cortez / La Paz.",
+            )
+            self.assertTrue(body["meta"]["verify_succeeded"])
+            decision = body["meta"]["not_in_region_decision"]
+            self.assertTrue(decision["fired"])
+            self.assertEqual(decision["reason"], "attached")
+        finally:
+            os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+
+    def test_ff27_v2_unconfirmed_high_stays_likely(self):
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        self.inat_handler = self._freshwater_handler(
+            "Carassius auratus", "Goldfish",
+            [{"name": "Actinopterygii", "rank": "class"}, {"name": "Cyprinidae", "rank": "family"}],
+        )
+        try:
+            self.captured["model_text"] = (
+                "Photo quality: good\n"
+                "Common name: Goldfish\n"
+                "Scientific name: Carassius auratus\n"
+                "Confidence: high\n"
+                "Candidate 1: Carassius auratus | Goldfish | high | orange body and no dorsal spines\n"
+            )
+            body = self.post_photo(
+                region="sea-of-cortez", debug="1", verify="0", discovery="0",
+            ).get_json()
+            self.assertEqual(body["certainty"], "likely")
+            self.assertEqual(body["candidates"][0]["confidence"], "medium")
+            self.assertIn("not_in_region", body)
         finally:
             os.environ.pop("FINFINDR_NOT_IN_REGION", None)
 
@@ -3177,11 +3393,51 @@ class NotInRegionRuleTests(unittest.TestCase):
             with patch("finfindr_server.fetch_inat_taxon") as fetch:
                 self.assertFalse(finfindr_server.taxon_is_freshwater_or_inland("Thalassoma lucasanum"))
                 fetch.assert_not_called()
+        goldfish = {
+            "name": "Carassius auratus",
+            "iconic_taxon_name": "Actinopterygii",
+            "ancestors": [{"name": "Actinopterygii", "rank": "class"}, {"name": "Cyprinidae", "rank": "family"}],
+        }
         with patch("finfindr_server._worms_habitat", return_value={"marine": False, "freshwater": True, "brackish": False, "terrestrial": False}):
-            self.assertTrue(finfindr_server.taxon_is_freshwater_or_inland("Carassius auratus"))
+            with patch("finfindr_server.fetch_inat_taxon", return_value=goldfish):
+                self.assertTrue(finfindr_server.taxon_is_freshwater_or_inland("Carassius auratus"))
+        with patch("finfindr_server._worms_habitat", return_value={"marine": False, "freshwater": True, "brackish": False, "terrestrial": True}):
+            with patch("finfindr_server.fetch_inat_taxon") as fetch:
+                self.assertFalse(finfindr_server.taxon_is_freshwater_or_inland("Caracara cheriway"))
+                fetch.assert_not_called()
+        heron = {
+            "name": "Ardea herodias",
+            "iconic_taxon_name": "Aves",
+            "ancestors": [{"name": "Aves", "rank": "class"}, {"name": "Ardeidae", "rank": "family"}],
+        }
+        with patch("finfindr_server._worms_habitat", return_value={"marine": False, "freshwater": True, "brackish": False, "terrestrial": True}):
+            with patch("finfindr_server.fetch_inat_taxon", return_value=heron):
+                self.assertFalse(finfindr_server.taxon_is_freshwater_or_inland("Ardea herodias"))
         with patch("finfindr_server._worms_habitat", return_value=None):
             with patch("finfindr_server.fetch_inat_taxon", return_value=None):
                 self.assertFalse(finfindr_server.taxon_is_freshwater_or_inland("Unknownus species"))
+            with patch("finfindr_server.fetch_inat_taxon", return_value=goldfish):
+                self.assertTrue(finfindr_server.taxon_is_freshwater_or_inland("Carassius auratus"))
+
+    def test_real_note_region_name_rejects_coordinate_labels(self):
+        cortez = finfindr_server._REGIONS_BY_ID["sea-of-cortez"]
+        other = finfindr_server._REGIONS_BY_ID["other"]
+        self.assertEqual(
+            finfindr_server.real_note_region_name(cortez, None, None),
+            "Sea of Cortez / La Paz",
+        )
+        self.assertIsNone(finfindr_server.real_note_region_name(other, 30.70, -96.47))
+        self.assertEqual(
+            finfindr_server.real_note_region_name(other, 24.2, -110.3),
+            "Sea of Cortez / La Paz",
+        )
+        self.assertFalse(finfindr_server.gps_in_note_region(cortez, 30.70, -96.47))
+        self.assertTrue(finfindr_server.gps_in_note_region(cortez, 24.2, -110.3))
+        self.assertIsNone(finfindr_server.gps_in_note_region(cortez, None, None))
+        self.assertFalse(finfindr_server.records_block_not_in_region(cortez, 24.2, -110.3, None))
+        self.assertFalse(finfindr_server.records_block_not_in_region(cortez, 24.2, -110.3, 0))
+        self.assertFalse(finfindr_server.records_block_not_in_region(cortez, 30.70, -96.47, 89))
+        self.assertTrue(finfindr_server.records_block_not_in_region(cortez, 24.2, -110.3, 34))
 
 
 class LookalikeRuleTests(unittest.TestCase):

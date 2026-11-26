@@ -1787,6 +1787,45 @@ def not_in_region_display(common, scientific, region_name):
     return f"{lead} — {not_in_region_text(region_name)}."
 
 
+_COORDINATE_REGION_NAME = re.compile(r"^(?:Other|Near) · -?\d+\.\d+, -?\d+\.\d+$")
+
+
+def real_note_region_name(region, lat, lng, location_fallback=False):
+    """A named ocean region for the note, or None for coordinate-only / Other labels."""
+    name = (effective_region_label(region, lat, lng, location_fallback) or "").strip()
+    if not name or name in ("Other", "Use my location"):
+        return None
+    if _COORDINATE_REGION_NAME.match(name):
+        return None
+    return name
+
+
+def gps_in_note_region(region, lat, lng):
+    """Whether GPS sits in the box the note would use. None when there is no GPS.
+
+    A named picker uses that region's box, even if the point is elsewhere.
+    For Other or Use my location, the named ocean box the point falls in, if any.
+    """
+    if lat is None or lng is None or not region:
+        return None
+    if region.get("id") not in ("other", "my-location"):
+        if "swlat" not in region:
+            return False
+        return _point_in_bbox(lat, lng, region["swlat"], region["swlng"], region["nelat"], region["nelng"])
+    match = region_matching_point(lat, lng)
+    return bool(match and "swlat" in match)
+
+
+def records_block_not_in_region(region, lat, lng, record_count):
+    """An existing GPS records_in_radius > 0 blocks only when that GPS is in the note region.
+
+    A missing count never blocks. This does not fetch a place_id or bbox count.
+    """
+    if record_count is None or record_count <= 0:
+        return False
+    return gps_in_note_region(region, lat, lng) is True
+
+
 def locality_text(region, lat, lng, coord_source):
     if region["id"] in ("my-location", "other"):
         if lat is None:
@@ -4932,25 +4971,131 @@ def species_on_list(scientific, species):
     return False
 
 
-def taxon_is_freshwater_or_inland(scientific):
-    """True only with positive inland evidence and no marine flag.
+def _not_in_region_habitat_fields(habitat):
+    if not habitat:
+        return {
+            "worms_marine": None,
+            "worms_brackish": None,
+            "worms_freshwater": None,
+            "worms_terrestrial": None,
+        }
+    return {
+        "worms_marine": habitat.get("marine"),
+        "worms_brackish": habitat.get("brackish"),
+        "worms_freshwater": habitat.get("freshwater"),
+        "worms_terrestrial": habitat.get("terrestrial"),
+    }
 
-    Unknown habitat is False so a rare or poorly recorded ocean species is
-    not given a not-in-region flag. Those stay on the discovery path.
+
+def taxon_is_freshwater_or_inland(scientific, habitat=None):
+    """True only for a freshwater or aquatic fish with positive evidence.
+
+    Birds and other land animals never qualify. WoRMS terrestrial is never
+    a reason to attach the not-in-region note. A marine-only fish does not
+    qualify. Unknown habitat is False unless the taxon is in the known
+    freshwater fish families.
     """
     if not scientific:
         return False
-    habitat = _worms_habitat(scientific)
-    if habitat and habitat.get("marine") is True:
-        return False
-    if habitat and habitat.get("freshwater") is True:
-        return True
+    if habitat is None:
+        habitat = _worms_habitat(scientific)
     if habitat and habitat.get("terrestrial") is True:
-        return True
+        return False
+    if habitat and habitat.get("marine") is True and habitat.get("freshwater") is not True:
+        return False
     taxon = fetch_inat_taxon(scientific)
-    if taxon and (_ancestor_names(taxon) & FRESHWATER_INLAND_ANCESTORS):
+    names = _ancestor_names(taxon) if taxon else set()
+    iconic = str((taxon or {}).get("iconic_taxon_name") or "").strip().lower()
+    if iconic in LAND_ICONIC_TAXA or (names & LAND_ICONIC_TAXA):
+        return False
+    is_freshwater_family = bool(names & FRESHWATER_INLAND_ANCESTORS)
+    is_ray_finned = "actinopterygii" in names or iconic == "actinopterygii"
+    if is_freshwater_family:
+        return True
+    if is_ray_finned and habitat and habitat.get("freshwater") is True:
         return True
     return False
+
+
+def _not_in_region_decision_base(record_count, region, lat, lng, reason, habitat=None):
+    decision = {
+        "fired": False,
+        "reason": reason,
+        "records_in_radius": record_count,
+        "gps_in_region": gps_in_note_region(region, lat, lng),
+        "region": None,
+    }
+    decision.update(_not_in_region_habitat_fields(habitat))
+    return decision
+
+
+def evaluate_not_in_region(
+    *,
+    focus,
+    common,
+    species,
+    no_match,
+    region,
+    lat,
+    lng,
+    location_fallback,
+    certainty,
+    record_count,
+):
+    """Decide whether to attach the note. Never fetches a new record count."""
+    decision = _not_in_region_decision_base(record_count, region, lat, lng, "no_focus")
+    if no_match:
+        decision["reason"] = "no_match"
+        return decision, None
+    if not focus:
+        return decision, None
+    if species_on_list(focus, species):
+        decision["reason"] = "on_list"
+        return decision, None
+    habitat = _worms_habitat(focus)
+    decision.update(_not_in_region_habitat_fields(habitat))
+    if habitat and habitat.get("terrestrial") is True:
+        decision["reason"] = "worms_terrestrial"
+        return decision, None
+    if not taxon_is_freshwater_or_inland(focus, habitat=habitat):
+        decision["reason"] = "not_freshwater_fish"
+        return decision, None
+    region_name = real_note_region_name(region, lat, lng, location_fallback)
+    if not region_name:
+        decision["reason"] = "no_real_region_name"
+        return decision, None
+    decision["region"] = region_name
+    if records_block_not_in_region(region, lat, lng, record_count):
+        decision["reason"] = "records_in_region"
+        return decision, None
+    if certainty == "unsure":
+        decision["reason"] = "unsure"
+        return decision, None
+    if certainty not in ("likely", "confident"):
+        decision["reason"] = "unsure"
+        return decision, None
+    decision["fired"] = True
+    decision["reason"] = "attached"
+    return decision, build_not_in_region_flag(common, focus, region, lat, lng, location_fallback)
+
+
+def log_not_in_region_decision(decision, scientific=""):
+    """One log line for every fire or no-fire decision."""
+    app.logger.info(
+        "not_in_region fired=%s reason=%s records_in_radius=%s gps_in_region=%s "
+        "worms_marine=%s worms_brackish=%s worms_freshwater=%s worms_terrestrial=%s "
+        "region=%s scientific=%s",
+        (decision or {}).get("fired"),
+        (decision or {}).get("reason"),
+        (decision or {}).get("records_in_radius"),
+        (decision or {}).get("gps_in_region"),
+        (decision or {}).get("worms_marine"),
+        (decision or {}).get("worms_brackish"),
+        (decision or {}).get("worms_freshwater"),
+        (decision or {}).get("worms_terrestrial"),
+        (decision or {}).get("region") or "",
+        scientific or "",
+    )
 
 
 def build_not_in_region_flag(common, scientific, region, lat, lng, location_fallback=False):
@@ -6225,22 +6370,24 @@ def _identify_with_nature(
         la_meta["certainty_final"] = certainty
         meta["lookalike"] = la_meta
     not_in_region = None
-    if inland_off_list and shown and not no_match and certainty != "unsure":
-        # Likely-level flag only. Never raise certainty. Never attach a
-        # discovery / KNOWN_OUT_OF_RANGE badge.
-        if certainty == "confident":
-            certainty = "likely"
-            for item in shown:
-                if item.get("confidence") == "high":
-                    item["confidence"] = "medium"
-            if text:
-                text = _set_field(text, "Confidence", shown[0].get("confidence") or "medium")
-        if certainty == "likely":
-            not_in_region = build_not_in_region_flag(
-                shown[0].get("common_name") or "",
-                shown[0].get("scientific_name") or focus,
-                region, lat, lng, location_fallback,
-            )
+    if not_in_region_enabled(debug, fields.get("not_in_region")) and not nature_off:
+        # Never raise certainty. Never cap it because the note attaches.
+        # Never attach a discovery / KNOWN_OUT_OF_RANGE badge.
+        decision, not_in_region = evaluate_not_in_region(
+            focus=focus,
+            common=(shown[0].get("common_name") or "") if shown else "",
+            species=species,
+            no_match=no_match,
+            region=region,
+            lat=lat,
+            lng=lng,
+            location_fallback=location_fallback,
+            certainty=certainty,
+            record_count=record_count,
+        )
+        meta["not_in_region_decision"] = decision
+        log_not_in_region_decision(decision, (shown[0].get("scientific_name") if shown else focus) or focus or "")
+        if not_in_region:
             if discovery and discovery.get("type") in ("possible_range_extension", "off_list"):
                 discovery = None
             evidence.append("not_in_region")
