@@ -4973,7 +4973,12 @@ def ff28_p2_clears_clash(shown, candidates, species, photo_quality, photo_text):
     rank1 = model_rank1_candidate(candidates)
     clash_common = traits_contradict(photo_text, f"{common} {card}")
     clash_card = traits_contradict(photo_text, card) if card else False
+    # FF-28 v3: the clash must be one observed color against the name's color word
+    # (a "green" moray that looks brown). Two or more observed colors that all miss
+    # the name describe a pattern, which points at a different species.
+    visible_colors = sorted(_color_set(photo_text))
     decision.update({
+        "visible_colors": visible_colors,
         "top_conf": top.get("confidence") or "",
         "second_conf": second or "",
         "photo_quality": photo_quality or "",
@@ -4989,6 +4994,7 @@ def ff28_p2_clears_clash(shown, candidates, species, photo_quality, photo_text):
         (second in (None, "", "low"), "second_not_low"),
         (not card, "trait_card_present"),
         (clash_common and not clash_card, "clash_not_common_name_only"),
+        (len(visible_colors) == 1, "clash_not_single_color"),
     )
     for ok, reason in checks:
         if not ok:

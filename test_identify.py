@@ -4399,6 +4399,8 @@ FF28_SPECIES = [
     ("Leucophaeus atricilla", "Laughing Gull"),
     ("Phataria unifascialis", "Blue Sea Star"),
     ("Pharia pyramidata", "Pyramid Sea Star"),
+    ("Johnrandallia nigrirostris", "Black-nosed Butterflyfish"),
+    ("Zanclus cornutus", "Moorish Idol"),
 ]
 
 
@@ -4445,6 +4447,33 @@ class UnsurePromoteTests(unittest.TestCase):
         "Notes: Nests on Isla Rasa.\n"
         "Candidate 1: Larus heermanni | Heermann's Gull | medium | uniform sooty-gray body, red bill, white trailing edge\n"
         "Candidate 2: Leucophaeus atricilla | Laughing Gull | low | white below rather than sooty gray\n"
+    )
+    # Stored replies from QA cold1 on bf7e441 (eval100/runs/ff28v2-bf7e441-cold1).
+    MORAY_COLD1_TEXT = (
+        "Photo quality: good\n"
+        "Photo issue: none\n"
+        "Common name: Panamic green moray\n"
+        "Scientific name: Gymnothorax castaneus\n"
+        "Group: moray eel\n"
+        "Alternative group considered: sea snake\n"
+        "Confidence: medium\n"
+        "Notes: Morays have a second set of pharyngeal jaws that shoot forward to pull prey down the throat.\n"
+        "Candidate 1: Gymnothorax castaneus | Panamic green moray | medium | plain chestnut-brown body, large gape, and no pectoral fins\n"
+        "Candidate 2: Muraena lentiginosa | Jewel moray | low | would show dense white jewel-like spots, absent here\n"
+        "Candidate 3: none | none | none | none\n"
+    )
+    BUTTERFLY_410627272_TEXT = (
+        "Photo quality: good\n"
+        "Photo issue: none\n"
+        "Common name: Black-nosed Butterflyfish\n"
+        "Scientific name: Johnrandallia nigrirostris\n"
+        "Group: Ray-finned fish (butterflyfish)\n"
+        "Alternative group considered: Moorish idol\n"
+        "Confidence: medium\n"
+        "Notes: Often called the barberfish because it cleans parasites from larger fishes at reef stations.\n"
+        "Candidate 1: Johnrandallia nigrirostris | Black-nosed Butterflyfish | medium | compressed yellow body, dark snout, and a long white dorsal filament without bold vertical bands\n"
+        "Candidate 2: Zanclus cornutus | Moorish Idol | low | also has a long dorsal streamer, but shows strong vertical black-white-yellow bands and a tubular snout\n"
+        "Candidate 3: none | none | low | none\n"
     )
     GULL_OFFLIST = "Off-list 1: Leucophaeus fuliginosus | Lava Gull | low | dark gray plumage, bill usually black\nOff-list 2: none\n"
 
@@ -4612,6 +4641,38 @@ class UnsurePromoteTests(unittest.TestCase):
                              for url in self.captured.get("gets", [])))
         # No extra model call: one identify call plus nothing for FF-28.
         self.assertFalse(any(call["verify"] for call in self.captured["calls"]))
+
+    def test_p2_v3_blocks_multi_color_clash_410627272(self):
+        top = ff28_cand("Johnrandallia nigrirostris", "Black-nosed Butterflyfish", "medium", rank=1,
+                        trait="compressed yellow body, dark snout, and a long white dorsal filament without bold vertical bands")
+        second = ff28_cand("Zanclus cornutus", "Moorish Idol", "low", rank=2)
+        shown = finfindr_server.public_candidates([top, second], ff28_list(), preserve_order=True)
+        text = f"{top['trait']} Often called the barberfish because it cleans parasites from larger fishes at reef stations."
+        cleared, decision = finfindr_server.ff28_p2_clears_clash(shown, [top, second], ff28_list(), "good", text)
+        self.assertFalse(cleared)
+        self.assertEqual(decision["reason"], "clash_not_single_color")
+        self.assertEqual(decision["visible_colors"], ["white", "yellow"])
+
+    def test_p2_v3_keeps_single_color_moray_414705526(self):
+        shown, candidates = self._moray_shown(top={"trait": "plain chestnut-brown body, large gape, and no pectoral fins"})
+        text = "plain chestnut-brown body, large gape, and no pectoral fins Morays have a second set of pharyngeal jaws."
+        cleared, decision = finfindr_server.ff28_p2_clears_clash(shown, candidates, ff28_list(), "good", text)
+        self.assertTrue(cleared)
+        self.assertEqual(decision["visible_colors"], ["brown"])
+
+    def test_route_v3_410627272_stays_unsure_and_moray_414705526_promoted(self):
+        os.environ["FINFINDR_UNSURE_PROMOTE"] = "1"
+        self.captured["model_text"] = self.BUTTERFLY_410627272_TEXT
+        body = self._post()
+        self.assertEqual(body["certainty"], "unsure")
+        self.assertNotIn("unsure_promoted_common_name_clash", body["meta"]["evidence"])
+        self.assertEqual(body["meta"]["ff28_decision"]["path"], "none")
+        self.assertEqual(body["meta"]["ff28_decision"]["reason"], "clash_not_single_color")
+        self.captured["model_text"] = self.MORAY_COLD1_TEXT
+        body = self._post()
+        self.assertEqual(body["certainty"], "likely")
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Gymnothorax castaneus")
+        self.assertEqual(body["meta"]["ff28_decision"]["path"], "P2")
 
     def test_route_p1_promotes_gull_to_likely(self):
         os.environ["FINFINDR_UNSURE_PROMOTE"] = "1"
