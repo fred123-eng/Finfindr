@@ -3587,13 +3587,14 @@ class IdentifyTests(unittest.TestCase):
                 "lookalike", "Centropomus viridis", "similar",
             )
             uncited = self._ff30_post()
-            self.assertEqual(uncited["certainty"], "unsure")
+            self.assertEqual(uncited["candidates"][0]["scientific_name"], "Centropomus viridis")
+            self.assertEqual(uncited["certainty"], "likely")
             self.assertEqual(uncited["meta"]["first_guess"]["outcome"], "unsure")
             self.assertEqual(uncited["meta"]["first_guess"]["reason"], "uncited_feature")
         finally:
             os.environ.pop("FINFINDR_FIRST_GUESS", None)
 
-    def test_ff30_cant_tell_is_unsure(self):
+    def test_ff30_cant_tell_keeps_the_normal_result(self):
         os.environ["FINFINDR_FIRST_GUESS"] = "1"
         self.inat_handler = self._micropterus_and_snook_handler()
         try:
@@ -3607,9 +3608,65 @@ class IdentifyTests(unittest.TestCase):
                 "unsure", "", "", "the photo cannot separate them",
             )
             body = self._ff30_post()
-            self.assertEqual(body["certainty"], "unsure")
-            self.assertEqual(body["meta"]["first_guess"]["outcome"], "unsure")
             self.assertEqual(body["candidates"][0]["scientific_name"], "Centropomus viridis")
+            self.assertEqual(body["certainty"], "likely")
+            self.assertEqual(body["meta"]["first_guess"]["outcome"], "unsure")
+            self.assertEqual(body["meta"]["first_guess"]["reason"], "model_unsure")
+            self.assertEqual(body["meta"]["first_guess"]["certainty_after"], "likely")
+        finally:
+            os.environ.pop("FINFINDR_FIRST_GUESS", None)
+
+    def test_ff30_off_list_disagreement_unsure_keeps_the_normal_result(self):
+        """415594578-style: off-list first guess + model_unsure keeps likely and the normal name."""
+        os.environ["FINFINDR_FIRST_GUESS"] = "1"
+
+        def handler(url, params):
+            params = params or {}
+            if "species_counts" in url:
+                payload = species_payload(params)
+                if int(params.get("page") or 1) == 1:
+                    payload["results"].insert(0, {
+                        "count": 9000,
+                        "taxon": {
+                            "name": "Abudefduf troschelii",
+                            "rank": "species",
+                            "preferred_common_name": "Panamic Sergeant Major",
+                        },
+                    })
+                return FakeResponse(payload)
+            return None
+
+        self.inat_handler = handler
+        try:
+            self.captured["model_text"] = (
+                "Photo quality: good\n"
+                "Common name: Panamic Sergeant Major\n"
+                "Scientific name: Abudefduf troschelii\n"
+                "Confidence: medium\n"
+                "Candidate 1: Abudefduf troschelii | Panamic Sergeant Major | medium | five black bars on a yellow back\n"
+                "Candidate 2: Abudefduf declivifrons | Mexican Nightsergeant | low | a darker head\n"
+            )
+            self.captured["first_guess_text"] = self._ff30_guess_text(
+                "Abudefduf saxatilis",
+                "Sergeant major",
+                "a silvery oval body with five bold black vertical bars",
+            )
+            self.captured["first_guess_compare_text"] = self._ff30_compare_text(
+                "unsure", "", "", "the photo cannot separate the two sergeant majors",
+            )
+            body = self._ff30_post()
+            self.assertEqual(body["candidates"][0]["scientific_name"], "Abudefduf troschelii")
+            self.assertEqual(body["certainty"], "likely")
+            self.assertNotIn("not_in_region", body)
+            fg = body["meta"]["first_guess"]
+            self.assertEqual(fg["scientific_name"], "Abudefduf saxatilis")
+            self.assertFalse(fg["on_list"])
+            self.assertFalse(fg["agrees"])
+            self.assertEqual(fg["outcome"], "unsure")
+            self.assertEqual(fg["reason"], "model_unsure")
+            self.assertEqual(fg["certainty_before"], "likely")
+            self.assertEqual(fg["certainty_after"], "likely")
+            self.assertTrue(self.captured.get("first_guess_compare_calls"))
         finally:
             os.environ.pop("FINFINDR_FIRST_GUESS", None)
 
@@ -4229,6 +4286,10 @@ class FirstGuessRuleTests(unittest.TestCase):
         self.assertEqual(finfindr_server.first_guess_certainty("medium"), "likely")
         self.assertEqual(finfindr_server.first_guess_certainty("low"), "unsure")
 
+    def test_first_guess_timeout_default_is_60(self):
+        os.environ.pop("FINFINDR_FIRST_GUESS_TIMEOUT", None)
+        self.assertEqual(finfindr_server.first_guess_timeout(), 60)
+
     def test_decide_hold_lookalike_unsure_and_fallback(self):
         hold = finfindr_server.decide_first_guess_compare(
             {
@@ -4282,7 +4343,8 @@ class FirstGuessRuleTests(unittest.TestCase):
         )
         self.assertEqual(uncited["outcome"], "unsure")
         self.assertEqual(uncited["reason"], "uncited_feature")
-        self.assertEqual(uncited["certainty"], "unsure")
+        self.assertEqual(uncited["scientific_name"], "Centropomus viridis")
+        self.assertEqual(uncited["certainty"], "likely")
 
         unsure = finfindr_server.decide_first_guess_compare(
             {"decision": "unsure", "chosen": "", "cited_features": ""},
@@ -4292,7 +4354,19 @@ class FirstGuessRuleTests(unittest.TestCase):
             "likely",
         )
         self.assertEqual(unsure["outcome"], "unsure")
-        self.assertEqual(unsure["certainty"], "unsure")
+        self.assertEqual(unsure["scientific_name"], "Centropomus viridis")
+        self.assertEqual(unsure["certainty"], "likely")
+
+        already = finfindr_server.decide_first_guess_compare(
+            {"decision": "unsure", "chosen": "", "cited_features": ""},
+            "Micropterus salmoides",
+            "Centropomus viridis",
+            "a large mouth",
+            "likely",
+            normal_certainty="unsure",
+        )
+        self.assertEqual(already["outcome"], "unsure")
+        self.assertEqual(already["certainty"], "unsure")
 
         fallback = finfindr_server.decide_first_guess_compare(
             None, "Micropterus salmoides", "Centropomus viridis", "a large mouth", "likely",

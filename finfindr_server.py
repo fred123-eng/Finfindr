@@ -4476,8 +4476,8 @@ def first_guess_enabled(debug=False, raw=None):
 
 
 def first_guess_timeout():
-    """Seconds for each FF-30 model call. Default 25, below the 180s main limit."""
-    return _env_seconds("FINFINDR_FIRST_GUESS_TIMEOUT", 25, 8, 60)
+    """Seconds for each FF-30 model call. Default 60, still bounded by the job wall."""
+    return _env_seconds("FINFINDR_FIRST_GUESS_TIMEOUT", 60, 8, 90)
 
 
 def first_guess_model():
@@ -4586,19 +4586,32 @@ def _empty_first_guess_decision(reason, **extra):
     return decision
 
 
-def decide_first_guess_compare(parsed, guess_name, normal_name, guess_trait, certainty_cap):
+def decide_first_guess_compare(parsed, guess_name, normal_name, guess_trait, certainty_cap, normal_certainty=None):
     """Apply the FF-30 mismatch rules. Pure function; no model calls.
 
     Returns outcome (hold / lookalike / unsure / fallback), the name to show,
-    a certainty that is never above certainty_cap (and never confident on hold),
-    a reason, and any cited features.
+    a certainty that is never raised, a reason, and any cited features.
+
+    A hold or a cited look-alike switch is capped at likely. If the second
+    look is unsure or cannot tell, the normal name and its certainty are
+    kept unchanged; UNSURE is only kept if the normal path already had it.
     """
+    keep_certainty = normal_certainty if normal_certainty is not None else certainty_cap
 
     def result(outcome, name, certainty, reason, features=""):
         return {
             "outcome": outcome,
             "scientific_name": name,
             "certainty": cap_certainty(certainty, certainty_cap),
+            "reason": reason,
+            "cited_features": features,
+        }
+
+    def keep_normal(reason, features=""):
+        return {
+            "outcome": "unsure",
+            "scientific_name": normal_name,
+            "certainty": keep_certainty,
             "reason": reason,
             "cited_features": features,
         }
@@ -4610,17 +4623,17 @@ def decide_first_guess_compare(parsed, guess_name, normal_name, guess_trait, cer
         return result("fallback", normal_name, certainty_cap, "unknown_decision")
     features = str(parsed.get("cited_features") or parsed.get("cited_feature") or "").strip()
     if decision == "unsure":
-        return result("unsure", normal_name, "unsure", "model_unsure", features)
+        return keep_normal("model_unsure", features)
     chosen_raw = str(parsed.get("chosen") or "").strip()
     chosen = exact_scientific_name(chosen_raw) if chosen_raw else ""
     if decision == "hold":
         if not chosen:
             chosen = guess_name
         if not scientific_names_agree(chosen, guess_name):
-            return result("unsure", normal_name, "unsure", "inconsistent_hold", features)
+            return keep_normal("inconsistent_hold", features)
         supporting = features or (guess_trait or "")
         if not explicit_diagnostic_trait(supporting):
-            return result("unsure", normal_name, "unsure", "uncited_feature", features)
+            return keep_normal("uncited_feature", features)
         return result(
             "hold",
             guess_name,
@@ -4631,12 +4644,12 @@ def decide_first_guess_compare(parsed, guess_name, normal_name, guess_trait, cer
     if not chosen:
         chosen = normal_name
     if scientific_names_agree(chosen, guess_name):
-        return result("unsure", normal_name, "unsure", "inconsistent_lookalike", features)
+        return keep_normal("inconsistent_lookalike", features)
     if not scientific_names_agree(chosen, normal_name):
-        return result("unsure", normal_name, "unsure", "unlisted_choice", features)
+        return keep_normal("unlisted_choice", features)
     if not explicit_diagnostic_trait(features):
-        return result("unsure", normal_name, "unsure", "uncited_feature", features)
-    return result("lookalike", normal_name, certainty_cap, "lookalike_with_visible_feature", features)
+        return keep_normal("uncited_feature", features)
+    return result("lookalike", normal_name, cap_certainty(keep_certainty, "likely"), "lookalike_with_visible_feature", features)
 
 
 def log_first_guess_decision(decision):
@@ -4756,7 +4769,11 @@ def apply_first_guess_to_result(
     request_started,
     use_cache,
 ):
-    """Decide hold / lookalike / unsure / skip. Never raises certainty."""
+    """Decide hold / lookalike / unsure / skip. Never raises certainty.
+
+    An unsure or cannot-tell second look keeps the normal result and its
+    certainty. A cited look-alike switch is capped at likely.
+    """
     decision["certainty_before"] = certainty
     normal = (shown[0] if shown else {}) or {}
     normal_name = normal.get("scientific_name") or ""
@@ -4807,6 +4824,7 @@ def apply_first_guess_to_result(
 
     decided = decide_first_guess_compare(
         parsed, guess_name, normal_name, guess.get("trait") or "", certainty_cap,
+        normal_certainty=certainty,
     )
     decision["outcome"] = decided["outcome"]
     decision["reason"] = decided["reason"]
@@ -4846,8 +4864,10 @@ def apply_first_guess_to_result(
         return shown, candidates, new_certainty, new_certainty
 
     if decided["outcome"] == "unsure":
-        decision["certainty_after"] = "unsure"
-        return shown, candidates, "unsure", "unsure"
+        # Never downgrade: keep the normal name and certainty. UNSURE only
+        # if the normal path already had it.
+        decision["certainty_after"] = certainty
+        return shown, candidates, certainty, None
 
     decision["certainty_after"] = certainty
     return shown, candidates, certainty, None
