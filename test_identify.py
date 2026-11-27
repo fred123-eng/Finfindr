@@ -147,6 +147,9 @@ class IdentifyTests(unittest.TestCase):
         os.environ.pop("FINFINDR_VERIFY_IMAGE_PX", None)
         os.environ.pop("FINFINDR_LOOKALIKE_PASS", None)
         os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+        os.environ.pop("FINFINDR_FIRST_GUESS", None)
+        os.environ.pop("FINFINDR_FIRST_GUESS_TIMEOUT", None)
+        os.environ.pop("FINFINDR_FIRST_GUESS_MODEL", None)
         os.environ["FINFINDR_INAT_MIN_INTERVAL"] = "0"
         os.environ["FINFINDR_MODEL_CACHE"] = "0"
         self.cache_dir = tempfile.mkdtemp(prefix="finfindr-cache-")
@@ -226,6 +229,36 @@ class IdentifyTests(unittest.TestCase):
             body = {
                 "output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}],
                 "usage": {"input_tokens": 1500, "output_tokens": 120, "total_tokens": 1620},
+            }
+            return FakeResponse(body)
+        if finfindr_server.FIRST_GUESS_COMPARE_MARKER in prompt:
+            with self._calls_lock:
+                self.captured.setdefault("first_guess_compare_calls", []).append(
+                    {"model": model, "timeout": kwargs.get("timeout"), "prompt": prompt}
+                )
+            if self.captured.get("first_guess_compare_raises") == "timeout":
+                raise requests.Timeout("first guess compare slow")
+            if self.captured.get("first_guess_compare_raises") == "error":
+                return FakeResponse({"error": "upstream"}, status=503)
+            text = self.captured.get("first_guess_compare_text", "")
+            body = {
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}],
+                "usage": {"input_tokens": 400, "output_tokens": 80, "total_tokens": 480},
+            }
+            return FakeResponse(body)
+        if finfindr_server.FIRST_GUESS_MARKER in prompt:
+            with self._calls_lock:
+                self.captured.setdefault("first_guess_calls", []).append(
+                    {"model": model, "timeout": kwargs.get("timeout"), "prompt": prompt}
+                )
+            if self.captured.get("first_guess_raises") == "timeout":
+                raise requests.Timeout("first guess slow")
+            if self.captured.get("first_guess_raises") == "error":
+                return FakeResponse({"error": "upstream"}, status=503)
+            text = self.captured.get("first_guess_text", "")
+            body = {
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}],
+                "usage": {"input_tokens": 800, "output_tokens": 60, "total_tokens": 860},
             }
             return FakeResponse(body)
         if "OFFLIST_FOLLOWUP" in prompt and self.captured.get("offlist_text"):
@@ -3319,6 +3352,322 @@ class IdentifyTests(unittest.TestCase):
             os.environ.pop("FINFINDR_NOT_IN_REGION", None)
 
 
+    def _ff30_guess_text(self, scientific, common, trait, confidence="medium"):
+        return (
+            f"Common name: {common}\n"
+            f"Scientific name: {scientific}\n"
+            f"Confidence: {confidence}\n"
+            f"Trait: {trait}\n"
+        )
+
+    def _ff30_compare_text(self, decision, chosen, features, reason="visible features decide it"):
+        return json.dumps({
+            "decision": decision,
+            "chosen": chosen,
+            "cited_features": features,
+            "reason": reason,
+        })
+
+    def _ff30_snook_model_text(self):
+        return (
+            "Photo quality: good\n"
+            "Common name: White Snook\n"
+            "Scientific name: Centropomus viridis\n"
+            "Confidence: medium\n"
+            "Candidate 1: Centropomus viridis | White Snook | medium | a dark lateral line to the tail\n"
+            "Candidate 2: Cynoscion parvipinnis | Shortfin corvina | low | a spotted side\n"
+        )
+
+    def _micropterus_and_snook_handler(self):
+        micro = self._combo_wildlife_handler(
+            "Micropterus salmoides",
+            "Largemouth Bass",
+            "Actinopterygii",
+            [
+                {"name": "Actinopterygii", "rank": "class"},
+                {"name": "Centrarchidae", "rank": "family"},
+            ],
+            {"isMarine": False, "isFreshwater": True, "isBrackish": False, "isTerrestrial": False},
+        )
+
+        def handler(url, params):
+            params = params or {}
+            if "species_counts" in url:
+                payload = species_payload(params)
+                if int(params.get("page") or 1) == 1:
+                    payload["results"].insert(0, {
+                        "count": 9000,
+                        "taxon": {
+                            "name": "Centropomus viridis",
+                            "rank": "species",
+                            "preferred_common_name": "White Snook",
+                        },
+                    })
+                return FakeResponse(payload)
+            if "marinespecies.org" in url:
+                if "micropterus" in (url or "").lower():
+                    return micro(url, params)
+                return FakeResponse([{
+                    "scientificname": "Centropomus viridis",
+                    "isMarine": True,
+                    "isFreshwater": False,
+                    "isBrackish": True,
+                    "isTerrestrial": False,
+                }])
+            if "taxa" in url:
+                name = (params.get("q") or "").lower()
+                if "micropterus" in name or "salmoides" in name:
+                    return micro(url, params)
+                return FakeResponse({"results": [{
+                    "id": 12,
+                    "name": "Centropomus viridis",
+                    "rank": "species",
+                    "iconic_taxon_name": "Actinopterygii",
+                    "preferred_common_name": "White Snook",
+                    "ancestors": [{"name": "Actinopterygii", "rank": "class"}],
+                }]})
+            return micro(url, params)
+
+        return handler
+
+    def _ff30_post(self, **fields):
+        data = {
+            "region": "sea-of-cortez",
+            "sync": "1",
+            "debug": "1",
+            "verify": "0",
+            "discovery": "0",
+            "models": "grok-4.7",
+            "first_guess": "1",
+            "not_in_region": "1",
+        }
+        data.update(fields)
+        return self.post_photo(**data).get_json()
+
+    def test_ff30_flag_off_means_no_change(self):
+        os.environ.pop("FINFINDR_FIRST_GUESS", None)
+        self.assertFalse(finfindr_server.first_guess_enabled())
+        self.captured["first_guess_text"] = self._ff30_guess_text(
+            "Micropterus salmoides", "Largemouth Bass", "a large mouth and a deep bass body",
+        )
+        self.captured["first_guess_compare_text"] = self._ff30_compare_text(
+            "hold", "Micropterus salmoides", "a large mouth and a deep bass body",
+        )
+        baseline = self.post_photo(
+            region="sea-of-cortez", debug="1", verify="0", discovery="0", models="grok-4.7", first_guess="0",
+        ).get_json()
+        self.assertNotIn("first_guess", baseline["meta"])
+        self.assertFalse(self.captured.get("first_guess_calls"))
+        self.assertFalse(self.captured.get("first_guess_compare_calls"))
+        for value in (None, "0", "false", "off"):
+            if value is None:
+                os.environ.pop("FINFINDR_FIRST_GUESS", None)
+            else:
+                os.environ["FINFINDR_FIRST_GUESS"] = value
+            try:
+                body = self.post_photo(
+                    region="sea-of-cortez", debug="1", verify="0", discovery="0", models="grok-4.7",
+                ).get_json()
+            finally:
+                os.environ.pop("FINFINDR_FIRST_GUESS", None)
+            self.assertEqual(self.stable(body), self.stable(baseline), value)
+            self.assertNotIn("first_guess", body["meta"])
+        self.assertFalse(self.captured.get("first_guess_calls"))
+        self.assertFalse(self.captured.get("first_guess_compare_calls"))
+        self.assertEqual(baseline["candidates"][0]["scientific_name"], "Thalassoma lucasanum")
+
+    def test_ff30_on_list_or_agree_skips_second_call(self):
+        os.environ["FINFINDR_FIRST_GUESS"] = "1"
+        try:
+            self.captured["first_guess_text"] = self._ff30_guess_text(
+                "Thalassoma lucasanum", "Cortez Rainbow Wrasse", "a yellow tail and a steep wrasse head",
+            )
+            self.captured["first_guess_compare_text"] = self._ff30_compare_text(
+                "hold", "Thalassoma lucasanum", "should not be requested",
+            )
+            on_list = self._ff30_post(not_in_region="0")
+            self.assertEqual(on_list["candidates"][0]["scientific_name"], "Thalassoma lucasanum")
+            self.assertEqual(on_list["certainty"], "likely")
+            self.assertEqual(on_list["meta"]["first_guess"]["outcome"], "agree")
+            self.assertTrue(on_list["meta"]["first_guess"]["on_list"])
+            self.assertTrue(on_list["meta"]["first_guess"]["agrees"])
+            self.assertTrue(self.captured.get("first_guess_calls"))
+            self.assertFalse(self.captured.get("first_guess_compare_calls"))
+            prompt = self.captured["first_guess_calls"][0]["prompt"]
+            self.assertIn(finfindr_server.FIRST_GUESS_MARKER, prompt)
+            self.assertNotIn("marine biologist", prompt.lower())
+            self.assertNotIn("Sea of Cortez", prompt)
+            self.assertNotIn("Prefer a species known from this region", prompt)
+
+            self.captured["first_guess_calls"] = []
+            self.captured["first_guess_compare_calls"] = []
+            self.inat_handler = self._freshwater_handler(
+                "Carassius auratus",
+                "Goldfish",
+                [{"name": "Actinopterygii", "rank": "class"}, {"name": "Cyprinidae", "rank": "family"}],
+            )
+            self.captured["model_text"] = (
+                "Photo quality: good\n"
+                "Common name: Goldfish\n"
+                "Scientific name: Carassius auratus\n"
+                "Confidence: medium\n"
+                "Candidate 1: Carassius auratus | Goldfish | medium | a deep orange body and no dorsal spines\n"
+            )
+            self.captured["first_guess_text"] = self._ff30_guess_text(
+                "Carassius auratus", "Goldfish", "a deep orange body and no dorsal spines",
+            )
+            agree = self._ff30_post()
+            self.assertEqual(agree["candidates"][0]["scientific_name"], "Carassius auratus")
+            self.assertEqual(agree["meta"]["first_guess"]["outcome"], "agree")
+            self.assertTrue(agree["meta"]["first_guess"]["agrees"])
+            self.assertFalse(agree["meta"]["first_guess"]["on_list"])
+            self.assertFalse(self.captured.get("first_guess_compare_calls"))
+            self.assertIn("not_in_region", agree)
+        finally:
+            os.environ.pop("FINFINDR_FIRST_GUESS", None)
+
+    def test_ff30_off_list_freshwater_guess_holds_and_gets_the_note(self):
+        os.environ["FINFINDR_FIRST_GUESS"] = "1"
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        self.inat_handler = self._micropterus_and_snook_handler()
+        try:
+            self.captured["model_text"] = self._ff30_snook_model_text()
+            self.captured["first_guess_text"] = self._ff30_guess_text(
+                "Micropterus salmoides",
+                "Largemouth Bass",
+                "a large mouth and a deep freshwater bass body",
+            )
+            self.captured["first_guess_compare_text"] = self._ff30_compare_text(
+                "hold",
+                "Micropterus salmoides",
+                "a large mouth and a deep freshwater bass body, not a snook lateral line",
+            )
+            body = self._ff30_post()
+            self.assertEqual(body["candidates"][0]["scientific_name"], "Micropterus salmoides")
+            self.assertEqual(body["certainty"], "likely")
+            self.assertIn("not_in_region", body)
+            self.assertIn("Sea of Cortez", body["not_in_region"]["display"])
+            self.assertIn("Largemouth Bass", body["not_in_region"]["display"])
+            fg = body["meta"]["first_guess"]
+            self.assertEqual(fg["outcome"], "hold")
+            self.assertFalse(fg["on_list"])
+            self.assertFalse(fg["agrees"])
+            self.assertTrue(self.captured.get("first_guess_compare_calls"))
+            compare_prompt = self.captured["first_guess_compare_calls"][0]["prompt"]
+            self.assertIn(finfindr_server.FIRST_GUESS_COMPARE_MARKER, compare_prompt)
+            self.assertNotIn("Sea of Cortez", compare_prompt)
+            self.assertNotIn("marine biologist", compare_prompt.lower())
+        finally:
+            os.environ.pop("FINFINDR_FIRST_GUESS", None)
+            os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+
+    def test_ff30_lookalike_switch_needs_cited_features(self):
+        os.environ["FINFINDR_FIRST_GUESS"] = "1"
+        self.inat_handler = self._micropterus_and_snook_handler()
+        try:
+            self.captured["model_text"] = self._ff30_snook_model_text()
+            self.captured["first_guess_text"] = self._ff30_guess_text(
+                "Micropterus salmoides",
+                "Largemouth Bass",
+                "a large mouth and a deep freshwater bass body",
+            )
+            self.captured["first_guess_compare_text"] = self._ff30_compare_text(
+                "lookalike",
+                "Centropomus viridis",
+                "a dark lateral line that runs to the edge of the tail",
+            )
+            cited = self._ff30_post()
+            self.assertEqual(cited["candidates"][0]["scientific_name"], "Centropomus viridis")
+            self.assertEqual(cited["certainty"], "likely")
+            self.assertNotIn("not_in_region", cited)
+            self.assertEqual(cited["meta"]["first_guess"]["outcome"], "lookalike")
+            self.assertIn("lateral line", cited["meta"]["first_guess"]["cited_features"])
+
+            self.captured["first_guess_compare_text"] = self._ff30_compare_text(
+                "lookalike", "Centropomus viridis", "similar",
+            )
+            uncited = self._ff30_post()
+            self.assertEqual(uncited["certainty"], "unsure")
+            self.assertEqual(uncited["meta"]["first_guess"]["outcome"], "unsure")
+            self.assertEqual(uncited["meta"]["first_guess"]["reason"], "uncited_feature")
+        finally:
+            os.environ.pop("FINFINDR_FIRST_GUESS", None)
+
+    def test_ff30_cant_tell_is_unsure(self):
+        os.environ["FINFINDR_FIRST_GUESS"] = "1"
+        self.inat_handler = self._micropterus_and_snook_handler()
+        try:
+            self.captured["model_text"] = self._ff30_snook_model_text()
+            self.captured["first_guess_text"] = self._ff30_guess_text(
+                "Micropterus salmoides",
+                "Largemouth Bass",
+                "a large mouth and a deep freshwater bass body",
+            )
+            self.captured["first_guess_compare_text"] = self._ff30_compare_text(
+                "unsure", "", "", "the photo cannot separate them",
+            )
+            body = self._ff30_post()
+            self.assertEqual(body["certainty"], "unsure")
+            self.assertEqual(body["meta"]["first_guess"]["outcome"], "unsure")
+            self.assertEqual(body["candidates"][0]["scientific_name"], "Centropomus viridis")
+        finally:
+            os.environ.pop("FINFINDR_FIRST_GUESS", None)
+
+    def test_ff30_never_raises_certainty(self):
+        os.environ["FINFINDR_FIRST_GUESS"] = "1"
+        os.environ["FINFINDR_NOT_IN_REGION"] = "1"
+        self.inat_handler = self._micropterus_and_snook_handler()
+        try:
+            self.captured["model_text"] = self._ff30_snook_model_text()
+            self.captured["first_guess_text"] = self._ff30_guess_text(
+                "Micropterus salmoides",
+                "Largemouth Bass",
+                "a large mouth and a deep freshwater bass body",
+                confidence="high",
+            )
+            self.captured["first_guess_compare_text"] = self._ff30_compare_text(
+                "hold",
+                "Micropterus salmoides",
+                "a large mouth and a deep freshwater bass body",
+            )
+            body = self._ff30_post()
+            self.assertEqual(body["candidates"][0]["scientific_name"], "Micropterus salmoides")
+            self.assertEqual(body["certainty"], "likely")
+            self.assertNotEqual(body["certainty"], "confident")
+            self.assertEqual(body["meta"]["first_guess"]["outcome"], "hold")
+            self.assertEqual(body["meta"]["first_guess"]["certainty_after"], "likely")
+        finally:
+            os.environ.pop("FINFINDR_FIRST_GUESS", None)
+            os.environ.pop("FINFINDR_NOT_IN_REGION", None)
+
+    def test_ff30_time_budget_skip_keeps_the_normal_result(self):
+        os.environ["FINFINDR_FIRST_GUESS"] = "1"
+        self.inat_handler = self._micropterus_and_snook_handler()
+        self.captured["model_text"] = self._ff30_snook_model_text()
+        self.captured["first_guess_text"] = self._ff30_guess_text(
+            "Micropterus salmoides",
+            "Largemouth Bass",
+            "a large mouth and a deep freshwater bass body",
+        )
+        self.captured["first_guess_compare_text"] = self._ff30_compare_text(
+            "hold", "Micropterus salmoides", "a large mouth and a deep freshwater bass body",
+        )
+        try:
+            with patch("finfindr_server._time_left", return_value=3.0):
+                body = self._ff30_post()
+            self.assertEqual(body["candidates"][0]["scientific_name"], "Centropomus viridis")
+            self.assertEqual(body["certainty"], "likely")
+            self.assertEqual(body["meta"]["first_guess"]["outcome"], "skip")
+            self.assertEqual(body["meta"]["first_guess"]["reason"], "no_time")
+            self.assertFalse(self.captured.get("first_guess_calls"))
+            self.assertFalse(self.captured.get("first_guess_compare_calls"))
+            self.assertNotIn("not_in_region", body)
+        finally:
+            os.environ.pop("FINFINDR_FIRST_GUESS", None)
+
+
+
+
 class NotInRegionRuleTests(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("FINFINDR_NOT_IN_REGION", None)
@@ -3438,6 +3787,7 @@ class NotInRegionRuleTests(unittest.TestCase):
         self.assertFalse(finfindr_server.records_block_not_in_region(cortez, 24.2, -110.3, 0))
         self.assertFalse(finfindr_server.records_block_not_in_region(cortez, 30.70, -96.47, 89))
         self.assertTrue(finfindr_server.records_block_not_in_region(cortez, 24.2, -110.3, 34))
+
 
 
 class LookalikeRuleTests(unittest.TestCase):
@@ -3834,6 +4184,134 @@ class EvalScoreTests(unittest.TestCase):
         self.assertEqual(report["first_attempt_errors"], 1)
         self.assertEqual(report["retried_ok"], 1)
         self.assertIn("First-attempt errors: 1", eval_region.markdown_report(report))
+
+
+
+
+class FirstGuessRuleTests(unittest.TestCase):
+    """FF-30 rules as pure functions. No model calls."""
+
+    def tearDown(self):
+        os.environ.pop("FINFINDR_FIRST_GUESS", None)
+        os.environ.pop("FINFINDR_FIRST_GUESS_TIMEOUT", None)
+
+    def test_flag_is_off_by_default(self):
+        os.environ.pop("FINFINDR_FIRST_GUESS", None)
+        self.assertFalse(finfindr_server.first_guess_enabled())
+        self.assertFalse(finfindr_server.first_guess_enabled(False, "1"))
+        self.assertTrue(finfindr_server.first_guess_enabled(True, "1"))
+        self.assertFalse(finfindr_server.first_guess_enabled(True, "0"))
+        os.environ["FINFINDR_FIRST_GUESS"] = "1"
+        self.assertTrue(finfindr_server.first_guess_enabled())
+
+    def test_prompt_has_no_region_or_marine_priors(self):
+        prompt = finfindr_server.first_guess_prompt()
+        self.assertIn(finfindr_server.FIRST_GUESS_MARKER, prompt)
+        lowered = prompt.lower()
+        self.assertNotIn("marine biologist", lowered)
+        self.assertNotIn("marine animal", lowered)
+        self.assertNotIn("sea of cortez", lowered)
+        self.assertNotIn("prefer a species known from this region", lowered)
+        self.assertNotIn("regional species list", lowered)
+        self.assertIn("visible features only", lowered)
+        compare = finfindr_server.first_guess_compare_prompt(
+            {"scientific_name": "Micropterus salmoides", "common_name": "Largemouth Bass", "trait": "a large mouth"},
+            {"scientific_name": "Centropomus viridis", "common_name": "White Snook", "trait": "a dark lateral line"},
+        )
+        self.assertIn(finfindr_server.FIRST_GUESS_COMPARE_MARKER, compare)
+        self.assertNotIn("Sea of Cortez", compare)
+        self.assertNotIn("marine biologist", compare.lower())
+        self.assertIn("Micropterus salmoides", compare)
+        self.assertIn("Centropomus viridis", compare)
+
+    def test_first_guess_certainty_is_never_confident(self):
+        self.assertEqual(finfindr_server.first_guess_certainty("high"), "likely")
+        self.assertEqual(finfindr_server.first_guess_certainty("medium"), "likely")
+        self.assertEqual(finfindr_server.first_guess_certainty("low"), "unsure")
+
+    def test_decide_hold_lookalike_unsure_and_fallback(self):
+        hold = finfindr_server.decide_first_guess_compare(
+            {
+                "decision": "hold",
+                "chosen": "Micropterus salmoides",
+                "cited_features": "a large mouth and a deep bass body",
+            },
+            "Micropterus salmoides",
+            "Centropomus viridis",
+            "a large mouth",
+            "likely",
+        )
+        self.assertEqual(hold["outcome"], "hold")
+        self.assertEqual(hold["scientific_name"], "Micropterus salmoides")
+        self.assertEqual(hold["certainty"], "likely")
+
+        # A first-guess "confident" cap is still likely.
+        capped = finfindr_server.decide_first_guess_compare(
+            {
+                "decision": "hold",
+                "chosen": "Micropterus salmoides",
+                "cited_features": "a large mouth and a deep bass body",
+            },
+            "Micropterus salmoides",
+            "Centropomus viridis",
+            "",
+            "confident",
+        )
+        self.assertEqual(capped["certainty"], "likely")
+
+        lookalike = finfindr_server.decide_first_guess_compare(
+            {
+                "decision": "lookalike",
+                "chosen": "Centropomus viridis",
+                "cited_features": "a dark lateral line to the tail",
+            },
+            "Micropterus salmoides",
+            "Centropomus viridis",
+            "a large mouth",
+            "likely",
+        )
+        self.assertEqual(lookalike["outcome"], "lookalike")
+        self.assertEqual(lookalike["scientific_name"], "Centropomus viridis")
+
+        uncited = finfindr_server.decide_first_guess_compare(
+            {"decision": "lookalike", "chosen": "Centropomus viridis", "cited_features": "similar"},
+            "Micropterus salmoides",
+            "Centropomus viridis",
+            "a large mouth",
+            "likely",
+        )
+        self.assertEqual(uncited["outcome"], "unsure")
+        self.assertEqual(uncited["reason"], "uncited_feature")
+        self.assertEqual(uncited["certainty"], "unsure")
+
+        unsure = finfindr_server.decide_first_guess_compare(
+            {"decision": "unsure", "chosen": "", "cited_features": ""},
+            "Micropterus salmoides",
+            "Centropomus viridis",
+            "a large mouth",
+            "likely",
+        )
+        self.assertEqual(unsure["outcome"], "unsure")
+        self.assertEqual(unsure["certainty"], "unsure")
+
+        fallback = finfindr_server.decide_first_guess_compare(
+            None, "Micropterus salmoides", "Centropomus viridis", "a large mouth", "likely",
+        )
+        self.assertEqual(fallback["outcome"], "fallback")
+        self.assertEqual(fallback["scientific_name"], "Centropomus viridis")
+
+    def test_parse_first_guess_reply_and_name_agreement(self):
+        parsed = finfindr_server.parse_first_guess_reply(
+            "Common name: Largemouth Bass\n"
+            "Scientific name: Micropterus salmoides\n"
+            "Confidence: high\n"
+            "Trait: a large mouth\n"
+        )
+        self.assertEqual(parsed["scientific_name"], "Micropterus salmoides")
+        self.assertEqual(parsed["confidence"], "high")
+        self.assertTrue(finfindr_server.scientific_names_agree("Micropterus salmoides", "micropterus salmoides"))
+        self.assertFalse(finfindr_server.scientific_names_agree("Micropterus salmoides", "Centropomus viridis"))
+        self.assertIsNone(finfindr_server.parse_first_guess_reply("Confidence: high\nTrait: a fin\n"))
 
 
 if __name__ == "__main__":

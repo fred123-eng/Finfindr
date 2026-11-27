@@ -4448,6 +4448,412 @@ def run_lookalike_pass(jpeg_bytes, candidates, certainty, locality, api_key, req
     return meta, new_candidates, new_certainty
 
 
+# --- Unconstrained first guess (FF-30) --------------------------------------
+# Off by default (FINFINDR_FIRST_GUESS). A short features-only call runs in
+# parallel with list load and the normal identify so agreement or on-list
+# photos add little wall time. A mismatch second look runs only when the
+# guess is off-list and differs from the normal result, and only if the
+# job wall still has time. Code-enforced outcomes: hold, lookalike, unsure,
+# or skip back to the normal result. Certainty is never raised, and a name
+# change is capped at likely. Folding the first guess into the normal
+# prompt is not used: that prompt still carries locality and the regional
+# list, which is the inferred cause of the bass miss.
+
+FIRST_GUESS_MARKER = "FIRST_GUESS"
+FIRST_GUESS_COMPARE_MARKER = "FIRST_GUESS_COMPARE"
+FIRST_GUESS_MIN_SECONDS = 8.0
+
+
+def first_guess_enabled(debug=False, raw=None):
+    """FINFINDR_FIRST_GUESS=1 turns the unconstrained first guess on. Default OFF.
+
+    A debug first_guess=0/1 form field overrides the environment for one request.
+    """
+    if debug and (raw or "").strip() in ("0", "1"):
+        return raw.strip() == "1"
+    flag = (os.environ.get("FINFINDR_FIRST_GUESS", "0") or "0").strip().lower()
+    return flag in ("1", "true", "on", "yes")
+
+
+def first_guess_timeout():
+    """Seconds for each FF-30 model call. Default 25, below the 180s main limit."""
+    return _env_seconds("FINFINDR_FIRST_GUESS_TIMEOUT", 25, 8, 60)
+
+
+def first_guess_model():
+    name = (os.environ.get("FINFINDR_FIRST_GUESS_MODEL") or "").strip()
+    return name if _safe_model_name(name) else "grok-4.7"
+
+
+def first_guess_prompt():
+    """Features-only prompt: no region, no coordinates, no marine/locality prior, no list."""
+    return "\n".join([
+        FIRST_GUESS_MARKER,
+        "Identify the animal in this photo from visible features only.",
+        "Do not use a region, location, map, habitat, or species list.",
+        "Do not assume the animal is marine, freshwater, or terrestrial.",
+        "Name the species that best matches what you can see.",
+        "",
+        "Reply in this exact format, with each field on its own line:",
+        "Common name: <name>",
+        "Scientific name: <name>",
+        "Confidence: <high / medium / low>",
+        "Trait: <one visible feature that supports this name>",
+    ])
+
+
+def first_guess_compare_prompt(guess, normal):
+    """A small second-look prompt. It compares two names by visible features only."""
+    guess_sci = guess.get("scientific_name") or ""
+    guess_common = guess.get("common_name") or "no common name"
+    guess_trait = guess.get("trait") or ""
+    normal_sci = normal.get("scientific_name") or ""
+    normal_common = normal.get("common_name") or "no common name"
+    normal_trait = normal.get("trait") or ""
+    lines = [
+        FIRST_GUESS_COMPARE_MARKER,
+        "The image is the animal to identify.",
+        "Compare these two names using only visible features in the photo.",
+        "Do not use a region, location, or species list as a reason to prefer one name.",
+        "",
+        f"Guess (from features only, not on the regional list): {guess_sci} ({guess_common})"
+        + (f". Noted feature: {guess_trait}" if guess_trait else ""),
+        f"List-matching result (on the regional list): {normal_sci} ({normal_common})"
+        + (f". Noted feature: {normal_trait}" if normal_trait else ""),
+        "",
+        "Decide exactly one of:",
+        '- "hold": the features support the guess, and the list-matching name lacks those features or fits less well.',
+        '- "lookalike": the list-matching name is a better fit, and you can cite a clear distinguishing feature that is visible in this photo.',
+        '- "unsure": you cannot tell, or the distinguishing features are not clearly visible.',
+        "Do not give a confidence level. Do not name a third species.",
+        "Reply with JSON only, no other text, in exactly this shape:",
+        '{"decision": "hold | lookalike | unsure", '
+        '"chosen": "<exact scientific name, or empty for unsure>", '
+        '"cited_features": "<the visible distinguishing feature, or empty>", '
+        '"reason": "<one sentence>"}',
+    ]
+    return "\n".join(lines)
+
+
+def parse_first_guess_reply(text):
+    scientific = exact_scientific_name(_field_value(text, "Scientific name") or "")
+    if not scientific:
+        return None
+    confidence = (_field_value(text, "Confidence") or "medium").strip().lower()
+    if confidence not in ("high", "medium", "low"):
+        confidence = "medium"
+    return {
+        "scientific_name": scientific,
+        "common_name": (_field_value(text, "Common name") or "").strip(),
+        "confidence": confidence,
+        "trait": (_field_value(text, "Trait") or "").strip(),
+    }
+
+
+def first_guess_certainty(confidence):
+    """A first guess is never confident: there is no reference check on this path."""
+    if (confidence or "").strip().lower() == "low":
+        return "unsure"
+    return "likely"
+
+
+def scientific_names_agree(left, right):
+    a = exact_scientific_name(left or "") or (left or "").strip()
+    b = exact_scientific_name(right or "") or (right or "").strip()
+    if not a or not b:
+        return False
+    return a.lower() == b.lower()
+
+
+def _empty_first_guess_decision(reason, **extra):
+    decision = {
+        "enabled": True,
+        "scientific_name": "",
+        "common_name": "",
+        "confidence": "",
+        "on_list": False,
+        "agrees": False,
+        "outcome": "skip",
+        "reason": reason,
+        "cited_features": "",
+        "guess_ms": 0,
+        "compare_ms": 0,
+        "model": first_guess_model(),
+        "certainty_before": "",
+        "certainty_after": "",
+    }
+    decision.update(extra)
+    return decision
+
+
+def decide_first_guess_compare(parsed, guess_name, normal_name, guess_trait, certainty_cap):
+    """Apply the FF-30 mismatch rules. Pure function; no model calls.
+
+    Returns outcome (hold / lookalike / unsure / fallback), the name to show,
+    a certainty that is never above certainty_cap (and never confident on hold),
+    a reason, and any cited features.
+    """
+
+    def result(outcome, name, certainty, reason, features=""):
+        return {
+            "outcome": outcome,
+            "scientific_name": name,
+            "certainty": cap_certainty(certainty, certainty_cap),
+            "reason": reason,
+            "cited_features": features,
+        }
+
+    if not isinstance(parsed, dict):
+        return result("fallback", normal_name, certainty_cap, "malformed_reply")
+    decision = str(parsed.get("decision") or "").strip().lower()
+    if decision not in ("hold", "lookalike", "unsure"):
+        return result("fallback", normal_name, certainty_cap, "unknown_decision")
+    features = str(parsed.get("cited_features") or parsed.get("cited_feature") or "").strip()
+    if decision == "unsure":
+        return result("unsure", normal_name, "unsure", "model_unsure", features)
+    chosen_raw = str(parsed.get("chosen") or "").strip()
+    chosen = exact_scientific_name(chosen_raw) if chosen_raw else ""
+    if decision == "hold":
+        if not chosen:
+            chosen = guess_name
+        if not scientific_names_agree(chosen, guess_name):
+            return result("unsure", normal_name, "unsure", "inconsistent_hold", features)
+        supporting = features or (guess_trait or "")
+        if not explicit_diagnostic_trait(supporting):
+            return result("unsure", normal_name, "unsure", "uncited_feature", features)
+        return result(
+            "hold",
+            guess_name,
+            cap_certainty(certainty_cap, "likely"),
+            "guess_holds",
+            supporting,
+        )
+    if not chosen:
+        chosen = normal_name
+    if scientific_names_agree(chosen, guess_name):
+        return result("unsure", normal_name, "unsure", "inconsistent_lookalike", features)
+    if not scientific_names_agree(chosen, normal_name):
+        return result("unsure", normal_name, "unsure", "unlisted_choice", features)
+    if not explicit_diagnostic_trait(features):
+        return result("unsure", normal_name, "unsure", "uncited_feature", features)
+    return result("lookalike", normal_name, certainty_cap, "lookalike_with_visible_feature", features)
+
+
+def log_first_guess_decision(decision):
+    app.logger.info(
+        "first_guess scientific=%s on_list=%s agrees=%s outcome=%s reason=%s "
+        "cited_features=%s guess_ms=%s compare_ms=%s",
+        decision.get("scientific_name") or "",
+        decision.get("on_list"),
+        decision.get("agrees"),
+        decision.get("outcome") or "",
+        decision.get("reason") or "",
+        (decision.get("cited_features") or "")[:200],
+        decision.get("guess_ms") or 0,
+        decision.get("compare_ms") or 0,
+    )
+
+
+def start_first_guess(jpeg_bytes, api_key, request_started, use_cache=True):
+    """Start the features-only call so it can overlap list load and identify."""
+    decision = _empty_first_guess_decision("started", model=first_guess_model())
+    timeout = min(first_guess_timeout(), _time_left(request_started) - 2.0)
+    if timeout < FIRST_GUESS_MIN_SECONDS:
+        decision["reason"] = "no_time"
+        return None, decision
+    prompt = first_guess_prompt()
+    holder = {}
+    started = time.perf_counter()
+
+    def run():
+        try:
+            holder["reply"] = _call_vision_model(
+                jpeg_bytes, prompt, first_guess_model(), timeout, api_key, use_cache=use_cache,
+            )
+        except Exception as exc:  # never let the extra pass break an answer
+            holder["reply"] = {"ok": False, "error": f"exception:{type(exc).__name__}", "ms": 0}
+
+    thread = _start_thread(run, "finfindr-first-guess")
+    return {
+        "thread": thread,
+        "holder": holder,
+        "started": started,
+        "timeout": timeout,
+        "prompt": prompt,
+    }, decision
+
+
+def abandon_first_guess(handle):
+    """Join a started first-guess thread on an early return so it is not left running."""
+    if handle and handle.get("thread"):
+        handle["thread"].join(max(0.2, float(handle.get("timeout") or 0.2) + 1.0))
+
+
+def collect_first_guess(handle, decision):
+    if not handle:
+        return None, decision
+    thread = handle["thread"]
+    remaining = handle["timeout"] - (time.perf_counter() - handle["started"])
+    thread.join(max(0.2, remaining + 1.0))
+    decision["guess_ms"] = int(round((time.perf_counter() - handle["started"]) * 1000))
+    if thread.is_alive():
+        decision["outcome"] = "skip"
+        decision["reason"] = "timeout"
+        return None, decision
+    reply = handle["holder"].get("reply") or {}
+    if reply.get("ms") is not None:
+        decision["guess_ms"] = reply.get("ms") or decision["guess_ms"]
+    if not reply.get("ok"):
+        error = str(reply.get("error") or "failed")
+        decision["outcome"] = "skip"
+        decision["reason"] = "timeout" if error == "timeout" else "call_failed"
+        return None, decision
+    parsed = parse_first_guess_reply(_extract_text(reply.get("data") or {}))
+    if not parsed:
+        decision["outcome"] = "skip"
+        decision["reason"] = "malformed_reply"
+        return None, decision
+    decision["scientific_name"] = parsed["scientific_name"]
+    decision["common_name"] = parsed["common_name"]
+    decision["confidence"] = parsed["confidence"]
+    decision["trait"] = parsed["trait"]
+    decision["guess_certainty"] = first_guess_certainty(parsed["confidence"])
+    return parsed, decision
+
+
+def run_first_guess_compare(jpeg_bytes, guess, normal, api_key, request_started, use_cache=True):
+    timeout = min(first_guess_timeout(), _time_left(request_started) - 2.0)
+    if timeout < FIRST_GUESS_MIN_SECONDS:
+        return None, 0, "no_time"
+    prompt = first_guess_compare_prompt(guess, normal)
+    started = time.perf_counter()
+    try:
+        reply = _call_vision_model(
+            jpeg_bytes, prompt, first_guess_model(), timeout, api_key, use_cache=use_cache,
+        )
+    except Exception as exc:
+        reply = {"ok": False, "error": f"exception:{type(exc).__name__}"}
+    ms = int(round((time.perf_counter() - started) * 1000))
+    if reply.get("ms") is not None:
+        ms = reply.get("ms") or ms
+    if not reply.get("ok"):
+        error = str(reply.get("error") or "failed")
+        return None, ms, "timeout" if error == "timeout" else "call_failed"
+    return parse_lookalike_reply(_extract_text(reply.get("data") or {})), ms, ""
+
+
+def apply_first_guess_to_result(
+    *,
+    decision,
+    guess,
+    shown,
+    candidates,
+    species,
+    certainty,
+    no_match,
+    jpeg_bytes,
+    api_key,
+    request_started,
+    use_cache,
+):
+    """Decide hold / lookalike / unsure / skip. Never raises certainty."""
+    decision["certainty_before"] = certainty
+    normal = (shown[0] if shown else {}) or {}
+    normal_name = normal.get("scientific_name") or ""
+    if not guess or no_match or not normal_name:
+        decision["outcome"] = "skip"
+        if no_match:
+            decision["reason"] = "no_match"
+        elif not guess:
+            decision["reason"] = decision.get("reason") or "no_guess"
+        else:
+            decision["reason"] = "no_normal_result"
+        decision["certainty_after"] = certainty
+        return shown, candidates, certainty, None
+
+    guess_name = guess["scientific_name"]
+    decision["on_list"] = species_on_list(guess_name, species)
+    decision["agrees"] = scientific_names_agree(guess_name, normal_name)
+    certainty_cap = cap_certainty(certainty, first_guess_certainty(guess.get("confidence")))
+
+    if decision["on_list"] or decision["agrees"]:
+        decision["outcome"] = "on_list" if decision["on_list"] and not decision["agrees"] else "agree"
+        decision["reason"] = "on_list" if decision["outcome"] == "on_list" else "agrees"
+        decision["certainty_after"] = certainty
+        return shown, candidates, certainty, None
+
+    parsed, compare_ms, compare_error = run_first_guess_compare(
+        jpeg_bytes,
+        {
+            "scientific_name": guess_name,
+            "common_name": guess.get("common_name") or "",
+            "trait": guess.get("trait") or "",
+        },
+        {
+            "scientific_name": normal_name,
+            "common_name": normal.get("common_name") or "",
+            "trait": normal.get("trait") or "",
+        },
+        api_key,
+        request_started,
+        use_cache,
+    )
+    decision["compare_ms"] = compare_ms
+    if compare_error:
+        decision["outcome"] = "skip"
+        decision["reason"] = compare_error
+        decision["certainty_after"] = certainty
+        return shown, candidates, certainty, None
+
+    decided = decide_first_guess_compare(
+        parsed, guess_name, normal_name, guess.get("trait") or "", certainty_cap,
+    )
+    decision["outcome"] = decided["outcome"]
+    decision["reason"] = decided["reason"]
+    decision["cited_features"] = decided.get("cited_features") or ""
+
+    if decided["outcome"] == "fallback":
+        decision["outcome"] = "skip"
+        decision["certainty_after"] = certainty
+        return shown, candidates, certainty, None
+
+    if decided["outcome"] == "hold":
+        if taxon_in_scope(guess_name) is False:
+            decision["outcome"] = "skip"
+            decision["reason"] = "not_marine"
+            decision["certainty_after"] = certainty
+            return shown, candidates, certainty, None
+        confidence = guess.get("confidence") or "medium"
+        if confidence == "high":
+            confidence = "medium"
+        held = {
+            "scientific_name": guess_name,
+            "common_name": guess.get("common_name") or "",
+            "confidence": confidence,
+            "trait": guess.get("trait") or decision.get("cited_features") or "",
+            "off_list": not species_on_list(guess_name, species),
+            "proposed_by": [{"model": first_guess_model(), "rank": 1, "confidence": confidence}],
+        }
+        rest = [
+            item for item in (candidates or [])
+            if (item.get("scientific_name") or "").lower() != guess_name.lower()
+        ]
+        candidates = [held] + rest
+        shown = public_candidates(candidates, species, preserve_order=True)
+        shown = _order_candidates(shown, guess_name)
+        new_certainty = cap_certainty(decided["certainty"], "likely")
+        decision["certainty_after"] = new_certainty
+        return shown, candidates, new_certainty, new_certainty
+
+    if decided["outcome"] == "unsure":
+        decision["certainty_after"] = "unsure"
+        return shown, candidates, "unsure", "unsure"
+
+    decision["certainty_after"] = certainty
+    return shown, candidates, certainty, None
+
+
+
 _CONFIDENCE_RANK = {"high": 0, "medium": 1, "low": 2}
 
 
@@ -5800,6 +6206,12 @@ def _identify_with_nature(
 
     request_started = g.identify_started
     set_call_deadline(request_started + job_wall_seconds())
+    fg_handle = None
+    fg_decision = None
+    if first_guess_enabled(debug, fields.get("first_guess")) and not nature_off:
+        fg_handle, fg_decision = start_first_guess(
+            jpeg_bytes, xai_key, request_started, use_cache=use_cache,
+        )
     if nature_off:
         species_payload, list_fetch_ms, list_wait_s, waited_out = _empty_species(), 0, 0, False
     else:
@@ -5883,6 +6295,11 @@ def _identify_with_nature(
         apply_verify_rates(meta, False, False, 0, 0, meta["verify_skipped"])
         _apply_model_bundle(meta, result)
         meta = stamp_meta(meta, request_started)
+        if fg_decision is not None:
+            abandon_first_guess(fg_handle)
+            fg_decision["reason"] = fg_decision.get("reason") or "model_failed"
+            meta["first_guess"] = fg_decision
+            log_first_guess_decision(fg_decision)
         _log_identification(region["id"], meta)
         body["meta"] = meta
         return jsonify(body), status
@@ -5912,6 +6329,11 @@ def _identify_with_nature(
         apply_verify_rates(meta, False, False, 0, 0, "photo_unusable")
         _apply_model_bundle(meta, result, final_source_for(parsed_candidates[0] if parsed_candidates else None))
         meta = stamp_meta(meta, request_started)
+        if fg_decision is not None:
+            abandon_first_guess(fg_handle)
+            fg_decision["reason"] = "photo_unusable"
+            meta["first_guess"] = fg_decision
+            log_first_guess_decision(fg_decision)
         _log_identification(region["id"], meta)
         return jsonify(_result_payload(
             region_label=region_label,
@@ -5942,6 +6364,11 @@ def _identify_with_nature(
         apply_verify_rates(meta, False, False, 0, 0, "not_marine")
         _apply_model_bundle(meta, result, final_source_for(candidates[0] if candidates else None))
         meta = stamp_meta(meta, request_started)
+        if fg_decision is not None:
+            abandon_first_guess(fg_handle)
+            fg_decision["reason"] = "not_marine"
+            meta["first_guess"] = fg_decision
+            log_first_guess_decision(fg_decision)
         _log_identification(region["id"], meta)
         return jsonify(_result_payload(
             region_label=region_label,
@@ -6163,6 +6590,40 @@ def _identify_with_nature(
         and focus
         and verification["scientific_name"].lower() == focus.lower()
     )
+    fg_cap = None
+    if fg_decision is not None:
+        guess, fg_decision = collect_first_guess(fg_handle, fg_decision)
+        shown, candidates, certainty, fg_cap = apply_first_guess_to_result(
+            decision=fg_decision,
+            guess=guess,
+            shown=shown,
+            candidates=candidates,
+            species=species,
+            certainty=certainty,
+            no_match=no_match,
+            jpeg_bytes=jpeg_bytes,
+            api_key=xai_key,
+            request_started=request_started,
+            use_cache=use_cache,
+        )
+        if shown:
+            focus = shown[0]["scientific_name"]
+        if fg_decision.get("guess_ms"):
+            attempts.append(_attempt_record(
+                fg_decision.get("model") or first_guess_model(),
+                fg_decision["guess_ms"],
+                fg_decision.get("reason") not in ("timeout", "call_failed"),
+                None if fg_decision.get("reason") not in ("timeout", "call_failed") else fg_decision.get("reason"),
+            ))
+        if fg_decision.get("compare_ms"):
+            attempts.append(_attempt_record(
+                fg_decision.get("model") or first_guess_model(),
+                fg_decision["compare_ms"],
+                fg_decision.get("reason") not in ("timeout", "call_failed", "no_time"),
+                None if fg_decision.get("outcome") != "skip" else fg_decision.get("reason"),
+            ))
+        if fg_cap is not None and certainty == "confident":
+            strong_id = False
     rule = range_rule()
     if discover and no_match and photo_quality == "good":
         relatives = []
@@ -6340,6 +6801,13 @@ def _identify_with_nature(
             for item in shown:
                 if item.get("confidence") == "high":
                     item["confidence"] = "medium"
+    if fg_cap is not None:
+        # FF-30: never raise certainty, and never keep confident after a name change.
+        certainty = cap_certainty(certainty, fg_cap)
+        if certainty != "confident":
+            for item in shown:
+                if item.get("confidence") == "high":
+                    item["confidence"] = "medium"
     if no_match or (discovery and discovery.get("type") == "no_match"):
         text = _no_match_result_text(discovery)
         certainty = "unsure"
@@ -6369,6 +6837,10 @@ def _identify_with_nature(
     if la_meta is not None:
         la_meta["certainty_final"] = certainty
         meta["lookalike"] = la_meta
+    if fg_decision is not None:
+        fg_decision["certainty_final"] = certainty
+        meta["first_guess"] = fg_decision
+        log_first_guess_decision(fg_decision)
     not_in_region = None
     if not_in_region_enabled(debug, fields.get("not_in_region")) and not nature_off:
         # Never raise certainty. Never cap it because the note attaches.
