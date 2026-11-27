@@ -4874,6 +4874,140 @@ def apply_first_guess_to_result(
 
 
 
+# --- FF-28 v2: promote a strong UNCERTAIN answer (FINFINDR_UNSURE_PROMOTE) -----
+# Off by default. No model calls. Both paths run only when the answer is
+# already unsure, can only raise it to likely, and never to confident.
+#   P1: certainty is read from the model's own on-list rank-1 candidate when
+#       that is the shown top, not from an off-list follow-up item that was
+#       placed in front of it. New certainty = max(current, rank-1's).
+#   P2: a no-match caused only by a color word in the resolved common name is
+#       cleared, under a narrow gate: good photo, on-list model rank-1 at
+#       medium or high, #2 low or absent, no SPECIES_TRAITS card for the top.
+
+def unsure_promote_enabled(debug=False, raw=None):
+    """FINFINDR_UNSURE_PROMOTE=1 turns FF-28 v2 on. Default OFF.
+
+    A debug unsure_promote=0/1 form field overrides the environment for one request.
+    """
+    if debug and (raw or "").strip() in ("0", "1"):
+        return raw.strip() == "1"
+    flag = (os.environ.get("FINFINDR_UNSURE_PROMOTE", "0") or "0").strip().lower()
+    return flag in ("1", "true", "on", "yes")
+
+
+def _max_certainty(a, b):
+    return a if _CERTAINTY_ORDER.get(a or "unsure", 0) >= _CERTAINTY_ORDER.get(b or "unsure", 0) else b
+
+
+def model_rank1_candidate(candidates):
+    """The main pass's own first choice: the candidate with the lowest proposed rank."""
+    best = None
+    best_rank = None
+    for item in candidates or []:
+        ranks = [
+            entry.get("rank") for entry in (item.get("proposed_by") or [])
+            if isinstance(entry, dict) and isinstance(entry.get("rank"), int)
+        ]
+        if not ranks:
+            continue
+        rank = min(ranks)
+        if best_rank is None or rank < best_rank:
+            best, best_rank = item, rank
+    return best
+
+
+def _ff28_decision(path, reason, certainty_before, certainty_after, **extra):
+    decision = {
+        "path": path,
+        "reason": reason,
+        "certainty_before": certainty_before,
+        "certainty_after": certainty_after,
+    }
+    decision.update(extra)
+    return decision
+
+
+def ff28_p1_certainty(candidates, shown, certainty, verification, species, no_match=False):
+    """P1. Returns (certainty, decision). Never lowers; never above likely."""
+    base = dict(top=(shown[0].get("scientific_name") if shown else ""))
+    if certainty != "unsure":
+        return certainty, _ff28_decision("none", "not_unsure", certainty, certainty, **base)
+    if no_match:
+        return certainty, _ff28_decision("none", "no_match", certainty, certainty, **base)
+    if not shown:
+        return certainty, _ff28_decision("none", "no_candidates", certainty, certainty, **base)
+    if verification is not None and not passing_verification(verification):
+        return certainty, _ff28_decision("none", "verification_disagreed", certainty, certainty, **base)
+    top = shown[0]
+    rank1 = model_rank1_candidate(candidates)
+    top_name = (top.get("scientific_name") or "").lower()
+    if not rank1 or (rank1.get("scientific_name") or "").lower() != top_name:
+        return certainty, _ff28_decision("none", "top_not_model_rank1", certainty, certainty, **base)
+    if top.get("off_list") or rank1.get("off_list") or not species_on_list(top.get("scientific_name"), species):
+        return certainty, _ff28_decision("none", "top_off_list", certainty, certainty, **base)
+    from_rank1 = cap_certainty(certainty_for([rank1], verification), "likely")
+    new_certainty = cap_certainty(_max_certainty(certainty, from_rank1), "likely")
+    new_certainty = _max_certainty(certainty, new_certainty)
+    if new_certainty == certainty:
+        return certainty, _ff28_decision(
+            "none", "rank1_not_stronger", certainty, certainty,
+            top_conf=rank1.get("confidence") or "", **base,
+        )
+    return new_certainty, _ff28_decision(
+        "P1", "certainty_from_model_rank1", certainty, new_certainty,
+        top_conf=rank1.get("confidence") or "", **base,
+    )
+
+
+def ff28_p2_clears_clash(shown, candidates, species, photo_quality, photo_text):
+    """P2. True when a trait clash comes only from a common-name color word and the full gate holds."""
+    decision = {"path": "none", "top": (shown[0].get("scientific_name") if shown else "")}
+    if not shown:
+        decision["reason"] = "no_candidates"
+        return False, decision
+    top = shown[0]
+    name = top.get("scientific_name") or ""
+    card = SPECIES_TRAITS.get(name.lower(), "")
+    common = top.get("common_name") or ""
+    second = shown[1].get("confidence") if len(shown) > 1 else None
+    rank1 = model_rank1_candidate(candidates)
+    clash_common = traits_contradict(photo_text, f"{common} {card}")
+    clash_card = traits_contradict(photo_text, card) if card else False
+    decision.update({
+        "top_conf": top.get("confidence") or "",
+        "second_conf": second or "",
+        "photo_quality": photo_quality or "",
+        "card_present": bool(card),
+        "clash_common_name": bool(clash_common),
+        "clash_card": bool(clash_card),
+    })
+    checks = (
+        (photo_quality == "good", "photo_not_good"),
+        (bool(rank1) and (rank1.get("scientific_name") or "").lower() == name.lower(), "top_not_model_rank1"),
+        (not top.get("off_list") and species_on_list(name, species), "top_off_list"),
+        ((top.get("confidence") or "") in ("medium", "high"), "top_not_medium_plus"),
+        (second in (None, "", "low"), "second_not_low"),
+        (not card, "trait_card_present"),
+        (clash_common and not clash_card, "clash_not_common_name_only"),
+    )
+    for ok, reason in checks:
+        if not ok:
+            decision["reason"] = reason
+            return False, decision
+    decision["path"] = "P2"
+    decision["reason"] = "common_name_color_clash_cleared"
+    return True, decision
+
+
+def log_ff28_decision(decision):
+    app.logger.info(
+        "ff28 path=%s reason=%s top=%s before=%s after=%s detail=%s",
+        decision.get("path"), decision.get("reason"), decision.get("top"),
+        decision.get("certainty_before"), decision.get("certainty_after"),
+        json.dumps({k: v for k, v in decision.items() if k not in ("path", "reason", "top", "certainty_before", "certainty_after")}, sort_keys=True),
+    )
+
+
 _CONFIDENCE_RANK = {"high": 0, "medium": 1, "low": 2}
 
 
@@ -6541,6 +6675,14 @@ def _identify_with_nature(
         verification and verification.get("decision") not in ("", "UNSURE", "NO_MATCH")
     )
     shown = public_candidates(candidates, species, preserve_order=verifier_ordered)
+    ff28_on = unsure_promote_enabled(debug, fields.get("unsure_promote")) and not nature_off
+    ff28_decision = None
+    ff28_cap = None
+    if ff28_on and certainty == "unsure" and not verification_disagreed:
+        promoted, ff28_decision = ff28_p1_certainty(candidates, shown, certainty, verification, species)
+        if promoted != certainty:
+            certainty = promoted
+            ff28_cap = "likely"
     la_meta = None
     la_cap = None
     if lookalike_enabled(debug, fields.get("lookalike")) and not nature_off:
@@ -6566,9 +6708,24 @@ def _identify_with_nature(
         f"{shown[0].get('trait') or ''} {notes_text}",
         f"{shown[0].get('common_name') or ''} {known_traits}",
     )
+    ff28_p2_fired = False
+    if ff28_on and trait_conflict:
+        cleared, p2_decision = ff28_p2_clears_clash(
+            shown, candidates, species, photo_quality, f"{shown[0].get('trait') or ''} {notes_text}",
+        )
+        p2_decision["certainty_before"] = "unsure"
+        if cleared:
+            trait_conflict = False
+            ff28_p2_fired = True
+            ff28_cap = "likely"
+        ff28_decision = p2_decision
     discovery = None
     notable_note = ""
     evidence = [f"photo_{photo_quality}"]
+    if ff28_p2_fired:
+        evidence.append("unsure_promoted_common_name_clash")
+    elif ff28_decision and ff28_decision.get("path") == "P1":
+        evidence.append("unsure_promoted_model_rank1")
     if verify_used:
         evidence.append("verification_used")
     if verification and verification.get("decision") == "NO_MATCH":
@@ -6666,7 +6823,10 @@ def _identify_with_nature(
         }
         certainty = "unsure"
         evidence.append("no_species_match")
-    elif discover and focus and photo_quality == "good" and lat is not None and lng is not None and _time_left(request_started) >= 3:
+    elif (
+        discover and focus and photo_quality == "good" and lat is not None and lng is not None
+        and _time_left(request_started) >= 3 and not ff28_p2_fired
+    ):
         record_count = count_research_records(
             focus, lat, lng, rule["radius_km"], not_id=exclude_observation or None
         )
@@ -6828,6 +6988,12 @@ def _identify_with_nature(
             for item in shown:
                 if item.get("confidence") == "high":
                     item["confidence"] = "medium"
+    if ff28_cap is not None:
+        # FF-28 v2: a promoted answer is never confident.
+        certainty = cap_certainty(certainty, ff28_cap)
+        for item in shown:
+            if item.get("confidence") == "high":
+                item["confidence"] = "medium"
     if no_match or (discovery and discovery.get("type") == "no_match"):
         text = _no_match_result_text(discovery)
         certainty = "unsure"
@@ -6861,6 +7027,14 @@ def _identify_with_nature(
         fg_decision["certainty_final"] = certainty
         meta["first_guess"] = fg_decision
         log_first_guess_decision(fg_decision)
+    if ff28_on and (certainty == "unsure" or ff28_decision is not None):
+        if ff28_decision is None:
+            ff28_decision = _ff28_decision("none", "not_reached", certainty, certainty,
+                                           top=(shown[0].get("scientific_name") if shown else ""))
+        ff28_decision["certainty_final"] = certainty
+        ff28_decision["photo_quality"] = photo_quality or ""
+        meta["ff28_decision"] = ff28_decision
+        log_ff28_decision(ff28_decision)
     not_in_region = None
     if not_in_region_enabled(debug, fields.get("not_in_region")) and not nature_off:
         # Never raise certainty. Never cap it because the note attaches.

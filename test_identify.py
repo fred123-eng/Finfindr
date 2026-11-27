@@ -4390,3 +4390,272 @@ class FirstGuessRuleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+FF28_SPECIES = [
+    ("Gymnothorax castaneus", "Panamic green moray"),
+    ("Muraena lentiginosa", "Jewel moray"),
+    ("Larus heermanni", "Heermann's Gull"),
+    ("Leucophaeus atricilla", "Laughing Gull"),
+    ("Phataria unifascialis", "Blue Sea Star"),
+    ("Pharia pyramidata", "Pyramid Sea Star"),
+]
+
+
+def ff28_list():
+    return [{"scientific": name, "common": common} for name, common in FF28_SPECIES]
+
+
+def ff28_cand(name, common, confidence, rank=None, off_list=False, trait="plain"):
+    item = {
+        "scientific_name": name, "common_name": common, "confidence": confidence,
+        "trait": trait, "off_list": off_list,
+        "proposed_by": [{"model": "grok-4.7", "rank": rank, "confidence": confidence}] if rank else [],
+    }
+    return item
+
+
+class UnsurePromoteTests(unittest.TestCase):
+    """FF-28 v2 (FINFINDR_UNSURE_PROMOTE). No live calls. Reuses IdentifyTests' fakes, not its tests."""
+
+    fake_get = IdentifyTests.fake_get
+    fake_post = IdentifyTests.fake_post
+    post_photo = IdentifyTests.post_photo
+
+    MORAY_TEXT = (
+        "Photo quality: good\n"
+        "Photo issue: none\n"
+        "Common name: Panamic green moray\n"
+        "Scientific name: Gymnothorax castaneus\n"
+        "Group: ray-finned fishes (moray eels)\n"
+        "Alternative group considered: sea snake\n"
+        "Confidence: medium\n"
+        "Notes: Morays have a second, hidden set of jaws.\n"
+        "Candidate 1: Gymnothorax castaneus | Panamic green moray | medium | uniform brown body, large moray head, pale bluish eye\n"
+        "Candidate 2: Muraena lentiginosa | Jewel moray | low | would show pale spots, which are not visible here\n"
+    )
+    GULL_TEXT = (
+        "Photo quality: poor\n"
+        "Photo issue: soft focus\n"
+        "Common name: Heermann's Gull\n"
+        "Scientific name: Larus heermanni\n"
+        "Group: seabird (gull)\n"
+        "Alternative group considered: none\n"
+        "Confidence: medium\n"
+        "Notes: Nests on Isla Rasa.\n"
+        "Candidate 1: Larus heermanni | Heermann's Gull | medium | uniform sooty-gray body, red bill, white trailing edge\n"
+        "Candidate 2: Leucophaeus atricilla | Laughing Gull | low | white below rather than sooty gray\n"
+    )
+    GULL_OFFLIST = "Off-list 1: Leucophaeus fuliginosus | Lava Gull | low | dark gray plumage, bill usually black\nOff-list 2: none\n"
+
+    def setUp(self):
+        IdentifyTests.setUp(self)
+        os.environ.pop("FINFINDR_UNSURE_PROMOTE", None)
+        self.species_patch = patch(f"{__name__}.species_payload", side_effect=self._species)
+        self._real_species = species_payload
+        self.species_patch.start()
+
+    def tearDown(self):
+        self.species_patch.stop()
+        os.environ.pop("FINFINDR_UNSURE_PROMOTE", None)
+        IdentifyTests.tearDown(self)
+
+    def _species(self, params):
+        payload = self._real_species(params)
+        if params.get("taxon_id") and int(params["taxon_id"]) != 47178:
+            return payload
+        if int(params.get("page") or 1) == 1:
+            named = [
+                {"count": 20000 - i, "taxon": {"name": n, "rank": "species", "preferred_common_name": c}}
+                for i, (n, c) in enumerate(FF28_SPECIES)
+            ]
+            payload["results"] = named + payload["results"][len(named):]
+        return payload
+
+    def _taxa(self, url, params):
+        if "taxa" in url and params.get("q"):
+            return FakeResponse({"results": [{"name": params["q"], "rank": "species"}]})
+        return None
+
+    def _post(self, **extra):
+        self.inat_handler = self._taxa
+        fields = dict(debug="1", verify="0", region="sea-of-cortez", lat="24.2", lng="-110.3")
+        fields.update(extra)
+        return self.post_photo(**fields).get_json()
+
+    # --- pure functions ---------------------------------------------------
+
+    def test_flag_default_off_and_debug_override(self):
+        self.assertFalse(finfindr_server.unsure_promote_enabled())
+        os.environ["FINFINDR_UNSURE_PROMOTE"] = "1"
+        self.assertTrue(finfindr_server.unsure_promote_enabled())
+        self.assertFalse(finfindr_server.unsure_promote_enabled(True, "0"))
+        os.environ.pop("FINFINDR_UNSURE_PROMOTE")
+        self.assertTrue(finfindr_server.unsure_promote_enabled(True, "1"))
+        self.assertFalse(finfindr_server.unsure_promote_enabled(False, "1"))
+
+    def test_p1_reads_certainty_from_shown_model_rank1(self):
+        lava = ff28_cand("Leucophaeus fuliginosus", "Lava Gull", "low", off_list=True)
+        gull = ff28_cand("Larus heermanni", "Heermann's Gull", "medium", rank=1)
+        laugh = ff28_cand("Leucophaeus atricilla", "Laughing Gull", "low", rank=2)
+        candidates = [lava, gull, laugh]
+        self.assertEqual(finfindr_server.certainty_for(candidates, None), "unsure")
+        shown = finfindr_server.public_candidates(candidates, ff28_list())
+        self.assertEqual(shown[0]["scientific_name"], "Larus heermanni")
+        certainty, decision = finfindr_server.ff28_p1_certainty(candidates, shown, "unsure", None, ff28_list())
+        self.assertEqual(certainty, "likely")
+        self.assertEqual(decision["path"], "P1")
+
+    def test_p1_never_lowers_and_never_confident(self):
+        high = ff28_cand("Larus heermanni", "Heermann's Gull", "high", rank=1)
+        shown = finfindr_server.public_candidates([high], ff28_list())
+        for current in ("likely", "confident"):
+            certainty, decision = finfindr_server.ff28_p1_certainty([high], shown, current, None, ff28_list())
+            self.assertEqual(certainty, current)
+            self.assertEqual(decision["path"], "none")
+        passing = {"decision": "Larus heermanni", "certainty": "confident", "scientific_name": "Larus heermanni"}
+        with patch("finfindr_server.passing_verification", return_value=True):
+            certainty, _ = finfindr_server.ff28_p1_certainty([high], shown, "unsure", passing, ff28_list())
+        self.assertEqual(certainty, "likely")
+        low = ff28_cand("Larus heermanni", "Heermann's Gull", "low", rank=1)
+        shown_low = finfindr_server.public_candidates([low], ff28_list())
+        certainty, decision = finfindr_server.ff28_p1_certainty([low], shown_low, "unsure", None, ff28_list())
+        self.assertEqual(certainty, "unsure")
+        self.assertEqual(decision["reason"], "rank1_not_stronger")
+
+    def test_p1_gates(self):
+        gull = ff28_cand("Larus heermanni", "Heermann's Gull", "medium", rank=1)
+        laugh = ff28_cand("Leucophaeus atricilla", "Laughing Gull", "medium", rank=2)
+        shown = finfindr_server.public_candidates([gull], ff28_list())
+        p1 = finfindr_server.ff28_p1_certainty
+        self.assertEqual(p1([gull], shown, "unsure", None, ff28_list(), no_match=True)[1]["reason"], "no_match")
+        self.assertEqual(p1([gull], [], "unsure", None, ff28_list())[1]["reason"], "no_candidates")
+        self.assertEqual(p1([gull], shown, "unsure", None, [])[1]["reason"], "top_off_list")
+        other_top = finfindr_server.public_candidates([laugh], ff28_list())
+        self.assertEqual(p1([gull, laugh], other_top, "unsure", None, ff28_list())[1]["reason"], "top_not_model_rank1")
+        with patch("finfindr_server.passing_verification", return_value=False):
+            self.assertEqual(
+                p1([gull], shown, "unsure", {"decision": "UNSURE"}, ff28_list())[1]["reason"], "verification_disagreed"
+            )
+
+    def _moray_shown(self, **changes):
+        top = ff28_cand("Gymnothorax castaneus", "Panamic green moray", "medium", rank=1,
+                        trait="uniform brown body, large moray head")
+        second = ff28_cand("Muraena lentiginosa", "Jewel moray", "low", rank=2)
+        top.update(changes.get("top", {}))
+        second.update(changes.get("second", {}))
+        candidates = [top, second]
+        shown = finfindr_server.public_candidates(candidates, ff28_list(), preserve_order=True)
+        return shown, candidates
+
+    def test_p2_clears_common_name_color_clash_under_full_gate(self):
+        shown, candidates = self._moray_shown()
+        text = "uniform brown body, large moray head Morays have a second set of jaws."
+        cleared, decision = finfindr_server.ff28_p2_clears_clash(shown, candidates, ff28_list(), "good", text)
+        self.assertTrue(cleared)
+        self.assertEqual(decision["path"], "P2")
+        self.assertTrue(decision["clash_common_name"])
+        self.assertFalse(decision["card_present"])
+
+    def test_p2_blocked_by_each_gate(self):
+        text = "uniform brown body, large moray head"
+        clear = finfindr_server.ff28_p2_clears_clash
+        shown, cands = self._moray_shown()
+        self.assertEqual(clear(shown, cands, ff28_list(), "poor", text)[1]["reason"], "photo_not_good")
+        self.assertEqual(clear(shown, cands, [], "good", text)[1]["reason"], "top_off_list")
+        shown, cands = self._moray_shown(top={"confidence": "low"})
+        self.assertEqual(clear(shown, cands, ff28_list(), "good", text)[1]["reason"], "top_not_medium_plus")
+        shown, cands = self._moray_shown(second={"confidence": "medium"})
+        self.assertEqual(clear(shown, cands, ff28_list(), "good", text)[1]["reason"], "second_not_low")
+        shown, cands = self._moray_shown(top={"proposed_by": []})
+        self.assertEqual(clear(shown, cands, ff28_list(), "good", text)[1]["reason"], "top_not_model_rank1")
+        shown, cands = self._moray_shown()
+        self.assertEqual(clear(shown, cands, ff28_list(), "good", "long body with a small head")[1]["reason"],
+                         "clash_not_common_name_only")
+        # A species with a SPECIES_TRAITS card is never cleared, even if the card agrees.
+        self.assertTrue(finfindr_server.SPECIES_TRAITS.get("phataria unifascialis"))
+        star = ff28_cand("Phataria unifascialis", "Blue Sea Star", "medium", rank=1, trait="red mesh pattern")
+        star_shown = finfindr_server.public_candidates([star], ff28_list(), preserve_order=True)
+        self.assertEqual(clear(star_shown, [star], ff28_list(), "good", "red mesh pattern")[1]["reason"],
+                         "trait_card_present")
+        self.assertEqual(clear([], [], ff28_list(), "good", text)[1]["reason"], "no_candidates")
+
+    # --- route ------------------------------------------------------------
+
+    def test_route_flag_off_is_unchanged_for_moray_and_gull(self):
+        self.captured["model_text"] = self.MORAY_TEXT
+        body = self._post()
+        self.assertEqual(body["certainty"], "unsure")
+        self.assertEqual(body["candidates"], [])
+        self.assertNotIn("ff28_decision", body["meta"])
+        self.assertNotIn("unsure_promoted_common_name_clash", body["meta"]["evidence"])
+        self.captured["model_text"] = self.GULL_TEXT
+        self.captured["offlist_text"] = self.GULL_OFFLIST
+        body = self._post()
+        self.assertEqual(body["certainty"], "unsure")
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Larus heermanni")
+        self.assertNotIn("ff28_decision", body["meta"])
+
+    def test_route_p2_promotes_moray_to_likely_without_record_count(self):
+        os.environ["FINFINDR_UNSURE_PROMOTE"] = "1"
+        self.captured["model_text"] = self.MORAY_TEXT
+        body = self._post()
+        self.assertEqual(body["certainty"], "likely")
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Gymnothorax castaneus")
+        self.assertNotEqual(body["candidates"][0]["confidence"], "high")
+        self.assertIn("unsure_promoted_common_name_clash", body["meta"]["evidence"])
+        self.assertEqual(body["meta"]["ff28_decision"]["path"], "P2")
+        self.assertEqual(body["meta"]["ff28_decision"]["certainty_final"], "likely")
+        self.assertIsNone(body["discovery"])
+        self.assertFalse(body["meta"]["discovery_checked"])
+        self.assertFalse(any("observations" in url and "species_counts" not in url
+                             for url in self.captured.get("gets", [])))
+        # No extra model call: one identify call plus nothing for FF-28.
+        self.assertFalse(any(call["verify"] for call in self.captured["calls"]))
+
+    def test_route_p1_promotes_gull_to_likely(self):
+        os.environ["FINFINDR_UNSURE_PROMOTE"] = "1"
+        self.captured["model_text"] = self.GULL_TEXT
+        self.captured["offlist_text"] = self.GULL_OFFLIST
+        body = self._post()
+        self.assertEqual(body["candidates"][0]["scientific_name"], "Larus heermanni")
+        self.assertEqual(body["certainty"], "likely")
+        self.assertEqual(body["meta"]["ff28_decision"]["path"], "P1")
+        self.assertIn("unsure_promoted_model_rank1", body["meta"]["evidence"])
+
+    def test_route_debug_zero_overrides_env(self):
+        os.environ["FINFINDR_UNSURE_PROMOTE"] = "1"
+        self.captured["model_text"] = self.MORAY_TEXT
+        body = self._post(unsure_promote="0")
+        self.assertEqual(body["certainty"], "unsure")
+        self.assertNotIn("ff28_decision", body["meta"])
+
+    def test_route_never_downgrades_or_upgrades_answered_photos(self):
+        texts = [
+            None,  # default high Thalassoma lucasanum
+            self.GULL_TEXT.replace("Photo quality: poor", "Photo quality: good"),
+            "Photo quality: good\nScientific name: Phataria unifascialis\nCommon name: Blue Sea Star\n"
+            "Confidence: high\nNotes: A red mesh star.\n"
+            "Candidate 1: Phataria unifascialis | Blue Sea Star | high | red mesh pattern\n",
+            "Photo quality: poor\nScientific name: Larus heermanni\nConfidence: low\nNotes: blurry.\n"
+            "Candidate 1: Larus heermanni | Heermann's Gull | low | gray body\n"
+            "Candidate 2: Leucophaeus atricilla | Laughing Gull | low | white below\n",
+        ]
+        for text in texts:
+            if text is None:
+                self.captured.pop("model_text", None)
+            else:
+                self.captured["model_text"] = text
+            self.captured.pop("offlist_text", None)
+            os.environ.pop("FINFINDR_UNSURE_PROMOTE", None)
+            off = self._post()
+            os.environ["FINFINDR_UNSURE_PROMOTE"] = "1"
+            on = self._post()
+            order = finfindr_server._CERTAINTY_ORDER
+            self.assertGreaterEqual(order[on["certainty"]], order[off["certainty"]])
+            self.assertNotEqual(on["certainty"], "confident" if off["certainty"] != "confident" else "")
+            self.assertEqual(on["certainty"], off["certainty"], msg=(text or "default")[:60])
+            self.assertEqual(
+                [c["scientific_name"] for c in on["candidates"]],
+                [c["scientific_name"] for c in off["candidates"]],
+            )
