@@ -3825,6 +3825,77 @@ class NotInRegionRuleTests(unittest.TestCase):
             with patch("finfindr_server.fetch_inat_taxon", return_value=goldfish):
                 self.assertTrue(finfindr_server.taxon_is_freshwater_or_inland("Carassius auratus"))
 
+    def _eury_taxon(self, family, species_name):
+        return {
+            "name": species_name,
+            "iconic_taxon_name": "Actinopterygii",
+            "ancestors": [{"name": "Actinopterygii", "rank": "class"}, {"name": family, "rank": "family"}],
+        }
+
+    def _note_decision(self, scientific, family, habitat):
+        """evaluate_not_in_region with WoRMS and iNat taxon stubbed; Sea of Cortez, no GPS, likely."""
+        cortez = finfindr_server._REGIONS_BY_ID["sea-of-cortez"]
+        with patch("finfindr_server._worms_habitat", return_value=habitat):
+            with patch("finfindr_server.fetch_inat_taxon", return_value=self._eury_taxon(family, scientific)):
+                return finfindr_server.evaluate_not_in_region(
+                    focus=scientific,
+                    common="Test fish",
+                    species=[],
+                    no_match=False,
+                    region=cortez,
+                    lat=None,
+                    lng=None,
+                    location_fallback=False,
+                    certainty="likely",
+                    record_count=None,
+                )
+
+    FF27_FRESH = {"marine": False, "freshwater": True, "brackish": False, "terrestrial": False}
+    FF27_FRESH_BRACKISH = {"marine": False, "freshwater": True, "brackish": True, "terrestrial": False}
+
+    def test_ff27_v3_goldfish_keeps_note(self):
+        decision, flag = self._note_decision("Carassius auratus", "Cyprinidae", self.FF27_FRESH_BRACKISH)
+        self.assertEqual(decision["reason"], "attached")
+        self.assertTrue(decision["fired"])
+        self.assertEqual(flag["region"], "Sea of Cortez / La Paz")
+
+    def test_ff27_v3_sunfish_keeps_note(self):
+        for scientific, habitat in (
+            ("Lepomis gibbosus", self.FF27_FRESH_BRACKISH),
+            ("Lepomis macrochirus", self.FF27_FRESH),
+        ):
+            decision, flag = self._note_decision(scientific, "Centrarchidae", habitat)
+            self.assertEqual(decision["reason"], "attached", scientific)
+            self.assertEqual(flag["region"], "Sea of Cortez / La Paz", scientific)
+
+    def test_ff27_v3_euryhaline_marine_fish_get_no_note(self):
+        euryhaline = {"marine": True, "freshwater": True, "brackish": True, "terrestrial": False}
+        for scientific, family in (
+            ("Dicentrarchus labrax", "Moronidae"),
+            ("Morone saxatilis", "Moronidae"),
+        ):
+            decision, flag = self._note_decision(scientific, family, euryhaline)
+            self.assertIsNone(flag, scientific)
+            self.assertFalse(decision["fired"], scientific)
+            self.assertEqual(decision["reason"], "not_freshwater_fish", scientific)
+            self.assertTrue(decision["worms_marine"], scientific)
+            self.assertTrue(decision["worms_freshwater"], scientific)
+
+    def test_ff27_v3_seriola_gets_no_note(self):
+        for scientific in ("Seriola lalandi", "Seriola dorsalis", "Seriola rivoliana"):
+            decision, flag = self._note_decision(
+                scientific, "Carangidae", {"marine": True, "freshwater": False, "brackish": True, "terrestrial": False}
+            )
+            self.assertIsNone(flag, scientific)
+            self.assertEqual(decision["reason"], "not_freshwater_fish", scientific)
+
+    def test_ff27_v3_marine_veto_has_no_freshwater_family_exception(self):
+        # Option (1): no goldfish or sunfish job ever came back marine=true in the QA logs,
+        # so a freshwater-family fish that WoRMS flags marine is also vetoed.
+        habitat = {"marine": True, "freshwater": True, "brackish": True, "terrestrial": False}
+        with patch("finfindr_server.fetch_inat_taxon", return_value=self._eury_taxon("Cyprinidae", "Carassius auratus")):
+            self.assertFalse(finfindr_server.taxon_is_freshwater_or_inland("Carassius auratus", habitat=habitat))
+
     def test_real_note_region_name_rejects_coordinate_labels(self):
         cortez = finfindr_server._REGIONS_BY_ID["sea-of-cortez"]
         other = finfindr_server._REGIONS_BY_ID["other"]

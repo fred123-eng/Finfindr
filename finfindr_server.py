@@ -5557,8 +5557,8 @@ def taxon_is_freshwater_or_inland(scientific, habitat=None):
     """True only for a freshwater or aquatic fish with positive evidence.
 
     Birds and other land animals never qualify. WoRMS terrestrial is never
-    a reason to attach the not-in-region note. A marine-only fish does not
-    qualify. Unknown habitat is False unless the taxon is in the known
+    a reason to attach the not-in-region note. A fish WoRMS flags marine
+    never qualifies, whether or not it is also flagged freshwater. Unknown habitat is False unless the taxon is in the known
     freshwater fish families.
     """
     if not scientific:
@@ -5567,7 +5567,10 @@ def taxon_is_freshwater_or_inland(scientific, habitat=None):
         habitat = _worms_habitat(scientific)
     if habitat and habitat.get("terrestrial") is True:
         return False
-    if habitat and habitat.get("marine") is True and habitat.get("freshwater") is not True:
+    # FF-27 v3 (attempted change): the v1 marine veto, restored. A species WoRMS flags
+    # marine never gets the note, even when it is also flagged freshwater or brackish
+    # (euryhaline: Dicentrarchus labrax, Morone saxatilis).
+    if habitat and habitat.get("marine") is True:
         return False
     taxon = fetch_inat_taxon(scientific)
     names = _ancestor_names(taxon) if taxon else set()
