@@ -4,7 +4,10 @@ FinFindr – Marine species identification
 """
 
 import base64
+import contextvars
 import fcntl
+import hashlib
+import json
 import logging
 import math
 import os
@@ -12,11 +15,12 @@ import random
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 
 import requests
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, Response, copy_current_request_context, g, jsonify, render_template_string, request
 from requests.adapters import HTTPAdapter
 from PIL import Image, ImageOps
 from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
@@ -30,7 +34,7 @@ app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
 Image.MAX_IMAGE_PIXELS = 50_000_000
 
 MIN_DIMENSION = 32
-DEFAULT_MAX_IMAGE_PX = 1536
+DEFAULT_MAX_IMAGE_PX = 1024
 JPEG_QUALITY = 85
 # grok-4.7 is the current flagship and accepts image input (text + image → text).
 # https://docs.x.ai/docs/models
@@ -84,6 +88,7 @@ HTML = """
   .discovery-card ul { margin: 0.45rem 0 0.2rem 1.1rem; }
   .discovery-card a { color: var(--aqua); }
   .quiet-note { margin-top: 0.55rem; opacity: 0.85; }
+  .not-in-region { margin-top: 0.75rem; padding: 0.7rem 0.8rem; border-radius: 12px; border: 1px solid rgba(255, 196, 80, 0.45); background: rgba(255, 196, 80, 0.08); line-height: 1.45; }
   #fileInput { display: block; width: 100%; max-width: 100%; margin: 1rem auto; font-size: 1rem; color: var(--white); }
   #results { max-width: 800px; margin: 0 auto; }
   .result-card { background: rgba(0,0,0,0.35); border-radius: 16px; margin-bottom: 1.25rem; border: 1px solid rgba(255,255,255,0.1); overflow: hidden; }
@@ -165,6 +170,11 @@ HTML = """
       <option value="1">On</option>
       <option value="0">Off</option>
     </select>
+    <label for="nocacheSelect">Skip answer cache</label>
+    <select id="nocacheSelect">
+      <option value="">Use cache</option>
+      <option value="1">nocache=1</option>
+    </select>
   </details>
 </div>
 
@@ -193,9 +203,11 @@ const modelInput = document.getElementById("modelInput");
 const verifySelect = document.getElementById("verifySelect");
 const discoverySelect = document.getElementById("discoverySelect");
 const excludeObservation = document.getElementById("excludeObservation");
+const nocacheSelect = document.getElementById("nocacheSelect");
 const locationStatus = document.getElementById("locationStatus");
 const MIN_DIMENSION = 32;
 const MAX_BYTES = 20 * 1024 * 1024;
+const NOT_MARINE_MESSAGE = "FinFindr focuses on marine animal identification only. Please upload a photo of a marine animal.";
 const REGION_KEY = "finfindr.region";
 const LOCATION_KEY = "finfindr.location";
 const LIST_KEY = "finfindr.speciesList";
@@ -321,7 +333,7 @@ function safeHttpUrl(url) {
   }
 }
 
-function showCandidates(card, candidates) {
+function showCandidates(card, candidates, allowHigh) {
   const list = document.createElement("div");
   list.className = "candidates";
   candidates.slice(0, 3).forEach(function (item) {
@@ -357,6 +369,11 @@ function showCandidates(card, candidates) {
       conf.className = "confidence";
       conf.textContent = item.confidence + " confidence";
       cap.appendChild(conf);
+    } else if (allowHigh && item.confidence === "high") {
+      const conf = document.createElement("div");
+      conf.className = "confidence";
+      conf.textContent = "high confidence";
+      cap.appendChild(conf);
     }
     if (item.trait) {
       const trait = document.createElement("div");
@@ -388,6 +405,16 @@ function showCandidates(card, candidates) {
     list.appendChild(block);
   });
   card.querySelector(".result-body").appendChild(list);
+}
+
+function showNotInRegion(card, data) {
+  const flag = data && data.not_in_region;
+  if (!flag) return;
+  const note = document.createElement("p");
+  note.className = "not-in-region";
+  note.textContent = flag.display || flag.text || "";
+  if (!note.textContent) return;
+  card.querySelector(".result-body").appendChild(note);
 }
 
 function showRegion(card, label) {
@@ -504,6 +531,27 @@ function appendNearestRecord(box, discovery) {
   box.appendChild(line);
 }
 
+function appendExternalRange(card, discovery) {
+  if (!discovery || !discovery.external_range) return;
+  const ext = document.createElement("p");
+  ext.className = "external-range";
+  const source = discovery.external_range_source || "not checked";
+  ext.textContent = "Outside iNaturalist: " + discovery.external_range + " (" + source + ")";
+  card.querySelector(".result-body").appendChild(ext);
+}
+
+function showNotMarine(card) {
+  card.querySelector("h3").textContent = "Marine animals only";
+  const sciWrap = card.querySelector(".scientific");
+  if (sciWrap) sciWrap.hidden = true;
+  const conf = card.querySelector(".confidence");
+  if (conf) conf.textContent = "";
+  const note = document.createElement("p");
+  note.className = "not-marine";
+  note.textContent = NOT_MARINE_MESSAGE;
+  card.querySelector(".result-body").appendChild(note);
+}
+
 function showPhotoRejection(card, data) {
   card.querySelector("h3").textContent = "Can't identify from this photo";
   const sciWrap = card.querySelector(".scientific");
@@ -534,6 +582,13 @@ function showDiscovery(card, data) {
     heading.textContent = "Possible range extension";
     const area = discovery.radius_km ? "within " + discovery.radius_km + " km" : "in the selected region";
     lead.textContent = (discovery.scientific_name || "This species") + " has " + discovery.records_in_region + " research-grade iNaturalist records " + area + ". The identification matches reference photos, so this may be outside the recorded range.";
+    if (discovery.external_range) {
+      const ext = document.createElement("p");
+      ext.className = "external-range";
+      const source = discovery.external_range_source || "not checked";
+      ext.textContent = "Outside iNaturalist: " + discovery.external_range + " (" + source + ")";
+      box.appendChild(ext);
+    }
     (discovery.traits || []).forEach(function (trait) {
       const item = document.createElement("li");
       item.textContent = trait;
@@ -770,9 +825,29 @@ async function handleFile(file) {
         formData.append("exclude_observation_id", excludeObservation.value.trim());
       }
     }
+    if (nocacheSelect && nocacheSelect.value === "1") {
+      formData.append("nocache", "1");
+    }
 
     const resp = await fetch("/identify", { method: "POST", body: formData });
-    const parsed = await readJsonResponse(resp);
+    let parsed = await readJsonResponse(resp);
+    if (parsed.ok && parsed.data && parsed.data.job_id) {
+      const statusUrl = parsed.data.status_url || ("/identify/status/" + parsed.data.job_id);
+      const waitStarted = Date.now();
+      while (Date.now() - waitStarted < 260000) {
+        await new Promise(function (resolve) { setTimeout(resolve, 2000); });
+        const poll = await fetch(statusUrl);
+        const update = await readJsonResponse(poll);
+        if (!update.ok) { parsed = update; break; }
+        const job = update.data || {};
+        const title = card.querySelector(".progress-title");
+        if (title && job.progress) title.textContent = job.progress;
+        if (job.status === "done" || job.status === "timeout") {
+          parsed = { ok: true, data: job.result || {}, region_label: (job.result || {}).region_label };
+          break;
+        }
+      }
+    }
     clearInterval(progressTimer);
     const progressNote = card.querySelector(".progress-note");
     if (progressNote) progressNote.remove();
@@ -787,13 +862,41 @@ async function handleFile(file) {
     const spinner = card.querySelector(".spinner");
     if (spinner) spinner.remove();
 
-    if (data.photo_quality === "poor" || data.photo_quality === "invalid") {
+    if (data.reason === "not_marine") {
+      showNotMarine(card);
+      addRetry(card);
+      return;
+    }
+    if ((!data.candidates || !data.candidates.length) && (data.photo_quality === "poor" || data.photo_quality === "invalid" || data.message === "Can't identify from this photo.")) {
       showPhotoRejection(card, data);
       addRetry(card);
       return;
     }
     if (data.discovery && (data.discovery.type === "possible_range_extension" || data.discovery.type === "no_match")) {
       showDiscovery(card, data);
+      addRetry(card);
+      return;
+    }
+    if (data.certainty !== "confident") {
+      if (data.candidates && data.candidates.length) {
+        card.querySelector("h3").textContent = data.certainty === "unsure" ? "Not sure yet" : "Likely — check these";
+        card.querySelector("h3").classList.add("unsure-title");
+        const sciWrapEarly = card.querySelector(".scientific");
+        if (sciWrapEarly) sciWrapEarly.hidden = true;
+        const confEarly = card.querySelector(".confidence");
+        if (confEarly) confEarly.textContent = "";
+        showCandidates(card, data.candidates, false);
+        if (data.notable_note) {
+          const note = document.createElement("p");
+          note.className = "quiet-note";
+          note.textContent = data.notable_note;
+          card.querySelector(".result-body").appendChild(note);
+        }
+        if (data.discovery && data.discovery.type === "off_list") appendExternalRange(card, data.discovery);
+        showNotInRegion(card, data);
+      } else {
+        showPhotoRejection(card, data);
+      }
       addRetry(card);
       return;
     }
@@ -810,48 +913,34 @@ async function handleFile(file) {
       else if (lower.startsWith("notes:")) notes = line.split(":").slice(1).join(":").trim();
     });
 
-    const uncertain = (data.certainty === "likely" || data.certainty === "unsure")
-      && data.candidates && data.candidates.length;
-    if (uncertain) {
-      card.querySelector("h3").textContent = data.certainty === "unsure" ? "Not sure yet" : "Likely — check these";
-      card.querySelector("h3").classList.add("unsure-title");
-      const sciWrapEarly = card.querySelector(".scientific");
-      if (sciWrapEarly) sciWrapEarly.hidden = true;
-      const conf = card.querySelector(".confidence");
-      if (conf) conf.textContent = "";
-      showCandidates(card, data.candidates);
-      if (data.notable_note) {
-        const note = document.createElement("p");
-        note.className = "quiet-note";
-        note.textContent = data.notable_note;
-        card.querySelector(".result-body").appendChild(note);
-      }
-    } else {
-      card.querySelector("h3").textContent = common || "Result";
-      card.querySelector(".sci").textContent = scientific;
-      if (group) {
-        const g = document.createElement("div");
-        g.style.margin = "0.3rem 0";
-        g.textContent = "Group: " + group;
-        card.querySelector(".result-body").appendChild(g);
-      }
-      if (altGroup && altGroup.toLowerCase() !== "none") {
-        const a = document.createElement("div");
-        a.style.margin = "0.2rem 0";
-        a.style.opacity = "0.75";
-        a.style.fontSize = "0.9rem";
-        a.textContent = "Also considered: " + altGroup;
-        card.querySelector(".result-body").appendChild(a);
-      }
-      if (confidence) card.querySelector(".confidence").textContent = confidence + " confidence";
-      if (notes) {
-        const n = document.createElement("div");
-        n.style.marginTop = "0.5rem";
-        n.textContent = notes;
-        card.querySelector(".result-body").appendChild(n);
-      }
-      if (!common && !scientific) card.querySelector(".sci").textContent = text;
+    card.querySelector("h3").textContent = common || "Result";
+    card.querySelector(".sci").textContent = scientific;
+    if (group) {
+      const g = document.createElement("div");
+      g.style.margin = "0.3rem 0";
+      g.textContent = "Group: " + group;
+      card.querySelector(".result-body").appendChild(g);
     }
+    if (altGroup && altGroup.toLowerCase() !== "none") {
+      const a = document.createElement("div");
+      a.style.margin = "0.2rem 0";
+      a.style.opacity = "0.75";
+      a.style.fontSize = "0.9rem";
+      a.textContent = "Also considered: " + altGroup;
+      card.querySelector(".result-body").appendChild(a);
+    }
+    if (confidence && confidence.toLowerCase() === "high") {
+      card.querySelector(".confidence").textContent = "high confidence";
+    }
+    if (notes) {
+      const n = document.createElement("div");
+      n.style.marginTop = "0.5rem";
+      n.textContent = notes;
+      card.querySelector(".result-body").appendChild(n);
+    }
+    if (data.discovery && data.discovery.type === "off_list") appendExternalRange(card, data.discovery);
+    showNotInRegion(card, data);
+    if (!common && !scientific) card.querySelector(".sci").textContent = text;
 
     const sciWrap = card.querySelector(".scientific");
     const sciLabel = card.querySelector(".sci-label");
@@ -1245,11 +1334,11 @@ def resolve_common_names(scientific_names, species=None):
         if scientific.lower() not in seen_pending:
             seen_pending.add(scientific.lower())
             pending.append(scientific)
-    if not pending:
+    if not pending or not nature_data_enabled():
         return found
     workers = min(8, len(pending))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_fetch_inat_common_name_uncached, name) for name in pending]
+        futures = [_submit(pool, _fetch_inat_common_name_uncached, name) for name in pending]
         for name, future in zip(pending, futures):
             try:
                 found[name] = future.result()
@@ -1434,7 +1523,109 @@ LOCATION_RADIUS_KM = 100
 # higher-priced band that starts at 128k tokens.
 MAX_PROMPT_TEXT_TOKENS = 100000
 XAI_TEMPERATURE = 0
+XAI_SEED = 0
+NOT_MARINE_MESSAGE = (
+    "FinFindr focuses on marine animal identification only. "
+    "Please upload a photo of a marine animal."
+)
+# FINFINDR_SCOPE=marine is the default. The names below are the one list a
+# marine identification may name. FINFINDR_SCOPE=all turns the gate off.
+# Any other value is a comma-separated ancestry list that replaces this one,
+# so the scope can widen later without touching the identification pipeline.
+MARINE_SCOPE_ANCESTORS = frozenset({
+    "actinopterygii",
+    "chondrichthyes",
+    "elasmobranchii",
+    "holocephali",
+    "myxini",
+    "petromyzontida",
+    "mollusca",
+    "echinodermata",
+    "cnidaria",
+    "porifera",
+    "ctenophora",
+    "crustacea",
+    "cetacea",
+    "odontoceti",
+    "mysticeti",
+    "sirenia",
+    "pinnipedia",
+    "otariidae",
+    "phocidae",
+    "odobenidae",
+    "enhydra",
+    "cheloniidae",
+    "dermochelyidae",
+    "hydrophiinae",
+    "laticaudinae",
+    "hydrophiidae",
+    "hydrophis",
+    "laticauda",
+    "aipysurus",
+    "emydocephalus",
+    "pelamis",
+    "spheniscidae",
+    "diomedeidae",
+    "procellariidae",
+    "hydrobatidae",
+    "pelecanidae",
+    "sulidae",
+    "fregatidae",
+    "phaethontidae",
+    "alcidae",
+    "laridae",
+    "stercorariidae",
+    "phalacrocoracidae",
+    # Shorebirds. A gull, pelican, or oystercatcher is in scope even on the beach.
+    "haematopodidae",
+    "scolopacidae",
+    "charadriidae",
+    "recurvirostridae",
+    "ardeidae",
+    "threskiornithidae",
+    "burhinidae",
+    # Marine iguana, polar bear, and sea otter are marine even though their
+    # class is otherwise terrestrial.
+    "amblyrhynchus",
+    "ursus maritimus",
+    "enhydra lutris",
+    # Marine algae.
+    "chlorophyta",
+    "rhodophyta",
+    "phaeophyceae",
+    "ochrophyta",
+    "ulvophyceae",
+})
+# Groups that sit inside an otherwise marine phylum but are not marine.
+TERRESTRIAL_SCOPE_EXCEPTIONS = frozenset({
+    "stylommatophora",
+    "helicidae",
+    "coenobitidae",
+    "gecarcinidae",
+})
+LAND_ICONIC_TAXA = frozenset({
+    "mammalia",
+    "aves",
+    "insecta",
+    "arachnida",
+    "amphibia",
+    "reptilia",
+    "plantae",
+    "fungi",
+})
+# Traits the photo description is compared with. A color, shape, or pattern
+# that cannot belong to the species blocks a confident identification.
+SPECIES_TRAITS = {
+    "mithrodia bradleyi": "tan or brown mottled cylindrical arms with a fine irregular network, not a red tile lattice",
+    "phataria unifascialis": "small disc and long slender cylindrical arms colored tan, orange, or blue, not a red lattice and not a thick knobby cushion",
+    "pharia pyramidata": "tan or orange star with a broad arm base, not a red tile lattice",
+    "echinaster tenuispina": "slender orange arms with fine spines, not a cream lattice of raised plates",
+    "fromia monilis": "red or orange arms covered by a cream lattice of raised plates",
+    "pentaceraster cumingi": "thick inflated body with short broad arms and large conical knobs",
+    "nidorellia armata": "pale thick body with very short arms and dark brown spines",
+}
 NL = chr(10)
+_REQUEST_STATS = contextvars.ContextVar("finfindr_request_stats", default=None)
 _SPECIES_LOCK = threading.Lock()
 _SPECIES_CACHE = {}
 _SPECIES_WAIT_RESULT = {}
@@ -1449,6 +1640,9 @@ CORTEZ_LOOKALIKE_LINES = (
     "- Blue sea star (Phataria unifascialis), Panamic cushion star (Pentaceraster cumingi), or chocolate-chip star (Nidorellia armata): a small disc with long slender cylindrical arms and no large conical spines means Phataria unifascialis, even when the color is tan, orange, or blue. A thick inflated body with short broad arms and large conical knobs means a cushion star, not Phataria. Among cushion stars, a pale body with very short, almost webbed arms and evenly sized dark-brown spines means Nidorellia armata. A larger cushion star whose knobs are red or orange and often linked in a network means Pentaceraster cumingi. Do not call a slender-armed star a cushion star, and do not call a knobby inflated star Phataria.",
     "- Cortez rainbow wrasse (Thalassoma lucasanum) or Mexican hogfish (Bodianus diplotaenia): a small cigar-shaped fish with horizontal yellow and red stripes, or a blue head with a broad yellow saddle just behind it, is the rainbow wrasse. A pointed hog-like snout with two dark side stripes on a yellow or reddish body, a yellow tail on the reddish fish, or a forehead hump and a yellow mid-body bar on a large fish, is the Mexican hogfish. Yellow with red stripes is not the hogfish. Two dark stripes and a hog snout are not the rainbow wrasse.",
     "- Bullseye puffer (Sphoeroides annulatus) or a porcupinefish (Diodon): long spines that can stand erect mean a porcupinefish, even when the body is spotted. Only short prickles, a more elongated body, and a double concentric oval on the back with narrow yellowish lines mean the bullseye puffer. Spots without long spines are not a porcupinefish. Long spines are not the bullseye puffer. A puffer that lacks the concentric oval is a different puffer, not Sphoeroides annulatus.",
+    "- Bull shark (Carcharhinus leucas) or silky shark (Carcharhinus falciformis): a stocky body, broad blunt snout, small eyes, and no ridge between the dorsal fins mean the bull shark, Carcharhinus leucas. Rank Carcharhinus leucas first in that case. A slender body, longer rounded snout, and a visible low ridge between the dorsal fins mean the silky shark. Do not name falciformis, and do not rank it first, when the snout is blunt or the body is stocky. Put leucas in the candidate list whenever both are plausible.",
+    "- Two-spot octopus (Octopus bimaculatus), Hubbs' octopus (Octopus hubbsorum), or red octopus (Octopus rubescens): a pair of false eye spots (ocelli) under the eyes means bimaculatus. A brown-gray octopus without those eye spots can be hubbsorum. A reddish octopus without eye spots, with a stout body and pale papillae, is Octopus rubescens even when it is not on the regional list. Do not leave rubescens off the off-list lines when the regional octopus species lack that reddish color and papillae.",
+    "- California blue dorid (Felimare californiensis) or a rough nerite (Nerita scabricosta): a dark blue mantle with yellow spots or rings is Felimare californiensis. A thick dark shell with rough spiral ridges in the intertidal is Nerita scabricosta. Name the one whose spots or shell ridges you can see, and say that trait explicitly.",
 )
 EASTERN_PACIFIC_BBOX = (-6.0, -118.0, 33.0, -77.0)
 
@@ -1557,6 +1751,79 @@ def display_region_label(region, lat, lng, location_fallback=False):
             return f"Other · near {match['label']}"
         return f"Other · {lat:.2f}, {lng:.2f}"
     return region["label"]
+
+
+def effective_region_label(region, lat, lng, location_fallback=False):
+    """Region name for the not-in-region flag.
+
+    When the user picked a named region, this is that name, which is also the
+    card's region_label, even if GPS built the species list from elsewhere.
+    The GPS-built list's region is used only when no named region was picked
+    (Other, or Use my location).
+    """
+    if location_fallback:
+        return display_region_label(region, lat, lng, location_fallback)
+    if region["id"] not in ("other", "my-location"):
+        return region["label"]
+    if lat is not None and lng is not None:
+        match = region_matching_point(lat, lng)
+        if match:
+            return match["label"]
+    return display_region_label(region, lat, lng, location_fallback)
+
+
+def not_in_region_text(region_name):
+    return f"not found in {region_name}"
+
+
+def not_in_region_display(common, scientific, region_name):
+    """Exact wording shown on the card, e.g. 'Goldfish (Carassius auratus) — not found in Sea of Cortez / La Paz.'"""
+    name = (common or "").strip()
+    sci = (scientific or "").strip()
+    if name and sci:
+        lead = f"{name} ({sci})"
+    else:
+        lead = name or sci or "This species"
+    return f"{lead} — {not_in_region_text(region_name)}."
+
+
+_COORDINATE_REGION_NAME = re.compile(r"^(?:Other|Near) · -?\d+\.\d+, -?\d+\.\d+$")
+
+
+def real_note_region_name(region, lat, lng, location_fallback=False):
+    """A named ocean region for the note, or None for coordinate-only / Other labels."""
+    name = (effective_region_label(region, lat, lng, location_fallback) or "").strip()
+    if not name or name in ("Other", "Use my location"):
+        return None
+    if _COORDINATE_REGION_NAME.match(name):
+        return None
+    return name
+
+
+def gps_in_note_region(region, lat, lng):
+    """Whether GPS sits in the box the note would use. None when there is no GPS.
+
+    A named picker uses that region's box, even if the point is elsewhere.
+    For Other or Use my location, the named ocean box the point falls in, if any.
+    """
+    if lat is None or lng is None or not region:
+        return None
+    if region.get("id") not in ("other", "my-location"):
+        if "swlat" not in region:
+            return False
+        return _point_in_bbox(lat, lng, region["swlat"], region["swlng"], region["nelat"], region["nelng"])
+    match = region_matching_point(lat, lng)
+    return bool(match and "swlat" in match)
+
+
+def records_block_not_in_region(region, lat, lng, record_count):
+    """An existing GPS records_in_radius > 0 blocks only when that GPS is in the note region.
+
+    A missing count never blocks. This does not fetch a place_id or bbox count.
+    """
+    if record_count is None or record_count <= 0:
+        return False
+    return gps_in_note_region(region, lat, lng) is True
 
 
 def locality_text(region, lat, lng, coord_source):
@@ -1673,19 +1940,20 @@ def _parse_coord(value, limit):
     return number
 
 
-def _form_coordinates():
-    lat = _parse_coord(request.form.get("lat"), 90)
-    lng = _parse_coord(request.form.get("lng"), 180)
+def _form_coordinates(fields=None):
+    source = request.form if fields is None else fields
+    lat = _parse_coord(source.get("lat"), 90)
+    lng = _parse_coord(source.get("lng"), 180)
     if lat is None or lng is None:
         return None, None
     return lat, lng
 
 
-def _choose_coordinates(image_bytes):
+def _choose_coordinates(image_bytes, fields=None):
     exif_lat, exif_lng = extract_gps(image_bytes)
     if exif_lat is not None and exif_lng is not None:
         return exif_lat, exif_lng, "exif"
-    form_lat, form_lng = _form_coordinates()
+    form_lat, form_lng = _form_coordinates(fields)
     if form_lat is not None and form_lng is not None:
         return form_lat, form_lng, "browser"
     return None, None, None
@@ -1751,12 +2019,15 @@ def assemble_prompt(locality, species, lookalikes, lat, lng):
         "Group: <group>",
         "Alternative group considered: <other possible group or none>",
         "Confidence: <high / medium / low>",
+        "high: a diagnostic trait is clearly visible and look-alikes are excluded.",
+        "medium: the photo is consistent with the species, but some look-alikes are not excluded.",
+        "low: the evidence is weak or only partly visible.",
         "Notes: <one cool fact about the species>",
         "Candidate 1: <scientific name> | <common name> | <high/medium/low> | <one trait that separates it from the next candidate>",
         "Candidate 2: <scientific name> | <common name> | <high/medium/low> | <one trait>",
         "Candidate 3: <scientific name or none> | <common name> | <high/medium/low> | <one trait>",
-        "Off-list 1: <scientific name or none> | <common name> | <trait that the regional list does not cover>",
-        "Off-list 2: <scientific name or none> | <common name> | <trait>",
+        "Off-list 1: <scientific name or none> | <common name> | <high/medium/low> | <trait that the regional list does not cover>",
+        "Off-list 2: <scientific name or none> | <common name> | <high/medium/low> | <trait>",
         "List the best supported species first. Include a look-alike when one is plausible. Use none only when you have no second species.",
         "When the visible animal matches a listed species, set both off-list lines to none.",
         "When it does not, name up to two real species that are not in the regional list. Do not invent a name.",
@@ -1782,22 +2053,135 @@ def prompt_for_species(locality, species, lookalikes, lat, lng):
     return assemble_prompt(locality, trimmed, lookalikes, lat, lng), len(trimmed), True
 
 
-def _species_cache_get(key):
-    now = time.monotonic()
+def cache_dir():
+    return os.environ.get("FINFINDR_CACHE_DIR", "/tmp/finfindr-cache")
+
+
+def _cache_key_text(key):
+    if isinstance(key, str):
+        return key
+    try:
+        return json.dumps(key, sort_keys=True, default=str)
+    except TypeError:
+        return str(key)
+
+
+def _disk_cache_path(name):
+    directory = cache_dir()
+    os.makedirs(directory, exist_ok=True)
+    return os.path.join(directory, name + ".json")
+
+
+def _disk_lock(path):
+    lock_path = path + ".lock"
+    handle = open(lock_path, "a")
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    return handle
+
+
+def _disk_read(name):
+    path = _disk_cache_path(name)
+    if not os.path.isfile(path):
+        return {}
+    lock = _disk_lock(path)
+    try:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            return {}
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+    if not isinstance(data, dict):
+        return {}
+    now = time.time()
+    fresh = {}
+    for key, item in data.items():
+        if isinstance(item, dict) and float(item.get("expires") or 0) > now and "value" in item:
+            fresh[key] = item
+    return fresh
+
+
+def _disk_write(name, data):
+    path = _disk_cache_path(name)
+    lock = _disk_lock(path)
+    try:
+        temporary = path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        os.replace(temporary, path)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+
+def _disk_cache_get(name, key):
+    item = _disk_read(name).get(_cache_key_text(key))
+    if not item:
+        return None
+    return item.get("value")
+
+
+def _disk_cache_put(name, key, value, ttl):
+    try:
+        json.dumps(value)
+    except TypeError:
+        return
+    path_name = name
+    data = _disk_read(path_name)
+    data[_cache_key_text(key)] = {"expires": time.time() + max(1.0, float(ttl)), "value": value}
+    if len(data) > 512:
+        ordered = sorted(data, key=lambda item: data[item].get("expires") or 0)
+        for old in ordered[: len(data) - 512]:
+            data.pop(old, None)
+    try:
+        _disk_write(path_name, data)
+    except OSError:
+        app.logger.warning("could not persist %s cache", name, exc_info=True)
+
+
+def clear_persisted_caches():
+    """Drop in-memory and on-disk species and taxon caches. Tests use this."""
     with _SPECIES_LOCK:
-        hit = _SPECIES_CACHE.get(key)
-        if not hit or hit[0] <= now:
-            _SPECIES_CACHE.pop(key, None)
-            return None
-        return hit[1]
+        _SPECIES_CACHE.clear()
+    with _INAT_JSON_LOCK:
+        _INAT_JSON_CACHE.clear()
+    directory = cache_dir()
+    try:
+        for name in ("species", "taxa"):
+            path = os.path.join(directory, name + ".json")
+            if os.path.isfile(path):
+                os.remove(path)
+    except OSError:
+        app.logger.warning("could not clear the disk cache", exc_info=True)
 
 
-def _species_cache_put(key, payload, ttl):
+def _species_memory_put(key, payload, ttl):
     with _SPECIES_LOCK:
         if len(_SPECIES_CACHE) >= 64 and key not in _SPECIES_CACHE:
             oldest = min(_SPECIES_CACHE, key=lambda item: _SPECIES_CACHE[item][0])
             _SPECIES_CACHE.pop(oldest, None)
         _SPECIES_CACHE[key] = (time.monotonic() + ttl, payload)
+
+
+def _species_cache_get(key):
+    now = time.monotonic()
+    with _SPECIES_LOCK:
+        hit = _SPECIES_CACHE.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+        _SPECIES_CACHE.pop(key, None)
+    persisted = _disk_cache_get("species", key)
+    if persisted is None:
+        return None
+    _species_memory_put(key, persisted, 60)
+    return persisted
+
+
+def _species_cache_put(key, payload, ttl):
+    _species_memory_put(key, payload, ttl)
+    _disk_cache_put("species", key, payload, ttl)
 
 
 def _empty_species():
@@ -1898,23 +2282,50 @@ def _inat_cache_key(url, params):
     return (url, items)
 
 
+def _inat_memory_put(key, payload, ttl):
+    with _INAT_JSON_LOCK:
+        if len(_INAT_JSON_CACHE) > 512 and key not in _INAT_JSON_CACHE:
+            _INAT_JSON_CACHE.clear()
+        _INAT_JSON_CACHE[key] = (time.monotonic() + ttl, payload)
+
+
+def _persist_taxon_response(url):
+    return "/taxa" in (url or "")
+
+
 def _inat_cache_get(url, params):
     key = _inat_cache_key(url, params)
     now = time.monotonic()
     with _INAT_JSON_LOCK:
         hit = _INAT_JSON_CACHE.get(key)
-        if not hit or hit[0] <= now:
-            _INAT_JSON_CACHE.pop(key, None)
-            return None
-        return hit[1]
+        if hit and hit[0] > now:
+            return hit[1]
+        _INAT_JSON_CACHE.pop(key, None)
+    if not _persist_taxon_response(url):
+        return None
+    persisted = _disk_cache_get("taxa", key)
+    if persisted is None:
+        return None
+    _inat_memory_put(key, persisted, 60)
+    return persisted
+
+
+def _taxon_payload_worth_keeping(payload):
+    if isinstance(payload, dict):
+        results = payload.get("results")
+        if isinstance(results, list):
+            return bool(results)
+        return bool(payload.get("name") or payload.get("ancestors") or payload.get("iconic_taxon_name"))
+    if isinstance(payload, list):
+        return bool(payload)
+    return False
 
 
 def _inat_cache_put(url, params, payload):
     key = _inat_cache_key(url, params)
-    with _INAT_JSON_LOCK:
-        if len(_INAT_JSON_CACHE) > 512:
-            _INAT_JSON_CACHE.clear()
-        _INAT_JSON_CACHE[key] = (time.monotonic() + INAT_CACHE_TTL, payload)
+    _inat_memory_put(key, payload, INAT_CACHE_TTL)
+    if _persist_taxon_response(url) and _taxon_payload_worth_keeping(payload):
+        _disk_cache_put("taxa", key, payload, INAT_CACHE_TTL)
 
 
 def _retry_after_seconds(response, attempt):
@@ -1947,6 +2358,48 @@ def call_time_left():
     return deadline - time.monotonic()
 
 
+def begin_request_stats():
+    stats = {"external_calls": 0, "inat_throttled": 0, "lock": threading.Lock()}
+    _REQUEST_STATS.set(stats)
+    return stats
+
+
+def _bump_stat(name):
+    stats = _REQUEST_STATS.get()
+    if not stats:
+        return
+    with stats["lock"]:
+        stats[name] = int(stats.get(name) or 0) + 1
+
+
+def request_stat(name):
+    stats = _REQUEST_STATS.get()
+    if not stats:
+        return 0
+    with stats["lock"]:
+        return int(stats.get(name) or 0)
+
+
+def _run_in_worker(fn, *args):
+    """Run fn in the current context so request counters survive a worker thread."""
+    ctx = contextvars.copy_context()
+
+    def run(fn=fn, args=args, ctx=ctx):
+        return ctx.run(fn, *args)
+
+    return run
+
+
+def _start_thread(target, name):
+    worker = threading.Thread(target=_run_in_worker(target), name=name, daemon=True)
+    worker.start()
+    return worker
+
+
+def _submit(pool, fn, *args):
+    return pool.submit(_run_in_worker(fn, *args))
+
+
 def _cap_timeout(timeout):
     """Fit a requests timeout inside the request's hard budget."""
     left = call_time_left()
@@ -1974,8 +2427,7 @@ def _http_get_bounded(url, params, headers, timeout):
         except Exception as exc:
             holder["error"] = exc
 
-    worker = threading.Thread(target=run, name="finfindr-http", daemon=True)
-    worker.start()
+    worker = _start_thread(run, "finfindr-http")
     worker.join(read_cap + 0.5)
     if worker.is_alive():
         app.logger.warning("outbound wall-clock timeout %s", url)
@@ -1987,6 +2439,8 @@ def _http_get_bounded(url, params, headers, timeout):
 
 def _inat_get(url, params, timeout, headers):
     """One paced external GET. Successful JSON is cached for hours. 429s are retried."""
+    if not nature_data_enabled():
+        return None
     cached = _inat_cache_get(url, params)
     if cached is not None:
         return cached
@@ -1995,6 +2449,7 @@ def _inat_get(url, params, timeout, headers):
         if call_time_left() is not None and call_time_left() < 0.4:
             return None
         _inat_wait()
+        _bump_stat("external_calls")
         try:
             resp = _http_get_bounded(url, params, headers, timeout)
         except requests.Timeout as exc:
@@ -2005,6 +2460,8 @@ def _inat_get(url, params, timeout, headers):
             return None
         if resp is None:
             return None
+        if resp.status_code == 429 and "inaturalist.org" in host:
+            _bump_stat("inat_throttled")
         if resp.status_code == 429 and attempt < 3:
             delay = _retry_after_seconds(resp, attempt)
             app.logger.warning("%s 429; retrying in %ss", host, delay)
@@ -2023,7 +2480,7 @@ def _inat_get(url, params, timeout, headers):
         except (requests.RequestException, ValueError) as exc:
             app.logger.warning("%s request failed: %s", host, exc)
             return None
-        if isinstance(payload, dict):
+        if isinstance(payload, (dict, list)):
             _inat_cache_put(url, params, payload)
             return payload
         return None
@@ -2129,7 +2586,7 @@ def _fetch_short_species_list(query, deadline):
             break
         still_pending = []
         with ThreadPoolExecutor(max_workers=1) as pool:
-            futures = [pool.submit(fetch_taxon, group, taxon_id) for group, taxon_id in pending]
+            futures = [_submit(pool, fetch_taxon, group, taxon_id) for group, taxon_id in pending]
             for (group, taxon_id), future in zip(pending, futures):
                 try:
                     label, rows, total, done = future.result()
@@ -2296,7 +2753,7 @@ def prefetch_reference_limit():
     """How many Sea of Cortez reference photos to warm. FINFINDR_PREFETCH_REFS=0 disables it."""
     raw = (os.environ.get("FINFINDR_PREFETCH_REFS") or "").strip()
     if not raw:
-        return 0
+        return 30
     if raw.lower() in ("0", "false", "off", "no"):
         return 0
     try:
@@ -2409,8 +2866,20 @@ def _vision_payload(jpeg_bytes, prompt, model, extra_images=None, extra_detail="
     return {
         "model": model,
         "temperature": XAI_TEMPERATURE,
+        "seed": resolve_seed(),
         "input": [{"role": "user", "content": content}],
     }
+
+
+def resolve_seed():
+    """XAI_SEED overrides 0. The responses API accepts seed for best-effort determinism."""
+    raw = (os.environ.get("XAI_SEED") or "").strip()
+    if not raw:
+        return XAI_SEED
+    try:
+        return int(raw)
+    except ValueError:
+        return XAI_SEED
 
 
 def _extract_text(data):
@@ -2451,21 +2920,48 @@ def _env_seconds(name, default, low, high):
     return min(float(high), max(float(low), value))
 
 
-def resolve_fallback_model(primary):
-    """Faster model used once if the primary call times out or the server errors.
+def _parse_model_list(raw):
+    """Comma-separated model names. Empty when nothing in the string is usable."""
+    chosen = []
+    for part in (raw or "").split(","):
+        name = part.strip()
+        if _safe_model_name(name) and name not in chosen:
+            chosen.append(name)
+    return chosen[:2]
 
-    XAI_FALLBACK_MODEL defaults to grok-4. An empty value disables the fallback.
+
+def configured_models(requested=None, debug=False, models_field=None):
+    """The models that identify every photo.
+
+    XAI_MODELS defaults to grok-4,grok-4.7. They run together. XAI_MODEL, or a
+    debug form value, runs that one model instead. With debug=1, `models` is a
+    comma-separated alias for that switch. XAI_FALLBACK_AFTER is unused.
     """
-    if "XAI_FALLBACK_MODEL" in os.environ:
-        raw = os.environ.get("XAI_FALLBACK_MODEL", "").strip()
-    else:
-        raw = "grok-4"
-    if not _safe_model_name(raw) or raw == primary:
-        return None
-    return raw
+    if debug:
+        chosen = _parse_model_list(models_field)
+        if chosen:
+            return chosen
+        candidate = (requested or "").strip()
+        if _safe_model_name(candidate):
+            return [candidate]
+    # XAI_MODEL used to mean "the one model". On staging it is grok-4.7, which
+    # is the slow model in the pair, not a reason to drop grok-4.
+    if not (os.environ.get("XAI_MODELS") or "").strip():
+        single = (os.environ.get("XAI_MODEL") or "").strip()
+        if _safe_model_name(single) and single != "grok-4":
+            return ["grok-4", single]
+        if _safe_model_name(single):
+            return ["grok-4", "grok-4.7"]
+    raw = os.environ.get("XAI_MODELS", "grok-4,grok-4.7")
+    models = []
+    for part in raw.split(","):
+        name = part.strip()
+        if _safe_model_name(name) and name not in models:
+            models.append(name)
+    return models[:2] or ["grok-4", "grok-4.7"]
 
 
-def _identification_meta(mode, sent, available, truncated, source, list_ms, model_ms, tokens, token_source, model, image_px, fallback_used=False, attempts=None, verify_used=False, verify_ms=0, reference_fetch_ms=0, total_ms=None, verify_skipped=""):
+def _identification_meta(mode, sent, available, truncated, source, list_ms, model_ms, tokens, token_source, model, image_px, fallback_used=False, attempts=None, verify_used=False, verify_ms=0, reference_fetch_ms=0, total_ms=None, verify_skipped="", list_wait_s=0, waited_out=False):
     return {
         "species_list_mode": mode,
         "species_sent": sent,
@@ -2475,6 +2971,8 @@ def _identification_meta(mode, sent, available, truncated, source, list_ms, mode
         "prompt_tokens": tokens,
         "prompt_tokens_source": token_source,
         "list_fetch_ms": int(list_ms),
+        "list_wait_s": list_wait_s,
+        "waited_out": bool(waited_out),
         "model_call_ms": int(model_ms),
         "model": model,
         "image_px": image_px,
@@ -2523,25 +3021,37 @@ def _attempt_record(model, elapsed_ms, ok, error=None):
 
 
 def _call_vision_model_once(jpeg_bytes, prompt, model, timeout, api_key, extra_images=None, extra_detail="low"):
-    """One HTTP attempt. The socket timeout matches the caller's wall-clock budget."""
+    """One HTTP attempt. A 429 is retried with backoff. It never becomes a 502."""
     started = time.perf_counter()
     payload = _vision_payload(jpeg_bytes, prompt, model, extra_images, extra_detail=extra_detail)
-    try:
-        resp = http.post(
-            "https://api.x.ai/v1/responses",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=max(1.0, timeout),
-        )
-    except requests.Timeout:
-        elapsed = int(round((time.perf_counter() - started) * 1000))
-        app.logger.warning("xAI timeout model=%s after %sms", model, elapsed)
-        return {"ok": False, "retryable": True, "model": model, "ms": elapsed, "error": "timeout", "status": 504}
-    except requests.RequestException as exc:
-        elapsed = int(round((time.perf_counter() - started) * 1000))
-        app.logger.warning("xAI connection error model=%s: %s", model, exc)
-        return {"ok": False, "retryable": True, "model": model, "ms": elapsed, "error": "connection", "status": 502}
+    resp = None
+    for attempt in range(1, 4):
+        _bump_stat("external_calls")
+        try:
+            resp = http.post(
+                "https://api.x.ai/v1/responses",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=max(1.0, timeout),
+            )
+        except requests.Timeout:
+            elapsed = int(round((time.perf_counter() - started) * 1000))
+            app.logger.warning("xAI timeout model=%s after %sms", model, elapsed)
+            return {"ok": False, "retryable": True, "model": model, "ms": elapsed, "error": "timeout", "status": 504}
+        except requests.RequestException as exc:
+            elapsed = int(round((time.perf_counter() - started) * 1000))
+            app.logger.warning("xAI connection error model=%s: %s", model, exc)
+            return {"ok": False, "retryable": True, "model": model, "ms": elapsed, "error": "connection", "status": 502}
+        if resp.status_code == 429 and attempt < 3:
+            delay = _retry_after_seconds(resp, attempt) + random.uniform(0.0, 0.25)
+            app.logger.warning("xAI 429 model=%s; retrying in %.2fs", model, delay)
+            time.sleep(min(delay, 2.0))
+            continue
+        break
     elapsed = int(round((time.perf_counter() - started) * 1000))
+    if resp is not None and resp.status_code == 429:
+        app.logger.error("xAI 429 model=%s after retries", model)
+        return {"ok": False, "retryable": True, "model": model, "ms": elapsed, "error": "rate_limited", "status": 200}
     if resp.status_code >= 500:
         app.logger.error("xAI HTTP %s model=%s: %s", resp.status_code, model, resp.text[:500])
         return {"ok": False, "retryable": True, "model": model, "ms": elapsed, "error": f"http_{resp.status_code}", "status": 502}
@@ -2556,8 +3066,78 @@ def _call_vision_model_once(jpeg_bytes, prompt, model, timeout, api_key, extra_i
     return {"ok": True, "retryable": False, "model": model, "ms": elapsed, "data": data, "status": 200}
 
 
-def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key, extra_images=None, extra_detail="low"):
+_MODEL_CACHE = {}
+_MODEL_CACHE_LOCK = threading.Lock()
+MODEL_CACHE_TTL = 6 * 60 * 60
+
+
+def model_cache_enabled():
+    """FINFINDR_MODEL_CACHE=0 turns off the image-hash cache. Default is on."""
+    return (os.environ.get("FINFINDR_MODEL_CACHE", "1") or "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def _model_cache_key(jpeg_bytes, prompt, model, extra_images):
+    digest = hashlib.sha256()
+    digest.update(jpeg_bytes or b"")
+    digest.update(b"|")
+    digest.update((model or "").encode())
+    digest.update(b"|")
+    digest.update(str(XAI_TEMPERATURE).encode())
+    digest.update(b"|")
+    digest.update(str(resolve_seed()).encode())
+    for image in extra_images or []:
+        digest.update(b"|")
+        digest.update((image or "").encode())
+    digest.update(b"|")
+    digest.update((prompt or "").encode())
+    return digest.hexdigest()
+
+
+def clear_model_cache():
+    with _MODEL_CACHE_LOCK:
+        _MODEL_CACHE.clear()
+    try:
+        path = os.path.join(cache_dir(), "model.json")
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _model_cache_get(key):
+    now = time.monotonic()
+    with _MODEL_CACHE_LOCK:
+        hit = _MODEL_CACHE.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+        _MODEL_CACHE.pop(key, None)
+    persisted = _disk_cache_get("model", key)
+    if not isinstance(persisted, dict) or not persisted.get("ok"):
+        return None
+    with _MODEL_CACHE_LOCK:
+        _MODEL_CACHE[key] = (time.monotonic() + 60, persisted)
+    return persisted
+
+
+def _model_cache_put(key, result):
+    if not isinstance(result, dict) or not result.get("ok"):
+        return
+    with _MODEL_CACHE_LOCK:
+        if len(_MODEL_CACHE) > 128 and key not in _MODEL_CACHE:
+            _MODEL_CACHE.clear()
+        _MODEL_CACHE[key] = (time.monotonic() + MODEL_CACHE_TTL, result)
+    _disk_cache_put("model", key, result, MODEL_CACHE_TTL)
+
+
+def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key, extra_images=None, extra_detail="low", use_cache=True):
     """One model attempt, stopped when the wall clock runs out even if the socket keeps trickling."""
+    cache_key = _model_cache_key(jpeg_bytes, prompt, model, extra_images)
+    if use_cache and model_cache_enabled():
+        cached = _model_cache_get(cache_key)
+        if cached is not None:
+            replay = dict(cached)
+            replay["cached"] = True
+            return replay
     started = time.perf_counter()
     holder = {}
 
@@ -2566,69 +3146,137 @@ def _call_vision_model(jpeg_bytes, prompt, model, timeout, api_key, extra_images
             jpeg_bytes, prompt, model, timeout, api_key, extra_images, extra_detail
         )
 
-    worker = threading.Thread(target=run, name="finfindr-model", daemon=True)
-    worker.start()
+    worker = _start_thread(run, "finfindr-model")
     worker.join(max(0.2, timeout))
     if worker.is_alive():
         elapsed = int(round((time.perf_counter() - started) * 1000))
         app.logger.warning("xAI wall-clock timeout model=%s after %sms", model, elapsed)
         return {"ok": False, "retryable": True, "model": model, "ms": elapsed, "error": "timeout", "status": 504}
-    return holder.get("result") or {
+    result = holder.get("result") or {
         "ok": False, "retryable": True, "model": model,
         "ms": int(round((time.perf_counter() - started) * 1000)),
         "error": "failed", "status": 502,
     }
+    if use_cache and model_cache_enabled():
+        _model_cache_put(cache_key, result)
+    return result
 
 
-def plan_model_timeouts(remaining, primary_cap, fallback_cap, verify_reserve, fallback_enabled):
-    """Keep primary + fallback + verification inside the time still left."""
-    slack = 5.0
-    verify_reserve = max(0.0, verify_reserve)
-    fallback_hold = fallback_cap if fallback_enabled else 0.0
-    primary = min(primary_cap, remaining - verify_reserve - fallback_hold - slack)
-    if primary < 12.0 and fallback_enabled:
-        fallback_hold = 0.0
-        primary = min(primary_cap, remaining - verify_reserve - slack)
-    primary = max(0.0, primary)
-    left = remaining - primary
-    fallback_timeout = 0.0
-    if fallback_hold > 0 and left >= fallback_cap + verify_reserve:
-        fallback_timeout = min(fallback_cap, left - verify_reserve - 1.0)
-    return primary, max(0.0, fallback_timeout)
+def model_call_timeout():
+    """Seconds each model is allowed. Both grok-4 and grok-4.7 get this. Default 180."""
+    return _env_seconds("XAI_MODEL_TIMEOUT", 180, 30, 240)
 
 
-def _run_model_attempts(jpeg_bytes, prompt, model, api_key, request_started, extra_reserve=0, extra_images=None):
-    """Primary model gets most of the budget. Fallback runs only when it still fits.
+def job_wall_seconds():
+    """Hard cap for one identification. Default 240s, above the measured 109s max."""
+    return _env_seconds("FINFINDR_JOB_WALL", 240, 60, 360)
 
-    Wall time stays under FINFINDR_TIME_BUDGET (default 110s) so a 120s worker
-    can still return JSON.
+
+_JOB_ID = contextvars.ContextVar("finfindr_job_id", default=None)
+# Default True. debug=1 and species_list=none sets this False for that request only.
+_NATURE_DATA = contextvars.ContextVar("finfindr_nature_data", default=True)
+
+
+def nature_data_enabled():
+    return _NATURE_DATA.get()
+
+
+def job_directory():
+    """Shared across gunicorn workers. In-memory storage is not, because workers do not share RAM."""
+    path = (os.environ.get("FINFINDR_JOB_DIR") or "").strip() or os.path.join(cache_dir(), "jobs")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _job_path(job_id):
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "", job_id or "")
+    return os.path.join(job_directory(), safe + ".json")
+
+
+def job_write(job_id, payload):
+    path = _job_path(job_id)
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+    os.replace(temporary, path)
+
+
+def job_read(job_id):
+    path = _job_path(job_id)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def job_update(job_id, **changes):
+    current = job_read(job_id) or {"id": job_id}
+    current.update(changes)
+    job_write(job_id, current)
+    return current
+
+
+def job_progress(text):
+    job_id = _JOB_ID.get()
+    if job_id and text:
+        job_update(job_id, status="running", progress=text)
+
+
+def _run_paired_models(jpeg_bytes, prompt, models, api_key, request_started, use_cache=True, on_fast=None):
+    """Run every configured model to completion, then return.
+
+    grok-4.7 is not abandoned because it is slower. The only time its answer
+    is missing is when that call errors or reaches the 180s client timeout.
+    Reference photos for grok-4 start when grok-4 returns, without stopping 4.7.
     """
-    worker_budget = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
-    primary_cap = _env_seconds("XAI_PRIMARY_TIMEOUT", 80, 5, 100)
-    fallback_cap = _env_seconds("XAI_FALLBACK_TIMEOUT", 25, 5, 60)
-    deadline = request_started + worker_budget
+    del request_started
+    timeout = model_call_timeout()
+    holder = {}
+    threads = {}
+    fast_name = "grok-4" if "grok-4" in models else ""
+    job_progress("Asking both models")
+
+    def launch(name):
+        def run(name=name):
+            holder[name] = _call_vision_model(
+                jpeg_bytes, prompt, name, timeout, api_key, use_cache=use_cache
+            )
+            if name == fast_name and holder[name].get("ok") and on_fast:
+                try:
+                    on_fast(holder[name])
+                except Exception:
+                    app.logger.warning("early reference prefetch failed", exc_info=True)
+
+        threads[name] = _start_thread(run, "finfindr-" + name)
+
+    for name in models:
+        launch(name)
+    for name in models:
+        threads[name].join(timeout + 1.0)
+    reports = []
     attempts = []
-
-    def remaining():
-        return deadline - time.monotonic()
-
-    fallback_model = resolve_fallback_model(model)
-    primary_timeout, fallback_timeout = plan_model_timeouts(
-        remaining(), primary_cap, fallback_cap, max(0.0, extra_reserve), bool(fallback_model)
-    )
-    primary_timeout = max(1.0, primary_timeout) if remaining() > 2 else max(0.5, remaining() - 0.2)
-    result = _call_vision_model(jpeg_bytes, prompt, model, primary_timeout, api_key, extra_images)
-    attempts.append(_attempt_record(model, result["ms"], result["ok"], None if result["ok"] else result.get("error")))
-    if result["ok"] or not result["retryable"]:
-        return result, attempts
-
-    if fallback_model and fallback_timeout >= 5 and remaining() >= fallback_timeout + max(0.0, extra_reserve):
-        result = _call_vision_model(
-            jpeg_bytes, prompt, fallback_model, min(fallback_timeout, remaining() - max(0.0, extra_reserve) - 1.0),
-            api_key, extra_images,
-        )
-        attempts.append(_attempt_record(fallback_model, result["ms"], result["ok"], None if result["ok"] else result.get("error")))
-    return result, attempts
+    for name in models:
+        result = holder.get(name) or {
+            "ok": False, "retryable": True, "model": name, "ms": 0, "error": "timeout", "status": 504,
+        }
+        attempts.append(_attempt_record(
+            name, result.get("ms") or 0, result.get("ok"), None if result.get("ok") else result.get("error"),
+        ))
+        text = _extract_text(result["data"]) if result.get("ok") and result.get("data") else ""
+        candidates = parse_model_candidates(text) if text else []
+        reports.append({
+            "model": name,
+            "ok": bool(result.get("ok")),
+            "error": result.get("error") or "",
+            "retryable": result.get("retryable", True),
+            "ms": result.get("ms") or 0,
+            "text": text,
+            "data": result.get("data") if result.get("ok") else None,
+            "candidates": candidates,
+        })
+    return _bundle_model_reports(models, reports, attempts)
 
 
 _CANDIDATE_LINE = re.compile(r"^candidate\s*\d+\s*:\s*(.+)$", re.IGNORECASE)
@@ -2650,33 +3298,36 @@ def verification_enabled(debug, raw):
 
 
 def verify_timeout_cap():
-    """Seconds allowed for the reference-photo model call. FINFINDR_VERIFY_TIMEOUT overrides 25."""
+    """Seconds for the reference check. FINFINDR_VERIFY_TIMEOUT is used as set. Default 60."""
     raw = (os.environ.get("FINFINDR_VERIFY_TIMEOUT") or "").strip()
     if not raw:
-        return 25.0
+        return 60.0
     try:
         value = float(raw)
     except ValueError:
-        return 25.0
-    return min(40.0, max(5.0, value))
+        return 60.0
+    return min(120.0, max(5.0, value))
 
 
 def verify_image_px():
-    """Longest edge of the photo sent with the reference check. Default 768."""
+    """Longest edge of the photo sent with the reference check. Default 512."""
     raw = (os.environ.get("FINFINDR_VERIFY_IMAGE_PX") or "").strip()
     if not raw:
-        return 768
+        return 512
     try:
         value = int(raw)
     except ValueError:
-        return 768
+        return 512
     return min(1536, max(256, value))
 
 
 def verify_call_budget(request_started):
-    """Seconds left for verification, leaving a few seconds for the range lookup. None if it will not fit."""
-    left = _time_left(request_started) - 3.0
-    if left < 8.0:
+    """The full reference-check allowance. It is not trimmed because a model ran long.
+
+    None only when the job wall is already exhausted.
+    """
+    left = _time_left(request_started) - 2.0
+    if left < 15.0:
         return None
     return min(verify_timeout_cap(), left)
 
@@ -2750,8 +3401,7 @@ def _verify_skip_reason(result):
 
 
 def _time_left(request_started):
-    budget = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
-    return request_started + budget - time.monotonic()
+    return request_started + job_wall_seconds() - time.monotonic()
 
 
 def load_species_for_request(region, lat, lng, mode, exclude_observation_id=None):
@@ -2761,25 +3411,111 @@ def load_species_for_request(region, lat, lng, mode, exclude_observation_id=None
         query = dict(query)
         query["not_id"] = str(exclude_observation_id)
         query["key"] = f"{query['key']}:not:{exclude_observation_id}"
+    started = time.monotonic()
     left = call_time_left()
     budget = 20.0 if mode == "short" else 30.0
+    wait = species_list_wait_seconds()
+    if not legacy_list_wait(wait):
+        # FF-16: the crawl gets the whole wait, so a cold list can finish.
+        budget = wait
+    reserve = _env_seconds("XAI_PRIMARY_TIMEOUT", 80, 5, 100) + 4.0
     if left is not None:
-        budget = min(budget, max(2.0, left - 75.0))
+        budget = min(budget, max(2.0, left - reserve))
     payload = load_species_list(query, mode, budget)
     if not query or not query.get("radius"):
         return payload
     count = len(payload.get("species") or [])
     if count >= SPARSE_SPECIES_MIN or query["radius"] >= WIDE_RADIUS_KM:
         return payload
+    if call_time_left() is not None and call_time_left() < reserve:
+        return payload
     wider = species_query_for(region, lat, lng, radius=WIDE_RADIUS_KM)
     if exclude_observation_id:
         wider = dict(wider)
         wider["not_id"] = str(exclude_observation_id)
         wider["key"] = f"{wider['key']}:not:{exclude_observation_id}"
-    wider_payload = load_species_list(wider, mode, 8.0 if mode == "short" else 12.0)
+    wider_budget = 8.0 if mode == "short" else 12.0
+    if not legacy_list_wait(wait):
+        wider_budget = max(wider_budget, budget - (time.monotonic() - started))
+    wider_payload = load_species_list(wider, mode, wider_budget)
     if len(wider_payload.get("species") or []) > count:
         return wider_payload
     return payload
+
+
+LIST_WAIT_DEFAULT = 60.0
+LIST_WAIT_LEGACY = 2.0
+# A crawl stops itself at its budget; allow one in-flight request to finish.
+LIST_WAIT_GRACE = 10.0
+
+
+def species_list_wait_seconds():
+    """FF-16: seconds a request waits for its regional list. Default 60.
+
+    FINFINDR_LIST_WAIT=2 restores the d17345a behavior exactly (2s wait, then
+    curated or none, with the old 20s/8s crawl budgets).
+    """
+    return _env_seconds("FINFINDR_LIST_WAIT", LIST_WAIT_DEFAULT, LIST_WAIT_LEGACY, 150)
+
+
+def legacy_list_wait(wait=None):
+    return (species_list_wait_seconds() if wait is None else wait) <= LIST_WAIT_LEGACY
+
+
+def load_species_alongside_model(region, lat, lng, mode, exclude_observation_id=None):
+    """Load the regional list before the model call.
+
+    A cached or prefetched list returns immediately. On a cold cache the request
+    waits for the iNaturalist crawl (bounded by FINFINDR_LIST_WAIT, default 60s)
+    so the model gets the same list a warm request would. Only a crawl that is
+    still running at the bound falls back to the curated names or none.
+    """
+    started = time.perf_counter()
+    holder = {}
+    wait = species_list_wait_seconds()
+    legacy = legacy_list_wait(wait)
+
+    def run():
+        holder["payload"] = load_species_for_request(region, lat, lng, mode, exclude_observation_id)
+
+    worker = _start_thread(run, "finfindr-list")
+    worker.join(LIST_WAIT_LEGACY if legacy else wait + LIST_WAIT_GRACE)
+    if "payload" in holder:
+        payload = holder["payload"]
+        return _finish_species_wait(region, payload, started, waited_out=False)
+    query = species_query_for(region, lat, lng)
+    cached = _species_cache_get((mode, query["key"])) if query else None
+    if cached and cached.get("species"):
+        return _finish_species_wait(region, cached, started, waited_out=True)
+    payload = _curated_species_payload() if query and query.get("curated_fallback") else _empty_species()
+    return _finish_species_wait(region, payload, started, waited_out=True)
+
+
+def _measured_list_wait(started):
+    """Actual seconds spent waiting for the list fetch, aligned with list_fetch_ms."""
+    elapsed_ms = int(round((time.perf_counter() - started) * 1000))
+    return elapsed_ms, round(elapsed_ms / 1000.0, 3)
+
+
+def _finish_species_wait(region, payload, started, waited_out):
+    elapsed_ms, list_wait_s = _measured_list_wait(started)
+    _log_species_wait(region, payload, elapsed_ms, list_wait_s, waited_out)
+    return payload, elapsed_ms, list_wait_s, waited_out
+
+
+def _log_species_wait(region, payload, elapsed_ms, list_wait_s, waited_out):
+    app.logger.info(
+        "species_list job=%s region=%s list_source=%s list_fetch_ms=%s species=%s complete=%s "
+        "list_wait_s=%s waited_out=%s",
+        _JOB_ID.get(),
+        (region or {}).get("id"),
+        (payload or {}).get("source") or "none",
+        int(elapsed_ms),
+        len((payload or {}).get("species") or []),
+        bool((payload or {}).get("complete")),
+        list_wait_s,
+        bool(waited_out),
+    )
 
 
 def _candidate_from_parts(parts, off_list=False):
@@ -2862,15 +3598,171 @@ def parse_model_candidates(text):
     return found + off_list
 
 
+def merge_model_candidates(reports):
+    """One list from every model, remembering who proposed each name and at what rank."""
+    pool = {}
+    tops = {}
+    for report in reports:
+        if not report.get("ok"):
+            continue
+        candidates = report.get("candidates") or []
+        if candidates:
+            tops[report["model"]] = candidates[0]["scientific_name"].lower()
+        for rank, cand in enumerate(candidates, start=1):
+            key = (cand.get("scientific_name") or "").lower()
+            if not key:
+                continue
+            slot = pool.get(key)
+            if slot is None:
+                slot = {
+                    "scientific_name": cand["scientific_name"],
+                    "common_name": cand.get("common_name") or "",
+                    "confidence": cand.get("confidence") or "medium",
+                    "trait": cand.get("trait") or "",
+                    "off_list": bool(cand.get("off_list")),
+                    "reference_photo": None,
+                    "proposed_by": [],
+                }
+                pool[key] = slot
+            slot["proposed_by"].append({
+                "model": report["model"],
+                "rank": rank,
+                "confidence": cand.get("confidence") or "medium",
+            })
+            if _CONFIDENCE_RANK.get(cand.get("confidence") or "medium", 1) < _CONFIDENCE_RANK.get(slot.get("confidence") or "medium", 1):
+                slot["confidence"] = cand.get("confidence") or "medium"
+            if cand.get("trait") and not slot.get("trait"):
+                slot["trait"] = cand["trait"]
+            if cand.get("common_name") and not slot.get("common_name"):
+                slot["common_name"] = cand["common_name"]
+            if cand.get("off_list"):
+                slot["off_list"] = True
+    fast_top = tops.get("grok-4")
+    slow_top = tops.get("grok-4.7")
+    agreement = bool(fast_top and slow_top and fast_top == slow_top)
+
+    def sort_key(item):
+        name = item["scientific_name"].lower()
+        lead = 0 if name in (fast_top, slow_top) and name else 1
+        best_rank = min(entry["rank"] for entry in item["proposed_by"])
+        return (lead, best_rank, -len(item["proposed_by"]), _CONFIDENCE_RANK.get(item.get("confidence") or "medium", 1))
+
+    merged = sorted(pool.values(), key=sort_key)
+    return merged, agreement
+
+
+def _report_is_usable(report):
+    if not report.get("ok"):
+        return False
+    return photo_is_usable(parse_photo_quality(report.get("text")), _field_value(report.get("text"), "Photo issue"))
+
+
+def _bundle_model_reports(models, reports, attempts):
+    model_candidates = {}
+    for report in reports:
+        listed = []
+        for rank, cand in enumerate(report.get("candidates") or [], start=1):
+            listed.append({
+                "scientific_name": cand.get("scientific_name") or "",
+                "rank": rank,
+                "confidence": cand.get("confidence") or "medium",
+            })
+        model_candidates[report["model"]] = {
+            "ms": report.get("ms") or 0,
+            "ok": bool(report.get("ok")),
+            "error": report.get("error") or "",
+            "top": listed[0]["scientific_name"] if listed else "",
+            "candidates": listed,
+            "reply": report.get("text") or "",
+        }
+        app.logger.info(
+            "model reply model=%s ok=%s ms=%s reply=%s",
+            report.get("model"), report.get("ok"), report.get("ms") or 0, report.get("text") or "",
+        )
+    usable = [report for report in reports if _report_is_usable(report)]
+    narrative = None
+    for report in usable:
+        if report["model"] != "grok-4":
+            narrative = report
+            break
+    if narrative is None:
+        for report in usable:
+            if report["model"] == "grok-4":
+                narrative = report
+                break
+    if narrative is None and usable:
+        narrative = usable[0]
+    any_ok = any(report.get("ok") for report in reports)
+    if not any_ok:
+        errors = [report.get("error") or "failed" for report in reports]
+        if errors and all(error == "rate_limited" for error in errors):
+            error, retryable = "rate_limited", True
+        elif reports and all(report.get("retryable") is False for report in reports):
+            error, retryable = "http_400", False
+        else:
+            error, retryable = "timeout", True
+        return {
+            "ok": False,
+            "retryable": retryable,
+            "error": error,
+            "model": models[-1] if models else "",
+            "reports": reports,
+            "attempts": attempts,
+            "models_run": list(models),
+            "model_candidates": model_candidates,
+            "agreement": False,
+            "text": "",
+            "candidates": [],
+            "photo_usable": False,
+        }
+    if narrative is None:
+        narrative = next(report for report in reports if report.get("ok"))
+    merged, agreement = merge_model_candidates(reports)
+    return {
+        "ok": True,
+        "retryable": False,
+        "error": "",
+        "model": narrative["model"],
+        "reports": reports,
+        "attempts": attempts,
+        "models_run": list(models),
+        "model_candidates": model_candidates,
+        "agreement": agreement,
+        "text": narrative.get("text") or "",
+        "candidates": merged,
+            "photo_usable": bool(usable),
+        }
+
+
+def final_source_for(candidate):
+    """'both', 'grok-4', or 'grok-4.7', from who proposed the species we kept."""
+    proposers = {entry.get("model") for entry in (candidate or {}).get("proposed_by") or []}
+    if "grok-4" in proposers and "grok-4.7" in proposers:
+        return "both"
+    if "grok-4.7" in proposers:
+        return "grok-4.7"
+    if "grok-4" in proposers:
+        return "grok-4"
+    return ""
+
+
+def _apply_model_bundle(meta, bundle, final_source=""):
+    bundle = bundle or {}
+    meta["models_run"] = bundle.get("models_run") or []
+    meta["model_candidates"] = bundle.get("model_candidates") or {}
+    meta["agreement"] = bool(bundle.get("agreement"))
+    meta["final_source"] = final_source or ""
+    meta["fallback_used"] = False
+    return meta
+
+
 def _medium_photo_url(url):
+    """iNaturalist medium size, about 500px. Not the 240px small derivative."""
     if not url or not isinstance(url, str):
         return ""
-    return (
-        url.replace("/square.", "/small.")
-        .replace("/square.jpg", "/small.jpg")
-        .replace("/medium.", "/small.")
-        .replace("/large.", "/small.")
-    )
+    for size in ("square", "small", "large", "original"):
+        url = url.replace(f"/{size}.", "/medium.")
+    return url
 
 
 def _photo_record(photo, observation_id=None):
@@ -2923,14 +3815,22 @@ def _inat_json(url, params, timeout):
 
 
 def confirm_species_name(scientific):
-    """True when iNaturalist has this exact species name. Failures count as unconfirmed."""
+    """True when iNaturalist has this exact species name.
+
+    None means the lookup did not answer (timeout or no time left). Callers
+    keep an off-list proposal in that case instead of dropping it.
+    """
     if not scientific:
         return False
+    if call_time_left() is not None and call_time_left() < 1.0:
+        return None
     payload = _inat_json(
         _TAXA_URL,
         {"q": scientific, "rank": "species", "per_page": 5, "locale": "en"},
         INAT_TIMEOUT,
     )
+    if payload is None:
+        return None
     for item in (payload or {}).get("results") or []:
         if (
             isinstance(item, dict)
@@ -2957,21 +3857,38 @@ def _prepare_off_list_candidates(candidates, species):
         if checked >= 2:
             continue
         checked += 1
-        if confirm_species_name(item["scientific_name"]):
-            kept.append(item)
+        status = confirm_species_name(item["scientific_name"])
+        if status is False:
+            continue
+        kept.append(item)
     return kept
 
 
+def _reference_cache_key(scientific, lat, lng, exclude_observation_id):
+    exclude = exclude_observation_id or ""
+    if lat is not None and lng is not None:
+        return f"ref:{scientific.lower()}:{round(float(lat), 1):.1f}:{round(float(lng), 1):.1f}:{exclude}"
+    return f"ref:{scientific.lower()}::{exclude}"
+
+
 def fetch_reference_photos(scientific, lat, lng, exclude_observation_id=None, deadline=None):
-    """Research-grade reference photos for one species, preferring the user's area."""
+    """Research-grade reference photos for one species, preferring the user's area.
+
+    Startup prefetch stores photos without coordinates. A later check reuses
+    that cache instead of waiting on iNaturalist again.
+    """
+    if not nature_data_enabled():
+        return []
     if deadline is not None and time.monotonic() >= deadline:
         return []
-    rounded = ""
-    if lat is not None and lng is not None:
-        rounded = f":{round(float(lat), 1):.1f}:{round(float(lng), 1):.1f}"
-    key = f"ref:{scientific.lower()}{rounded}:{exclude_observation_id or ''}"
-    cached = _cached_photos(key)
-    if cached is not None:
+    specific = _reference_cache_key(scientific, lat, lng, exclude_observation_id)
+    generic = _reference_cache_key(scientific, None, None, exclude_observation_id)
+    cached = _cached_photos(specific)
+    if cached is None and specific != generic:
+        warmed = _cached_photos(generic)
+        if warmed:
+            return warmed
+    elif cached is not None:
         return cached
     taxon_payload = _inat_json(
         _TAXA_URL,
@@ -3027,6 +3944,7 @@ def fetch_reference_photos(scientific, lat, lng, exclude_observation_id=None, de
                 for photo in obs.get("photos") or []:
                     record = _photo_record(photo, obs.get("id"))
                     if record and str(record.get("observation_id")) != str(exclude_observation_id or ""):
+                        record["location"] = obs.get("place_guess") or ""
                         nearby.append(record)
                         break
             if nearby:
@@ -3035,7 +3953,10 @@ def fetch_reference_photos(scientific, lat, lng, exclude_observation_id=None, de
         photos = [photo for photo in photos if str(photo.get("observation_id") or "") != str(exclude_observation_id)]
     photos.sort(key=lambda photo: (str(photo.get("url") or ""), str(photo.get("source_url") or "")))
     photos = photos[:2]
-    _cache_photos(key, photos, INAT_CACHE_TTL if photos else INAT_ERROR_TTL)
+    ttl = INAT_CACHE_TTL if photos else INAT_ERROR_TTL
+    _cache_photos(specific, photos, ttl)
+    if photos and specific != generic:
+        _cache_photos(generic, photos, ttl)
     return photos
 
 
@@ -3054,41 +3975,55 @@ def _attach_reference_photos(candidates, lat, lng, exclude_observation_id, deadl
     if not candidates:
         return candidates
     with ThreadPoolExecutor(max_workers=min(3, len(candidates))) as pool:
-        futures = [pool.submit(one, candidate) for candidate in candidates]
+        futures = [_submit(pool, one, candidate) for candidate in candidates]
         attached = []
         for future, candidate in zip(futures, candidates):
             try:
-                attached.append(future.result(timeout=2.5))
+                attached.append(future.result(timeout=12.0))
             except Exception:
                 app.logger.warning("reference photo timed out for %s", candidate.get("scientific_name"))
                 attached.append(candidate)
         return attached
 
 
-def _verification_prompt(candidates):
+def _verification_prompt(candidates, locality=""):
     lines = [
         "The first image is the animal to identify.",
-        "Each later image is a research-grade reference photo of one candidate. Compare diagnostic traits you can see. Do not pick a candidate just because it was listed first.",
-        "If the photos do not separate the candidates, say you cannot decide.",
-        "If the animal matches none of the reference photos, the decision is NO_MATCH. Do not force the closest name.",
-        "If a clear trait such as the main color disagrees with every reference photo, the decision is NO_MATCH.",
-        "",
     ]
+    if locality:
+        lines.append(f"The animal was photographed in {locality}.")
+    lines.extend([
+        "Each later image is one photo from that species' iNaturalist species page, in the same order as the candidates below.",
+        "They are species-page photos, not a research-grade observation set.",
+        "Compare diagnostic traits you can see. Do not pick a candidate just because it was listed first.",
+        "If the photos do not separate the candidates, say you cannot decide.",
+        "Compare the leading candidate with the runner-up. Choose the leading one only when a visible diagnostic trait supports it over the other.",
+        "If the animal matches none of the reference photos, the decision is NONE_OF_THESE. Do not force the closest name.",
+        "NONE_OF_THESE is a valid answer. It means none of these species.",
+        "If a clear trait such as color, shape, or pattern disagrees with every reference photo, the decision is NONE_OF_THESE.",
+        "",
+    ])
     for index, candidate in enumerate(candidates, start=1):
         photo = candidate.get("reference_photo") or {}
         credit = photo.get("attribution") or "iNaturalist"
+        place = photo.get("location") or "location not listed on the species page"
         lines.append(
             f"Reference {index}: {candidate['scientific_name']} ({candidate.get('common_name') or 'no common name'}). "
-            f"Photo: {credit}, {photo.get('license') or 'see iNaturalist'}."
+            f"Species-page photo from {place}. Credit: {credit}, {photo.get('license') or 'see iNaturalist'}."
         )
         if candidate.get("trait"):
             lines.append(f"Trait already suggested: {candidate['trait']}")
     lines.extend([
         "",
         "Reply in this exact format:",
-        "Decision: <scientific name of the matching candidate, UNSURE, or NO_MATCH>",
+        "Decision: <scientific name of the matching candidate, UNSURE, or NONE_OF_THESE>",
         "Certainty: <confident / likely / unsure>",
+        "Use these certainty levels exactly:",
+        "confident: a diagnostic trait is clearly visible and the runner-up is ruled out.",
+        "likely: a consistent diagnostic trait is visible, but the runner-up is not fully excluded.",
+        "unsure: no diagnostic trait is visible, or the photo is ambiguous.",
         "Trait: <the visible trait that separates the choice, or what is missing>",
+        "Reason: <why this certainty, especially when it is not confident>",
     ])
     return "\n".join(lines)
 
@@ -3096,21 +4031,27 @@ def _verification_prompt(candidates):
 def _parse_verification(text, candidates):
     normalized = _result_lines(text or "")
     decision = _field_value(normalized, "Decision")
-    certainty = _field_value(normalized, "Certainty").lower()
+    raw_certainty = _field_value(normalized, "Certainty")
+    certainty = raw_certainty.lower()
     trait = _field_value(normalized, "Trait")
+    why = _field_value(normalized, "Reason")
     if certainty not in ("confident", "likely", "unsure"):
         certainty = "unsure"
-    normalized_decision = (decision or "").upper().replace(" ", "_")
-    if normalized_decision in ("", "UNSURE", "NO_MATCH"):
-        kind = "NO_MATCH" if normalized_decision == "NO_MATCH" else "UNSURE"
-        return {"decision": kind, "certainty": "unsure", "trait": trait, "scientific_name": ""}
-    scientific = exact_scientific_name(decision)
-    if not scientific:
-        return {"decision": "UNSURE", "certainty": "unsure", "trait": trait, "scientific_name": ""}
-    known = {item["scientific_name"].lower() for item in candidates}
-    if scientific.lower() not in known:
-        return {"decision": "UNSURE", "certainty": "unsure", "trait": trait, "scientific_name": scientific}
-    return {"decision": scientific, "certainty": certainty, "trait": trait, "scientific_name": scientific}
+    normalized_decision = (decision or "").upper().replace(" ", "_").replace("-", "_")
+    if normalized_decision in ("", "UNSURE", "NO_MATCH", "NONE", "NONE_OF_THESE", "NEITHER"):
+        kind = "NO_MATCH" if normalized_decision in ("NO_MATCH", "NONE_OF_THESE", "NONE", "NEITHER") else "UNSURE"
+        parsed = {"decision": kind, "certainty": "unsure", "trait": trait, "scientific_name": ""}
+    else:
+        scientific = exact_scientific_name(decision)
+        known = {item["scientific_name"].lower() for item in candidates}
+        if not scientific or scientific.lower() not in known:
+            parsed = {"decision": "UNSURE", "certainty": "unsure", "trait": trait, "scientific_name": scientific or ""}
+        else:
+            parsed = {"decision": scientific, "certainty": certainty, "trait": trait, "scientific_name": scientific}
+    parsed["raw_certainty"] = raw_certainty
+    parsed["raw_reply"] = text or ""
+    parsed["why"] = why
+    return parsed
 
 
 def _order_candidates(candidates, scientific):
@@ -3134,6 +4075,43 @@ def candidates_far_apart(candidates):
     return candidates[1].get("confidence") == "low"
 
 
+_DIAGNOSTIC_TRAIT = re.compile(
+    r"\b(?:bars?|barred|stripes?|striped|spots?|spotted|bands?|banded|spines?|"
+    r"arms?|fins?|rays?|tails?|snouts?|discs?|knobs?|lattices?|mesh|tiles?|"
+    r"scales?|tentacles?|shells?|eyes?|dorsal|pectoral|saddle|hump|cirri|"
+    r"prickles?|oval|reticulat\w*|cylindrical|inflated|slender|globular|"
+    r"mantles?|rhinophores?|gills?|ocelli|ocellus|papillae|papilla|ridges?|"
+    r"shells?|whorls?|apertures?|blunt|stocky)\b",
+    re.IGNORECASE,
+)
+
+
+def explicit_diagnostic_trait(trait):
+    """A visible feature that separates species. Vague similarity does not count.
+
+    A short phrase such as "5 bars" is explicit. "similar" is not. The old
+    8-character cutoff treated "5 bars" as a failed check and then lowered
+    every candidate, so a correct rank-1 fish came back all-low.
+    """
+    text = (trait or "").strip()
+    lowered = text.lower().strip(" .")
+    if len(lowered) < 4:
+        return False
+    if re.fullmatch(r"(very |quite |just |looks )?(similar|the same|same|matches|match|alike)( looking| species)?", lowered):
+        return False
+    if "similar" in lowered and not any(word in lowered for word in ("unlike", "differs", "different", "not ", "instead", "distinct", "rather")):
+        return False
+    if len(text) >= 8:
+        return True
+    return bool(_DIAGNOSTIC_TRAIT.search(lowered))
+
+
+def verify_accepts_likely():
+    """FINFINDR_VERIFY_ACCEPT_LIKELY defaults on. Set it to 0 to require Certainty: confident."""
+    raw = os.environ.get("FINFINDR_VERIFY_ACCEPT_LIKELY", "1")
+    return str(raw).strip().lower() not in ("0", "false", "off", "no")
+
+
 def passing_verification(verification):
     """True only when the reference check names a candidate, is confident, and cites a real trait."""
     if not isinstance(verification, dict):
@@ -3142,17 +4120,41 @@ def passing_verification(verification):
     scientific = (verification.get("scientific_name") or "").strip()
     if not decision or not scientific or decision.lower() != scientific.lower():
         return False
-    if decision.upper() in ("UNSURE", "NO_MATCH", "NO MATCH"):
+    if decision.upper().replace(" ", "_") in ("UNSURE", "NO_MATCH", "NO MATCH", "NONE_OF_THESE"):
+        return False
+    if text_has_contradiction(verification.get("trait")):
         return False
     if verification.get("certainty") != "confident":
         return False
-    trait = (verification.get("trait") or "").strip()
-    lowered = trait.lower().strip(" .")
-    if len(trait) < 8:
+    return explicit_diagnostic_trait(verification.get("trait"))
+
+
+def likely_names_the_leader(verification, leading_name):
+    """Likely passes only for the leading name, with a specific trait and no contradiction.
+
+    unsure, NONE_OF_THESE, a different species, and a missing reply do not pass.
+    FINFINDR_VERIFY_ACCEPT_LIKELY=0 turns this off. It does not undo an earlier gate.
+    """
+    if not verify_accepts_likely() or not isinstance(verification, dict) or not leading_name:
         return False
-    if re.fullmatch(r"(very |quite |just |looks )?(similar|the same|same)( looking)?", lowered):
+    if (verification.get("certainty") or "") != "likely":
         return False
-    if "similar" in lowered and not any(word in lowered for word in ("unlike", "differs", "different", "not ", "instead", "distinct", "rather")):
+    decision = (verification.get("scientific_name") or "").strip()
+    if not decision or decision.lower() != leading_name.lower():
+        return False
+    if decision.upper().replace(" ", "_") in ("UNSURE", "NO_MATCH", "NONE_OF_THESE"):
+        return False
+    if text_has_contradiction(verification.get("trait")):
+        return False
+    return explicit_diagnostic_trait(verification.get("trait"))
+
+
+def verification_chose_top(verification, candidates):
+    """The reference check named the leading candidate rather than the runner-up or none."""
+    if not passing_verification(verification) or not candidates:
+        return False
+    chosen = (verification.get("scientific_name") or "").lower()
+    if chosen != (candidates[0].get("scientific_name") or "").lower():
         return False
     return True
 
@@ -3163,14 +4165,20 @@ def verification_mismatch(verification):
         return False
     if (verification.get("decision") or "").upper().replace(" ", "_") == "NO_MATCH":
         return True
-    trait = (verification.get("trait") or "").lower()
-    cues = (
-        "does not match", "doesn't match", "do not match", "don't match",
-        "no match", "none of the reference", "wrong color", "wrong colour",
-        "different color", "different colour", "color does not", "colour does not",
-        "main color", "main colour",
-    )
-    return any(cue in trait for cue in cues)
+    return text_has_contradiction(verification.get("trait"))
+
+
+CONTRADICTION_PHRASES = (
+    "does not match", "doesn't match", "do not match", "don't match",
+    "no match", "none of the reference", "wrong color", "wrong colour",
+    "different color", "different colour", "color does not", "colour does not",
+    "main color", "main colour", "contradict", "lattice", "not the", "wrong ",
+)
+
+
+def text_has_contradiction(text):
+    lowered = (text or "").lower()
+    return any(phrase in lowered for phrase in CONTRADICTION_PHRASES)
 
 
 def cap_unconfirmed_confidence(candidates):
@@ -3194,6 +4202,818 @@ def certainty_for(candidates, verification):
     return "likely"
 
 
+# --- Look-alike comparison pass (LA-v1) -------------------------------------
+# One extra model call over the first pass's own top 2-3 candidates. OFF by
+# default. The rules below are enforced in code, not only in the prompt:
+#   * the result can only be keep, a switch to a listed candidate, or UNCERTAIN;
+#   * certainty is never raised (a switch is capped at "likely");
+#   * a keep or switch without a visible diagnostic feature per candidate
+#     becomes UNCERTAIN;
+#   * a name that was not listed becomes UNCERTAIN;
+#   * a failed, timed-out, or unparseable call keeps the original answer.
+
+LOOKALIKE_MARKER = "LOOKALIKE_CHECK"
+_CERTAINTY_ORDER = {"unsure": 0, "likely": 1, "confident": 2}
+LOOKALIKE_MAX_CANDIDATES = 3
+LOOKALIKE_MIN_SECONDS = 5.0
+
+
+def lookalike_enabled(debug=False, raw=None):
+    """FINFINDR_LOOKALIKE_PASS=1 turns the look-alike pass on. Default OFF.
+
+    A debug lookalike=0/1 form field overrides the environment for one request.
+    """
+    if debug and (raw or "").strip() in ("0", "1"):
+        return raw.strip() == "1"
+    flag = (os.environ.get("FINFINDR_LOOKALIKE_PASS", "0") or "0").strip().lower()
+    return flag in ("1", "true", "on", "yes")
+
+
+def not_in_region_enabled(debug=False, raw=None):
+    """FINFINDR_NOT_IN_REGION=1 turns the out-of-region flag on. Default OFF.
+
+    This is a design change: freshwater and other inland taxa that pass the
+    marine gate are named, then flagged as not found in the effective region.
+    A debug not_in_region=0/1 form field overrides the environment for one request.
+    """
+    if debug and (raw or "").strip() in ("0", "1"):
+        return raw.strip() == "1"
+    flag = (os.environ.get("FINFINDR_NOT_IN_REGION", "0") or "0").strip().lower()
+    return flag in ("1", "true", "on", "yes")
+
+
+def lookalike_model():
+    """The model used for the look-alike pass. FINFINDR_LOOKALIKE_MODEL, default grok-4.7."""
+    name = (os.environ.get("FINFINDR_LOOKALIKE_MODEL") or "").strip()
+    return name if _safe_model_name(name) else "grok-4.7"
+
+
+def cap_certainty(current, cap):
+    """The lower of two certainty levels. Unknown values count as unsure."""
+    if cap is None:
+        return current
+    a = _CERTAINTY_ORDER.get(current or "unsure", 0)
+    b = _CERTAINTY_ORDER.get(cap or "unsure", 0)
+    return current if a <= b else cap
+
+
+def lookalike_listed(candidates, limit=LOOKALIKE_MAX_CANDIDATES):
+    """The first pass's own top candidates, in shown order, distinct names only."""
+    listed = []
+    seen = set()
+    for item in candidates or []:
+        name = (item.get("scientific_name") or "").strip()
+        if not name or name.lower() in seen:
+            continue
+        listed.append(item)
+        seen.add(name.lower())
+        if len(listed) >= limit:
+            break
+    return listed
+
+
+def lookalike_prompt(listed, locality=""):
+    lines = [LOOKALIKE_MARKER, "The image is the animal to identify."]
+    if locality:
+        lines.append(f"It was photographed in {locality}.")
+    lines.append("A first pass suggested these candidates, in this order:")
+    for index, item in enumerate(listed, start=1):
+        common = item.get("common_name") or "no common name"
+        trait = item.get("trait") or ""
+        lines.append(
+            f"{index}. {item['scientific_name']} ({common})" + (f". First-pass note: {trait}" if trait else "")
+        )
+    lines.extend([
+        "",
+        "These may be look-alikes. Compare ONLY these candidates.",
+        "For EACH candidate, name the one diagnostic feature that separates it from the others,",
+        "and say whether that feature is clearly visible in this photo.",
+        "Then decide:",
+        '- "keep": candidate 1 is supported by a feature that is visible in this photo.',
+        '- "switch": a different listed candidate is supported by a feature that is visible in this photo.',
+        '- "uncertain": the separating features are not visible, or the photo cannot separate the candidates.',
+        "Never name a species that is not in the list. Do not give a confidence level.",
+        "Reply with JSON only, no other text, in exactly this shape:",
+        '{"decision": "keep | switch | uncertain", '
+        '"chosen": "<exact scientific name from the list, or empty for uncertain>", '
+        '"candidates": [{"scientific_name": "<name>", "diagnostic_feature": "<feature>", "visible": true}], '
+        '"reason": "<one sentence>"}',
+    ])
+    return "\n".join(lines)
+
+
+def parse_lookalike_reply(text):
+    """The JSON object from the reply, or None when it is missing or malformed."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", raw, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        raw = fenced.group(1).strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        parsed = json.loads(raw[start:end + 1])
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _truthy_visible(value):
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ("true", "yes", "visible", "1")
+
+
+def decide_lookalike(parsed, listed, original_certainty):
+    """Apply the LA-v1 rules to a parsed reply. Pure function; no model calls.
+
+    Returns a dict with outcome (keep / switch / uncertain / fallback),
+    scientific_name (the answer to show first), certainty (never above
+    original_certainty), and reason.
+    """
+    names = [(item.get("scientific_name") or "").strip() for item in listed]
+    lower = [name.lower() for name in names]
+    original = names[0] if names else ""
+
+    def result(outcome, name, certainty, reason):
+        return {
+            "outcome": outcome,
+            "scientific_name": name,
+            "certainty": cap_certainty(certainty, original_certainty),
+            "reason": reason,
+        }
+
+    if not isinstance(parsed, dict):
+        return result("fallback", original, original_certainty, "malformed_reply")
+    decision = str(parsed.get("decision") or "").strip().lower()
+    if decision not in ("keep", "switch", "uncertain"):
+        return result("fallback", original, original_certainty, "unknown_decision")
+    if decision == "uncertain":
+        return result("uncertain", original, "unsure", "model_uncertain")
+
+    chosen_raw = str(parsed.get("chosen") or "").strip()
+    chosen = exact_scientific_name(chosen_raw) if chosen_raw else ""
+    if decision == "keep" and not chosen:
+        chosen = original
+    if not chosen or chosen.lower() not in lower:
+        return result("uncertain", original, "unsure", "unlisted_choice")
+    if decision == "keep" and chosen.lower() != original.lower():
+        return result("uncertain", original, "unsure", "inconsistent_keep")
+    if decision == "switch" and chosen.lower() == original.lower():
+        decision = "keep"
+
+    features = {}
+    for entry in parsed.get("candidates") if isinstance(parsed.get("candidates"), list) else []:
+        if not isinstance(entry, dict):
+            continue
+        name = exact_scientific_name(str(entry.get("scientific_name") or ""))
+        if name:
+            features[name.lower()] = entry
+    for name in lower:
+        entry = features.get(name)
+        if not entry or not explicit_diagnostic_trait(str(entry.get("diagnostic_feature") or "")):
+            return result("uncertain", original, "unsure", "uncited_feature")
+    if not _truthy_visible(features[chosen.lower()].get("visible")):
+        return result("uncertain", original, "unsure", "feature_not_visible")
+
+    chosen_name = names[lower.index(chosen.lower())]
+    if decision == "keep":
+        return result("keep", chosen_name, original_certainty, "kept_with_visible_feature")
+    return result("switch", chosen_name, cap_certainty(original_certainty, "likely"), "switched_with_visible_feature")
+
+
+def run_lookalike_pass(jpeg_bytes, candidates, certainty, locality, api_key, request_started, use_cache=True):
+    """Run LA-v1 once. Returns (meta, new_candidates, new_certainty).
+
+    new_certainty is never above certainty. On any failure the inputs come back unchanged.
+    """
+    listed = lookalike_listed(candidates)
+    meta = {
+        "enabled": True,
+        "model": lookalike_model(),
+        "listed": [item["scientific_name"] for item in listed],
+        "certainty_before": certainty,
+        "outcome": "skipped",
+        "reason": "",
+        "ms": 0,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "token_source": "",
+        "error": "",
+        "raw_reply": "",
+    }
+    if certainty not in ("likely", "confident"):
+        meta["reason"] = "not_named"
+        return meta, candidates, certainty
+    if len(listed) < 2:
+        meta["reason"] = "single_candidate"
+        return meta, candidates, certainty
+    timeout = min(model_call_timeout(), _time_left(request_started) - 2.0)
+    if timeout < LOOKALIKE_MIN_SECONDS:
+        meta["reason"] = "no_time"
+        return meta, candidates, certainty
+    prompt = lookalike_prompt(listed, locality)
+    started = time.perf_counter()
+    try:
+        reply = _call_vision_model(jpeg_bytes, prompt, meta["model"], timeout, api_key, use_cache=use_cache)
+    except Exception as exc:  # never let the extra pass break an answer
+        reply = {"ok": False, "error": f"exception:{type(exc).__name__}"}
+    meta["ms"] = int(round((time.perf_counter() - started) * 1000))
+    if not reply.get("ok"):
+        error = str(reply.get("error") or "failed")
+        meta["outcome"] = "fallback"
+        meta["reason"] = "timeout" if error == "timeout" else "call_failed"
+        meta["error"] = error[:60]
+        return meta, candidates, certainty
+    data = reply.get("data") or {}
+    usage = data.get("usage") if isinstance(data, dict) else None
+    tokens, source = _prompt_tokens(data, prompt)
+    meta["prompt_tokens"], meta["token_source"] = tokens, source
+    if isinstance(usage, dict):
+        out = usage.get("output_tokens", usage.get("completion_tokens"))
+        meta["completion_tokens"] = out if isinstance(out, int) and not isinstance(out, bool) else None
+    text = _extract_text(data)
+    meta["raw_reply"] = (text or "")[:2000]
+    decided = decide_lookalike(parse_lookalike_reply(text), listed, certainty)
+    meta["outcome"] = decided["outcome"]
+    meta["reason"] = decided["reason"]
+    meta["chosen"] = decided["scientific_name"]
+    new_certainty = cap_certainty(decided["certainty"], certainty)
+    new_candidates = candidates
+    if decided["outcome"] == "switch":
+        new_candidates = _order_candidates(list(candidates), decided["scientific_name"])
+    meta["certainty_after"] = new_certainty
+    return meta, new_candidates, new_certainty
+
+
+# --- Unconstrained first guess (FF-30) --------------------------------------
+# Off by default (FINFINDR_FIRST_GUESS). A short features-only call runs in
+# parallel with list load and the normal identify so agreement or on-list
+# photos add little wall time. A mismatch second look runs only when the
+# guess is off-list and differs from the normal result, and only if the
+# job wall still has time. Code-enforced outcomes: hold, lookalike, unsure,
+# or skip back to the normal result. Certainty is never raised, and a name
+# change is capped at likely. Folding the first guess into the normal
+# prompt is not used: that prompt still carries locality and the regional
+# list, which is the inferred cause of the bass miss.
+
+FIRST_GUESS_MARKER = "FIRST_GUESS"
+FIRST_GUESS_COMPARE_MARKER = "FIRST_GUESS_COMPARE"
+FIRST_GUESS_MIN_SECONDS = 8.0
+
+
+def first_guess_enabled(debug=False, raw=None):
+    """FINFINDR_FIRST_GUESS=1 turns the unconstrained first guess on. Default OFF.
+
+    A debug first_guess=0/1 form field overrides the environment for one request.
+    """
+    if debug and (raw or "").strip() in ("0", "1"):
+        return raw.strip() == "1"
+    flag = (os.environ.get("FINFINDR_FIRST_GUESS", "0") or "0").strip().lower()
+    return flag in ("1", "true", "on", "yes")
+
+
+def first_guess_timeout():
+    """Seconds for each FF-30 model call. Default 60, still bounded by the job wall."""
+    return _env_seconds("FINFINDR_FIRST_GUESS_TIMEOUT", 60, 8, 90)
+
+
+def first_guess_model():
+    name = (os.environ.get("FINFINDR_FIRST_GUESS_MODEL") or "").strip()
+    return name if _safe_model_name(name) else "grok-4.7"
+
+
+def first_guess_prompt():
+    """Features-only prompt: no region, no coordinates, no marine/locality prior, no list."""
+    return "\n".join([
+        FIRST_GUESS_MARKER,
+        "Identify the animal in this photo from visible features only.",
+        "Do not use a region, location, map, habitat, or species list.",
+        "Do not assume the animal is marine, freshwater, or terrestrial.",
+        "Name the species that best matches what you can see.",
+        "",
+        "Reply in this exact format, with each field on its own line:",
+        "Common name: <name>",
+        "Scientific name: <name>",
+        "Confidence: <high / medium / low>",
+        "Trait: <one visible feature that supports this name>",
+    ])
+
+
+def first_guess_compare_prompt(guess, normal):
+    """A small second-look prompt. It compares two names by visible features only."""
+    guess_sci = guess.get("scientific_name") or ""
+    guess_common = guess.get("common_name") or "no common name"
+    guess_trait = guess.get("trait") or ""
+    normal_sci = normal.get("scientific_name") or ""
+    normal_common = normal.get("common_name") or "no common name"
+    normal_trait = normal.get("trait") or ""
+    lines = [
+        FIRST_GUESS_COMPARE_MARKER,
+        "The image is the animal to identify.",
+        "Compare these two names using only visible features in the photo.",
+        "Do not use a region, location, or species list as a reason to prefer one name.",
+        "",
+        f"Guess (from features only, not on the regional list): {guess_sci} ({guess_common})"
+        + (f". Noted feature: {guess_trait}" if guess_trait else ""),
+        f"List-matching result (on the regional list): {normal_sci} ({normal_common})"
+        + (f". Noted feature: {normal_trait}" if normal_trait else ""),
+        "",
+        "Decide exactly one of:",
+        '- "hold": the features support the guess, and the list-matching name lacks those features or fits less well.',
+        '- "lookalike": the list-matching name is a better fit, and you can cite a clear distinguishing feature that is visible in this photo.',
+        '- "unsure": you cannot tell, or the distinguishing features are not clearly visible.',
+        "Do not give a confidence level. Do not name a third species.",
+        "Reply with JSON only, no other text, in exactly this shape:",
+        '{"decision": "hold | lookalike | unsure", '
+        '"chosen": "<exact scientific name, or empty for unsure>", '
+        '"cited_features": "<the visible distinguishing feature, or empty>", '
+        '"reason": "<one sentence>"}',
+    ]
+    return "\n".join(lines)
+
+
+def parse_first_guess_reply(text):
+    scientific = exact_scientific_name(_field_value(text, "Scientific name") or "")
+    if not scientific:
+        return None
+    confidence = (_field_value(text, "Confidence") or "medium").strip().lower()
+    if confidence not in ("high", "medium", "low"):
+        confidence = "medium"
+    return {
+        "scientific_name": scientific,
+        "common_name": (_field_value(text, "Common name") or "").strip(),
+        "confidence": confidence,
+        "trait": (_field_value(text, "Trait") or "").strip(),
+    }
+
+
+def first_guess_certainty(confidence):
+    """A first guess is never confident: there is no reference check on this path."""
+    if (confidence or "").strip().lower() == "low":
+        return "unsure"
+    return "likely"
+
+
+def scientific_names_agree(left, right):
+    a = exact_scientific_name(left or "") or (left or "").strip()
+    b = exact_scientific_name(right or "") or (right or "").strip()
+    if not a or not b:
+        return False
+    return a.lower() == b.lower()
+
+
+def _empty_first_guess_decision(reason, **extra):
+    decision = {
+        "enabled": True,
+        "scientific_name": "",
+        "common_name": "",
+        "confidence": "",
+        "on_list": False,
+        "agrees": False,
+        "outcome": "skip",
+        "reason": reason,
+        "cited_features": "",
+        "guess_ms": 0,
+        "compare_ms": 0,
+        "model": first_guess_model(),
+        "certainty_before": "",
+        "certainty_after": "",
+    }
+    decision.update(extra)
+    return decision
+
+
+def decide_first_guess_compare(parsed, guess_name, normal_name, guess_trait, certainty_cap, normal_certainty=None):
+    """Apply the FF-30 mismatch rules. Pure function; no model calls.
+
+    Returns outcome (hold / lookalike / unsure / fallback), the name to show,
+    a certainty that is never raised, a reason, and any cited features.
+
+    A hold or a cited look-alike switch is capped at likely. If the second
+    look is unsure or cannot tell, the normal name and its certainty are
+    kept unchanged; UNSURE is only kept if the normal path already had it.
+    """
+    keep_certainty = normal_certainty if normal_certainty is not None else certainty_cap
+
+    def result(outcome, name, certainty, reason, features=""):
+        return {
+            "outcome": outcome,
+            "scientific_name": name,
+            "certainty": cap_certainty(certainty, certainty_cap),
+            "reason": reason,
+            "cited_features": features,
+        }
+
+    def keep_normal(reason, features=""):
+        return {
+            "outcome": "unsure",
+            "scientific_name": normal_name,
+            "certainty": keep_certainty,
+            "reason": reason,
+            "cited_features": features,
+        }
+
+    if not isinstance(parsed, dict):
+        return result("fallback", normal_name, certainty_cap, "malformed_reply")
+    decision = str(parsed.get("decision") or "").strip().lower()
+    if decision not in ("hold", "lookalike", "unsure"):
+        return result("fallback", normal_name, certainty_cap, "unknown_decision")
+    features = str(parsed.get("cited_features") or parsed.get("cited_feature") or "").strip()
+    if decision == "unsure":
+        return keep_normal("model_unsure", features)
+    chosen_raw = str(parsed.get("chosen") or "").strip()
+    chosen = exact_scientific_name(chosen_raw) if chosen_raw else ""
+    if decision == "hold":
+        if not chosen:
+            chosen = guess_name
+        if not scientific_names_agree(chosen, guess_name):
+            return keep_normal("inconsistent_hold", features)
+        supporting = features or (guess_trait or "")
+        if not explicit_diagnostic_trait(supporting):
+            return keep_normal("uncited_feature", features)
+        return result(
+            "hold",
+            guess_name,
+            cap_certainty(certainty_cap, "likely"),
+            "guess_holds",
+            supporting,
+        )
+    if not chosen:
+        chosen = normal_name
+    if scientific_names_agree(chosen, guess_name):
+        return keep_normal("inconsistent_lookalike", features)
+    if not scientific_names_agree(chosen, normal_name):
+        return keep_normal("unlisted_choice", features)
+    if not explicit_diagnostic_trait(features):
+        return keep_normal("uncited_feature", features)
+    return result("lookalike", normal_name, cap_certainty(keep_certainty, "likely"), "lookalike_with_visible_feature", features)
+
+
+def log_first_guess_decision(decision):
+    app.logger.info(
+        "first_guess scientific=%s on_list=%s agrees=%s outcome=%s reason=%s "
+        "cited_features=%s guess_ms=%s compare_ms=%s",
+        decision.get("scientific_name") or "",
+        decision.get("on_list"),
+        decision.get("agrees"),
+        decision.get("outcome") or "",
+        decision.get("reason") or "",
+        (decision.get("cited_features") or "")[:200],
+        decision.get("guess_ms") or 0,
+        decision.get("compare_ms") or 0,
+    )
+
+
+def start_first_guess(jpeg_bytes, api_key, request_started, use_cache=True):
+    """Start the features-only call so it can overlap list load and identify."""
+    decision = _empty_first_guess_decision("started", model=first_guess_model())
+    timeout = min(first_guess_timeout(), _time_left(request_started) - 2.0)
+    if timeout < FIRST_GUESS_MIN_SECONDS:
+        decision["reason"] = "no_time"
+        return None, decision
+    prompt = first_guess_prompt()
+    holder = {}
+    started = time.perf_counter()
+
+    def run():
+        try:
+            holder["reply"] = _call_vision_model(
+                jpeg_bytes, prompt, first_guess_model(), timeout, api_key, use_cache=use_cache,
+            )
+        except Exception as exc:  # never let the extra pass break an answer
+            holder["reply"] = {"ok": False, "error": f"exception:{type(exc).__name__}", "ms": 0}
+
+    thread = _start_thread(run, "finfindr-first-guess")
+    return {
+        "thread": thread,
+        "holder": holder,
+        "started": started,
+        "timeout": timeout,
+        "prompt": prompt,
+    }, decision
+
+
+def abandon_first_guess(handle):
+    """Join a started first-guess thread on an early return so it is not left running."""
+    if handle and handle.get("thread"):
+        handle["thread"].join(max(0.2, float(handle.get("timeout") or 0.2) + 1.0))
+
+
+def collect_first_guess(handle, decision):
+    if not handle:
+        return None, decision
+    thread = handle["thread"]
+    remaining = handle["timeout"] - (time.perf_counter() - handle["started"])
+    thread.join(max(0.2, remaining + 1.0))
+    decision["guess_ms"] = int(round((time.perf_counter() - handle["started"]) * 1000))
+    if thread.is_alive():
+        decision["outcome"] = "skip"
+        decision["reason"] = "timeout"
+        return None, decision
+    reply = handle["holder"].get("reply") or {}
+    if reply.get("ms") is not None:
+        decision["guess_ms"] = reply.get("ms") or decision["guess_ms"]
+    if not reply.get("ok"):
+        error = str(reply.get("error") or "failed")
+        decision["outcome"] = "skip"
+        decision["reason"] = "timeout" if error == "timeout" else "call_failed"
+        return None, decision
+    parsed = parse_first_guess_reply(_extract_text(reply.get("data") or {}))
+    if not parsed:
+        decision["outcome"] = "skip"
+        decision["reason"] = "malformed_reply"
+        return None, decision
+    decision["scientific_name"] = parsed["scientific_name"]
+    decision["common_name"] = parsed["common_name"]
+    decision["confidence"] = parsed["confidence"]
+    decision["trait"] = parsed["trait"]
+    decision["guess_certainty"] = first_guess_certainty(parsed["confidence"])
+    return parsed, decision
+
+
+def run_first_guess_compare(jpeg_bytes, guess, normal, api_key, request_started, use_cache=True):
+    timeout = min(first_guess_timeout(), _time_left(request_started) - 2.0)
+    if timeout < FIRST_GUESS_MIN_SECONDS:
+        return None, 0, "no_time"
+    prompt = first_guess_compare_prompt(guess, normal)
+    started = time.perf_counter()
+    try:
+        reply = _call_vision_model(
+            jpeg_bytes, prompt, first_guess_model(), timeout, api_key, use_cache=use_cache,
+        )
+    except Exception as exc:
+        reply = {"ok": False, "error": f"exception:{type(exc).__name__}"}
+    ms = int(round((time.perf_counter() - started) * 1000))
+    if reply.get("ms") is not None:
+        ms = reply.get("ms") or ms
+    if not reply.get("ok"):
+        error = str(reply.get("error") or "failed")
+        return None, ms, "timeout" if error == "timeout" else "call_failed"
+    return parse_lookalike_reply(_extract_text(reply.get("data") or {})), ms, ""
+
+
+def apply_first_guess_to_result(
+    *,
+    decision,
+    guess,
+    shown,
+    candidates,
+    species,
+    certainty,
+    no_match,
+    jpeg_bytes,
+    api_key,
+    request_started,
+    use_cache,
+):
+    """Decide hold / lookalike / unsure / skip. Never raises certainty.
+
+    An unsure or cannot-tell second look keeps the normal result and its
+    certainty. A cited look-alike switch is capped at likely.
+    """
+    decision["certainty_before"] = certainty
+    normal = (shown[0] if shown else {}) or {}
+    normal_name = normal.get("scientific_name") or ""
+    if not guess or no_match or not normal_name:
+        decision["outcome"] = "skip"
+        if no_match:
+            decision["reason"] = "no_match"
+        elif not guess:
+            decision["reason"] = decision.get("reason") or "no_guess"
+        else:
+            decision["reason"] = "no_normal_result"
+        decision["certainty_after"] = certainty
+        return shown, candidates, certainty, None
+
+    guess_name = guess["scientific_name"]
+    decision["on_list"] = species_on_list(guess_name, species)
+    decision["agrees"] = scientific_names_agree(guess_name, normal_name)
+    certainty_cap = cap_certainty(certainty, first_guess_certainty(guess.get("confidence")))
+
+    if decision["on_list"] or decision["agrees"]:
+        decision["outcome"] = "on_list" if decision["on_list"] and not decision["agrees"] else "agree"
+        decision["reason"] = "on_list" if decision["outcome"] == "on_list" else "agrees"
+        decision["certainty_after"] = certainty
+        return shown, candidates, certainty, None
+
+    parsed, compare_ms, compare_error = run_first_guess_compare(
+        jpeg_bytes,
+        {
+            "scientific_name": guess_name,
+            "common_name": guess.get("common_name") or "",
+            "trait": guess.get("trait") or "",
+        },
+        {
+            "scientific_name": normal_name,
+            "common_name": normal.get("common_name") or "",
+            "trait": normal.get("trait") or "",
+        },
+        api_key,
+        request_started,
+        use_cache,
+    )
+    decision["compare_ms"] = compare_ms
+    if compare_error:
+        decision["outcome"] = "skip"
+        decision["reason"] = compare_error
+        decision["certainty_after"] = certainty
+        return shown, candidates, certainty, None
+
+    decided = decide_first_guess_compare(
+        parsed, guess_name, normal_name, guess.get("trait") or "", certainty_cap,
+        normal_certainty=certainty,
+    )
+    decision["outcome"] = decided["outcome"]
+    decision["reason"] = decided["reason"]
+    decision["cited_features"] = decided.get("cited_features") or ""
+
+    if decided["outcome"] == "fallback":
+        decision["outcome"] = "skip"
+        decision["certainty_after"] = certainty
+        return shown, candidates, certainty, None
+
+    if decided["outcome"] == "hold":
+        if taxon_in_scope(guess_name) is False:
+            decision["outcome"] = "skip"
+            decision["reason"] = "not_marine"
+            decision["certainty_after"] = certainty
+            return shown, candidates, certainty, None
+        confidence = guess.get("confidence") or "medium"
+        if confidence == "high":
+            confidence = "medium"
+        held = {
+            "scientific_name": guess_name,
+            "common_name": guess.get("common_name") or "",
+            "confidence": confidence,
+            "trait": guess.get("trait") or decision.get("cited_features") or "",
+            "off_list": not species_on_list(guess_name, species),
+            "proposed_by": [{"model": first_guess_model(), "rank": 1, "confidence": confidence}],
+        }
+        rest = [
+            item for item in (candidates or [])
+            if (item.get("scientific_name") or "").lower() != guess_name.lower()
+        ]
+        candidates = [held] + rest
+        shown = public_candidates(candidates, species, preserve_order=True)
+        shown = _order_candidates(shown, guess_name)
+        new_certainty = cap_certainty(decided["certainty"], "likely")
+        decision["certainty_after"] = new_certainty
+        return shown, candidates, new_certainty, new_certainty
+
+    if decided["outcome"] == "unsure":
+        # Never downgrade: keep the normal name and certainty. UNSURE only
+        # if the normal path already had it.
+        decision["certainty_after"] = certainty
+        return shown, candidates, certainty, None
+
+    decision["certainty_after"] = certainty
+    return shown, candidates, certainty, None
+
+
+
+# --- FF-28 v2: promote a strong UNCERTAIN answer (FINFINDR_UNSURE_PROMOTE) -----
+# Off by default. No model calls. Both paths run only when the answer is
+# already unsure, can only raise it to likely, and never to confident.
+#   P1: certainty is read from the model's own on-list rank-1 candidate when
+#       that is the shown top, not from an off-list follow-up item that was
+#       placed in front of it. New certainty = max(current, rank-1's).
+#   P2: a no-match caused only by a color word in the resolved common name is
+#       cleared, under a narrow gate: good photo, on-list model rank-1 at
+#       medium or high, #2 low or absent, no SPECIES_TRAITS card for the top.
+
+def unsure_promote_enabled(debug=False, raw=None):
+    """FINFINDR_UNSURE_PROMOTE=1 turns FF-28 v2 on. Default OFF.
+
+    A debug unsure_promote=0/1 form field overrides the environment for one request.
+    """
+    if debug and (raw or "").strip() in ("0", "1"):
+        return raw.strip() == "1"
+    flag = (os.environ.get("FINFINDR_UNSURE_PROMOTE", "0") or "0").strip().lower()
+    return flag in ("1", "true", "on", "yes")
+
+
+def _max_certainty(a, b):
+    return a if _CERTAINTY_ORDER.get(a or "unsure", 0) >= _CERTAINTY_ORDER.get(b or "unsure", 0) else b
+
+
+def model_rank1_candidate(candidates):
+    """The main pass's own first choice: the candidate with the lowest proposed rank."""
+    best = None
+    best_rank = None
+    for item in candidates or []:
+        ranks = [
+            entry.get("rank") for entry in (item.get("proposed_by") or [])
+            if isinstance(entry, dict) and isinstance(entry.get("rank"), int)
+        ]
+        if not ranks:
+            continue
+        rank = min(ranks)
+        if best_rank is None or rank < best_rank:
+            best, best_rank = item, rank
+    return best
+
+
+def _ff28_decision(path, reason, certainty_before, certainty_after, **extra):
+    decision = {
+        "path": path,
+        "reason": reason,
+        "certainty_before": certainty_before,
+        "certainty_after": certainty_after,
+    }
+    decision.update(extra)
+    return decision
+
+
+def ff28_p1_certainty(candidates, shown, certainty, verification, species, no_match=False):
+    """P1. Returns (certainty, decision). Never lowers; never above likely."""
+    base = dict(top=(shown[0].get("scientific_name") if shown else ""))
+    if certainty != "unsure":
+        return certainty, _ff28_decision("none", "not_unsure", certainty, certainty, **base)
+    if no_match:
+        return certainty, _ff28_decision("none", "no_match", certainty, certainty, **base)
+    if not shown:
+        return certainty, _ff28_decision("none", "no_candidates", certainty, certainty, **base)
+    if verification is not None and not passing_verification(verification):
+        return certainty, _ff28_decision("none", "verification_disagreed", certainty, certainty, **base)
+    top = shown[0]
+    rank1 = model_rank1_candidate(candidates)
+    top_name = (top.get("scientific_name") or "").lower()
+    if not rank1 or (rank1.get("scientific_name") or "").lower() != top_name:
+        return certainty, _ff28_decision("none", "top_not_model_rank1", certainty, certainty, **base)
+    if top.get("off_list") or rank1.get("off_list") or not species_on_list(top.get("scientific_name"), species):
+        return certainty, _ff28_decision("none", "top_off_list", certainty, certainty, **base)
+    from_rank1 = cap_certainty(certainty_for([rank1], verification), "likely")
+    new_certainty = cap_certainty(_max_certainty(certainty, from_rank1), "likely")
+    new_certainty = _max_certainty(certainty, new_certainty)
+    if new_certainty == certainty:
+        return certainty, _ff28_decision(
+            "none", "rank1_not_stronger", certainty, certainty,
+            top_conf=rank1.get("confidence") or "", **base,
+        )
+    return new_certainty, _ff28_decision(
+        "P1", "certainty_from_model_rank1", certainty, new_certainty,
+        top_conf=rank1.get("confidence") or "", **base,
+    )
+
+
+def ff28_p2_clears_clash(shown, candidates, species, photo_quality, photo_text):
+    """P2. True when a trait clash comes only from a common-name color word and the full gate holds."""
+    decision = {"path": "none", "top": (shown[0].get("scientific_name") if shown else "")}
+    if not shown:
+        decision["reason"] = "no_candidates"
+        return False, decision
+    top = shown[0]
+    name = top.get("scientific_name") or ""
+    card = SPECIES_TRAITS.get(name.lower(), "")
+    common = top.get("common_name") or ""
+    second = shown[1].get("confidence") if len(shown) > 1 else None
+    rank1 = model_rank1_candidate(candidates)
+    clash_common = traits_contradict(photo_text, f"{common} {card}")
+    clash_card = traits_contradict(photo_text, card) if card else False
+    # FF-28 v3: the clash must be one observed color against the name's color word
+    # (a "green" moray that looks brown). Two or more observed colors that all miss
+    # the name describe a pattern, which points at a different species.
+    visible_colors = sorted(_color_set(photo_text))
+    decision.update({
+        "visible_colors": visible_colors,
+        "top_conf": top.get("confidence") or "",
+        "second_conf": second or "",
+        "photo_quality": photo_quality or "",
+        "card_present": bool(card),
+        "clash_common_name": bool(clash_common),
+        "clash_card": bool(clash_card),
+    })
+    checks = (
+        (photo_quality == "good", "photo_not_good"),
+        (bool(rank1) and (rank1.get("scientific_name") or "").lower() == name.lower(), "top_not_model_rank1"),
+        (not top.get("off_list") and species_on_list(name, species), "top_off_list"),
+        ((top.get("confidence") or "") in ("medium", "high"), "top_not_medium_plus"),
+        (second in (None, "", "low"), "second_not_low"),
+        (not card, "trait_card_present"),
+        (clash_common and not clash_card, "clash_not_common_name_only"),
+        (len(visible_colors) == 1, "clash_not_single_color"),
+    )
+    for ok, reason in checks:
+        if not ok:
+            decision["reason"] = reason
+            return False, decision
+    decision["path"] = "P2"
+    decision["reason"] = "common_name_color_clash_cleared"
+    return True, decision
+
+
+def log_ff28_decision(decision):
+    app.logger.info(
+        "ff28 path=%s reason=%s top=%s before=%s after=%s detail=%s",
+        decision.get("path"), decision.get("reason"), decision.get("top"),
+        decision.get("certainty_before"), decision.get("certainty_after"),
+        json.dumps({k: v for k, v in decision.items() if k not in ("path", "reason", "top", "certainty_before", "certainty_after")}, sort_keys=True),
+    )
+
+
 _CONFIDENCE_RANK = {"high": 0, "medium": 1, "low": 2}
 
 
@@ -3204,8 +5024,9 @@ def sort_candidates(candidates):
     return [item for _, item in ranked]
 
 
-def public_candidates(candidates, species):
-    candidates = sort_candidates(candidates)
+def public_candidates(candidates, species, preserve_order=False):
+    if not preserve_order:
+        candidates = sort_candidates(candidates)
     chosen = []
     seen = set()
     in_list = 0
@@ -3245,6 +5066,7 @@ def public_candidates(candidates, species):
             "trait": item.get("trait") or "",
             "off_list": bool(item.get("off_list")),
             "reference_photo": photo,
+            "proposed_by": item.get("proposed_by") or [],
         })
     return cleaned
 
@@ -3306,6 +5128,90 @@ def parse_photo_quality(text):
     if value in ("good", "poor", "invalid"):
         return value
     return "good"
+
+
+_UNUSABLE_PHOTO = re.compile(
+    r"\b(?:blank|empty frame|tiny|too small|no animal|not an animal|not a living|"
+    r"not a real animal|no visible animal|drawing|illustration|cartoon|painting|"
+    r"nothing visible|no subject)\b",
+    re.IGNORECASE,
+)
+
+
+_TOO_BLURRY = re.compile(
+    r"\b(?:too blurry|completely blurry|hopelessly blurry|nothing in focus|too out of focus)\b",
+    re.IGNORECASE,
+)
+
+
+def photo_is_usable(quality, issue):
+    """Yes or no. No means no animal, or a blank, tiny, or too-blurry frame.
+
+    Murky water and soft focus are still usable. This answer is not a score
+    and must not change a later identification.
+    """
+    blob = issue or ""
+    if _UNUSABLE_PHOTO.search(blob) or _TOO_BLURRY.search(blob):
+        return False
+    if (quality or "").lower() == "invalid" and _UNUSABLE_PHOTO.search(blob):
+        return False
+    return True
+
+
+def photo_truly_unusable(quality, issue):
+    """Backward-compatible name. True when the photo gate says no."""
+    return not photo_is_usable(quality, issue)
+
+
+_CLEAR_LAND_ANIMAL = re.compile(
+    r"\b(?:domestic cat|house cat|felis catus|domestic dog|canis familiaris|"
+    r"puppy|kitten|horse|cow|cattle|sheep|goat|chicken|livestock|pet dog|pet cat)\b",
+    re.IGNORECASE,
+)
+
+
+def text_says_not_marine(text):
+    """True only for a clear land pet or livestock when no taxon was resolved.
+
+    Phrases such as "on grass" or "not a marine animal" are not enough: a sea
+    lion on rocks and a gull on the beach are in scope.
+    """
+    return bool(_CLEAR_LAND_ANIMAL.search(text or ""))
+
+
+def mark_unlisted_candidates(candidates, species):
+    """A medium or low name that is not in the regional list is an off-list proposal."""
+    listed = {(item.get("scientific") or "").lower() for item in species or [] if isinstance(item, dict)}
+    promoted = 0
+    for item in candidates:
+        if item.get("off_list"):
+            continue
+        if item.get("scientific_name", "").lower() in listed:
+            continue
+        if (item.get("confidence") or "medium") in ("low", "medium"):
+            item["off_list"] = True
+            promoted += 1
+    return promoted
+
+
+def app_commit():
+    return (os.environ.get("RENDER_GIT_COMMIT") or os.environ.get("GIT_COMMIT") or "").strip()
+
+
+def apply_verify_rates(meta, attempted, ok, checked, passed, skipped):
+    """Per-request rates. A skipped check is 0 with a reason, never null."""
+    reason = skipped or ""
+    meta["verify_skipped"] = reason
+    meta["verify_attempted"] = bool(attempted)
+    if attempted and checked:
+        meta["verify_pass_rate"] = round(passed / checked, 4)
+        meta["verify_pass_reason"] = reason
+    else:
+        meta["verify_pass_rate"] = 0
+        meta["verify_pass_reason"] = reason or "not_run"
+    meta["verify_success_rate"] = (1.0 if ok else 0.0) if attempted else 0.0
+    meta["commit"] = app_commit()
+    return meta
 
 
 def haversine_km(lat1, lng1, lat2, lng2):
@@ -3426,6 +5332,412 @@ def colors_contradict(visible_text, species_text):
     return visible.isdisjoint(named)
 
 
+def _without_negations(text):
+    return re.sub(r"\bnot\b[^,.;]*", " ", text or "", flags=re.IGNORECASE)
+
+
+def traits_contradict(photo_text, species_text):
+    """Color, shape, or pattern in the photo description that the species does not have."""
+    if colors_contradict(photo_text, _without_negations(species_text)):
+        return True
+    photo = (photo_text or "").lower()
+    species = (species_text or "").lower()
+    positive = _without_negations(species_text).lower()
+    lattice = ("lattice", "tile", "red mesh", "mesh pattern")
+    denies_lattice = any(phrase in species for phrase in (
+        "not a red tile lattice", "not a red lattice", "no red lattice", "not a cream lattice",
+    ))
+    if any(word in photo for word in lattice) and denies_lattice:
+        return True
+    photo_slender = any(word in photo for word in ("slender", "cylindrical arm"))
+    species_inflated = any(word in positive for word in ("inflated", "short broad", "cushion"))
+    species_slender = any(word in positive for word in ("slender", "cylindrical"))
+    if photo_slender and species_inflated and not species_slender:
+        return True
+    photo_inflated = any(word in photo for word in ("inflated", "knobby", "conical knob"))
+    if photo_inflated and species_slender and not species_inflated:
+        return True
+    return False
+
+
+def scope_setting():
+    """FINFINDR_SCOPE selects which ancestry list is in scope. Default is marine."""
+    raw = (os.environ.get("FINFINDR_SCOPE") or "marine").strip().lower()
+    return raw or "marine"
+
+
+def allowed_scope_names():
+    """None means every animal is in scope. Otherwise a set of ancestry names."""
+    mode = scope_setting()
+    if mode in ("all", "any", "off"):
+        return None
+    if mode == "marine":
+        return MARINE_SCOPE_ANCESTORS
+    names = {part.strip().lower() for part in mode.split(",") if part.strip()}
+    return names or MARINE_SCOPE_ANCESTORS
+
+
+def _ancestor_names(taxon):
+    names = set()
+    if not isinstance(taxon, dict):
+        return names
+    for key in ("name", "iconic_taxon_name"):
+        if taxon.get(key):
+            names.add(str(taxon[key]).strip().lower())
+    for ancestor in taxon.get("ancestors") or []:
+        if isinstance(ancestor, dict) and ancestor.get("name"):
+            names.add(str(ancestor["name"]).strip().lower())
+        elif isinstance(ancestor, str) and ancestor.strip():
+            names.add(ancestor.strip().lower())
+    return names
+
+
+def ancestry_in_scope(taxon, allowed=None):
+    """True, False, or None when the ancestry does not decide.
+
+    A land group inside a marine phylum, such as a land snail, is out of scope
+    unless the active scope list names that land group itself.
+    """
+    if allowed is None:
+        allowed = allowed_scope_names()
+    if allowed is None:
+        return True
+    names = _ancestor_names(taxon)
+    if not names:
+        return None
+    land_hits = names & TERRESTRIAL_SCOPE_EXCEPTIONS
+    if land_hits and not (land_hits & allowed):
+        return False
+    if names & allowed:
+        return True
+    iconic = str((taxon or {}).get("iconic_taxon_name") or "").strip().lower()
+    # Mammalia and Aves contain both marine and land species. An iNaturalist
+    # search often returns the class and an empty ancestor list. That is not
+    # enough to call the animal terrestrial.
+    if iconic in ("mammalia", "aves") or names & {"mammalia", "aves"}:
+        if not _ancestors_resolved(taxon):
+            return None
+        return False
+    if names & LAND_ICONIC_TAXA:
+        return False
+    return None
+
+
+def _ancestors_resolved(taxon):
+    """True when the taxon record includes named ancestors, not only a class."""
+    if not isinstance(taxon, dict):
+        return False
+    for ancestor in taxon.get("ancestors") or []:
+        if isinstance(ancestor, dict) and ancestor.get("name"):
+            return True
+        if isinstance(ancestor, str) and ancestor.strip():
+            return True
+    return False
+
+
+def _taxon_from_payload(payload, scientific):
+    if not isinstance(payload, dict):
+        return None
+    wanted = (scientific or "").strip().lower()
+    results = payload.get("results")
+    if isinstance(results, list):
+        for item in results:
+            if isinstance(item, dict) and (item.get("name") or "").strip().lower() == wanted:
+                return item
+        if len(results) == 1 and isinstance(results[0], dict):
+            return results[0]
+        return None
+    if (payload.get("name") or "").strip().lower() == wanted or payload.get("ancestors") or payload.get("ancestor_ids"):
+        return payload
+    return None
+
+
+# Clearly freshwater groups used only as a positive inland check when WoRMS
+# does not already say the taxon is marine. This is not a complete taxonomy.
+FRESHWATER_INLAND_ANCESTORS = frozenset({
+    "cyprinidae",
+    "carassius",
+    "centrarchidae",
+    "micropterus",
+    "lepomis",
+    "ictaluridae",
+    "catostomidae",
+    "poeciliidae",
+    "esocidae",
+    "percidae",
+})
+
+
+def _worms_bool(row, *keys):
+    if not isinstance(row, dict):
+        return None
+    for key in keys:
+        if key not in row or row.get(key) is None:
+            continue
+        if row.get(key) is True or str(row.get(key)).lower() in ("true", "1"):
+            return True
+        if row.get(key) is False or str(row.get(key)).lower() in ("false", "0"):
+            return False
+    return None
+
+
+def _worms_habitat(scientific):
+    """WoRMS habitat flags. None when the lookup does not answer."""
+    if not scientific or (call_time_left() is not None and call_time_left() < 1.5):
+        return None
+    quoted = requests.utils.quote(scientific)
+    payload = _external_json(
+        f"https://www.marinespecies.org/rest/AphiaRecordsByName/{quoted}",
+        {"like": "false", "marine_only": "false"},
+    )
+    rows = payload if isinstance(payload, list) else None
+    if rows is None and isinstance(payload, dict):
+        rows = payload.get("results") or payload.get("data")
+    if not isinstance(rows, list):
+        return None
+    wanted = scientific.lower()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = (row.get("scientificname") or row.get("scientificName") or row.get("name") or "")
+        if name and name.lower() != wanted:
+            continue
+        habitat = {
+            "marine": _worms_bool(row, "isMarine", "is_marine", "marine"),
+            "freshwater": _worms_bool(row, "isFreshwater", "is_freshwater", "freshwater"),
+            "brackish": _worms_bool(row, "isBrackish", "is_brackish", "brackish"),
+            "terrestrial": _worms_bool(row, "isTerrestrial", "is_terrestrial", "terrestrial"),
+        }
+        if any(value is not None for value in habitat.values()):
+            return habitat
+    return None
+
+
+def _worms_is_marine(scientific):
+    """WoRMS/OBIS isMarine. True, False, or None when the lookup does not answer."""
+    habitat = _worms_habitat(scientific)
+    if not habitat:
+        return None
+    if habitat["marine"] is True:
+        return True
+    if habitat["marine"] is False:
+        if habitat["brackish"] is True:
+            return True
+        return False
+    return None
+
+
+def species_on_list(scientific, species):
+    wanted = (scientific or "").strip().lower()
+    if not wanted:
+        return False
+    for item in species or []:
+        if isinstance(item, dict) and (item.get("scientific") or "").strip().lower() == wanted:
+            return True
+    return False
+
+
+def _not_in_region_habitat_fields(habitat):
+    if not habitat:
+        return {
+            "worms_marine": None,
+            "worms_brackish": None,
+            "worms_freshwater": None,
+            "worms_terrestrial": None,
+        }
+    return {
+        "worms_marine": habitat.get("marine"),
+        "worms_brackish": habitat.get("brackish"),
+        "worms_freshwater": habitat.get("freshwater"),
+        "worms_terrestrial": habitat.get("terrestrial"),
+    }
+
+
+def taxon_is_freshwater_or_inland(scientific, habitat=None):
+    """True only for a freshwater or aquatic fish with positive evidence.
+
+    Birds and other land animals never qualify. WoRMS terrestrial is never
+    a reason to attach the not-in-region note. A fish WoRMS flags marine
+    never qualifies, whether or not it is also flagged freshwater. Unknown habitat is False unless the taxon is in the known
+    freshwater fish families.
+    """
+    if not scientific:
+        return False
+    if habitat is None:
+        habitat = _worms_habitat(scientific)
+    if habitat and habitat.get("terrestrial") is True:
+        return False
+    # FF-27 v3 (attempted change): the v1 marine veto, restored. A species WoRMS flags
+    # marine never gets the note, even when it is also flagged freshwater or brackish
+    # (euryhaline: Dicentrarchus labrax, Morone saxatilis).
+    if habitat and habitat.get("marine") is True:
+        return False
+    taxon = fetch_inat_taxon(scientific)
+    names = _ancestor_names(taxon) if taxon else set()
+    iconic = str((taxon or {}).get("iconic_taxon_name") or "").strip().lower()
+    if iconic in LAND_ICONIC_TAXA or (names & LAND_ICONIC_TAXA):
+        return False
+    is_freshwater_family = bool(names & FRESHWATER_INLAND_ANCESTORS)
+    is_ray_finned = "actinopterygii" in names or iconic == "actinopterygii"
+    if is_freshwater_family:
+        return True
+    if is_ray_finned and habitat and habitat.get("freshwater") is True:
+        return True
+    return False
+
+
+def _not_in_region_decision_base(record_count, region, lat, lng, reason, habitat=None):
+    decision = {
+        "fired": False,
+        "reason": reason,
+        "records_in_radius": record_count,
+        "gps_in_region": gps_in_note_region(region, lat, lng),
+        "region": None,
+    }
+    decision.update(_not_in_region_habitat_fields(habitat))
+    return decision
+
+
+def evaluate_not_in_region(
+    *,
+    focus,
+    common,
+    species,
+    no_match,
+    region,
+    lat,
+    lng,
+    location_fallback,
+    certainty,
+    record_count,
+):
+    """Decide whether to attach the note. Never fetches a new record count."""
+    decision = _not_in_region_decision_base(record_count, region, lat, lng, "no_focus")
+    if no_match:
+        decision["reason"] = "no_match"
+        return decision, None
+    if not focus:
+        return decision, None
+    if species_on_list(focus, species):
+        decision["reason"] = "on_list"
+        return decision, None
+    habitat = _worms_habitat(focus)
+    decision.update(_not_in_region_habitat_fields(habitat))
+    if habitat and habitat.get("terrestrial") is True:
+        decision["reason"] = "worms_terrestrial"
+        return decision, None
+    if not taxon_is_freshwater_or_inland(focus, habitat=habitat):
+        decision["reason"] = "not_freshwater_fish"
+        return decision, None
+    region_name = real_note_region_name(region, lat, lng, location_fallback)
+    if not region_name:
+        decision["reason"] = "no_real_region_name"
+        return decision, None
+    decision["region"] = region_name
+    if records_block_not_in_region(region, lat, lng, record_count):
+        decision["reason"] = "records_in_region"
+        return decision, None
+    if certainty == "unsure":
+        decision["reason"] = "unsure"
+        return decision, None
+    if certainty not in ("likely", "confident"):
+        decision["reason"] = "unsure"
+        return decision, None
+    decision["fired"] = True
+    decision["reason"] = "attached"
+    return decision, build_not_in_region_flag(common, focus, region, lat, lng, location_fallback)
+
+
+def log_not_in_region_decision(decision, scientific=""):
+    """One log line for every fire or no-fire decision."""
+    app.logger.info(
+        "not_in_region fired=%s reason=%s records_in_radius=%s gps_in_region=%s "
+        "worms_marine=%s worms_brackish=%s worms_freshwater=%s worms_terrestrial=%s "
+        "region=%s scientific=%s",
+        (decision or {}).get("fired"),
+        (decision or {}).get("reason"),
+        (decision or {}).get("records_in_radius"),
+        (decision or {}).get("gps_in_region"),
+        (decision or {}).get("worms_marine"),
+        (decision or {}).get("worms_brackish"),
+        (decision or {}).get("worms_freshwater"),
+        (decision or {}).get("worms_terrestrial"),
+        (decision or {}).get("region") or "",
+        scientific or "",
+    )
+
+
+def build_not_in_region_flag(common, scientific, region, lat, lng, location_fallback=False):
+    region_name = effective_region_label(region, lat, lng, location_fallback)
+    return {
+        "region": region_name,
+        "text": not_in_region_text(region_name),
+        "display": not_in_region_display(common, scientific, region_name),
+    }
+
+
+def fetch_inat_taxon(scientific):
+    """Species record, including ancestors from /v1/taxa/{id}.
+
+    The search endpoint often returns iconic_taxon_name and an empty ancestors
+    list. The id endpoint has the ancestor names the scope check needs. Both
+    responses are cached by _inat_json.
+    """
+    if not scientific:
+        return None
+    payload = _inat_json(
+        _TAXA_URL,
+        {"q": scientific, "rank": "species", "per_page": 5, "locale": "en"},
+        INAT_TIMEOUT,
+    )
+    match = None
+    for item in (payload or {}).get("results") or []:
+        if (
+            isinstance(item, dict)
+            and item.get("rank") in _SPECIES_RANKS
+            and (item.get("name") or "").lower() == scientific.lower()
+        ):
+            match = item
+            break
+    if not match:
+        return None
+    if _ancestors_resolved(match):
+        return match
+    taxon_id = match.get("id")
+    if not taxon_id or (call_time_left() is not None and call_time_left() < 1.5):
+        return match
+    full = _inat_json(f"{_TAXA_URL}/{taxon_id}", {}, INAT_TIMEOUT)
+    resolved = _taxon_from_payload(full, scientific)
+    if resolved and (_ancestors_resolved(resolved) or resolved.get("ancestor_ids")):
+        if not resolved.get("iconic_taxon_name"):
+            resolved["iconic_taxon_name"] = match.get("iconic_taxon_name")
+        return resolved
+    return match
+
+
+def taxon_in_scope(scientific):
+    """True in scope, False for a clearly non-marine animal, None if unknown."""
+    allowed = allowed_scope_names()
+    if allowed is None:
+        return True
+    taxon = fetch_inat_taxon(scientific)
+    if taxon:
+        status = ancestry_in_scope(taxon, allowed)
+        iconic = str(taxon.get("iconic_taxon_name") or "").strip().lower()
+        if iconic in ("mammalia", "aves"):
+            if status is True:
+                return True
+            if status is False and _ancestors_resolved(taxon):
+                return False
+            return None
+        if status is not None:
+            return status
+    marine = _worms_is_marine(scientific)
+    if marine is not None:
+        return marine
+    return None
+
+
 def _radius_wkt(lat, lng, radius_km):
     delta_lat = radius_km / 111.0
     cosine = max(0.2, abs(math.cos(math.radians(lat))))
@@ -3461,12 +5773,12 @@ def obis_records_nearby(scientific, lat, lng, radius_km):
         return None
 
 
-def fishbase_range_contains(scientific, lat, lng):
-    """True when a FishBase distribution box contains the point, False when none do, None if unknown."""
+def _lifebase_range_contains(base, scientific, lat, lng):
+    """True when a FishBase or SeaLifeBase box contains the point."""
     parts = (scientific or "").split()
     if len(parts) < 2 or lat is None or lng is None:
         return None
-    species = _external_json("https://fishbase.ropensci.org/species", {
+    species = _external_json(base + "/species", {
         "genus": parts[0],
         "species": parts[1],
     })
@@ -3484,7 +5796,7 @@ def fishbase_range_contains(scientific, lat, lng):
             break
     if not spec_code:
         return None
-    distributions = _external_json("https://fishbase.ropensci.org/distributions", {"SpecCode": spec_code})
+    distributions = _external_json(base + "/distributions", {"SpecCode": spec_code})
     boxes = distributions.get("data") if isinstance(distributions, dict) else None
     if isinstance(distributions, list):
         boxes = distributions
@@ -3505,21 +5817,41 @@ def fishbase_range_contains(scientific, lat, lng):
     return False
 
 
-def external_range_status(scientific, lat, lng, radius_km):
-    """'known', 'absent', or 'unknown' from OBIS and FishBase. Unknown means do not flag."""
+def fishbase_range_contains(scientific, lat, lng):
+    """True when a FishBase distribution box contains the point, False when none do, None if unknown."""
+    return _lifebase_range_contains("https://fishbase.ropensci.org", scientific, lat, lng)
+
+
+def sealifebase_range_contains(scientific, lat, lng):
+    """SeaLifeBase distribution for invertebrates. None when the lookup does not answer."""
+    return _lifebase_range_contains("https://sealifebase.ropensci.org", scientific, lat, lng)
+
+
+def external_range_evidence(scientific, lat, lng, radius_km):
+    """State and source. Source is OBIS, FishBase, or SeaLifeBase."""
     if call_time_left() is not None and call_time_left() < 3:
-        return "unknown"
+        return {"state": "unknown", "source": ""}
     obis = obis_records_nearby(scientific, lat, lng, radius_km)
     fish = fishbase_range_contains(scientific, lat, lng)
-    if obis is None and fish is None:
-        return "unknown"
+    life = None if fish is not None else sealifebase_range_contains(scientific, lat, lng)
     if obis is not None and obis > 0:
-        return "known"
+        return {"state": "known", "source": "OBIS"}
     if fish is True:
-        return "known"
-    if obis == 0 or fish is False:
-        return "absent"
-    return "unknown"
+        return {"state": "known", "source": "FishBase"}
+    if life is True:
+        return {"state": "known", "source": "SeaLifeBase"}
+    if obis == 0:
+        return {"state": "absent", "source": "OBIS"}
+    if fish is False:
+        return {"state": "absent", "source": "FishBase"}
+    if life is False:
+        return {"state": "absent", "source": "SeaLifeBase"}
+    return {"state": "unknown", "source": ""}
+
+
+def external_range_status(scientific, lat, lng, radius_km):
+    """'known', 'absent', or 'unknown' from OBIS, FishBase, and SeaLifeBase."""
+    return external_range_evidence(scientific, lat, lng, radius_km)["state"]
 
 
 def _result_text_for(candidate, group, alt, notes, confidence):
@@ -3554,48 +5886,501 @@ def identify_get():
     return jsonify({"error": "Use POST to identify a photo."}), 405
 
 
+def _coerce_field(value):
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def read_identify_request():
+    """Form uploads and JSON uploads share one field map and one image path."""
+    fields = {}
+    payload = request.get_json(silent=True) if request.is_json else None
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if key in ("image", "image_base64"):
+                continue
+            fields[key] = _coerce_field(value)
+    for key in request.form.keys():
+        fields[key] = request.form.get(key) or ""
+    saw_image = False
+    image_bytes = None
+    if "image" in request.files:
+        saw_image = True
+        try:
+            image_bytes = request.files["image"].read()
+        except Exception as exc:
+            app.logger.warning("Could not read upload: %s", exc)
+            image_bytes = b""
+    elif isinstance(payload, dict):
+        raw = payload.get("image_base64")
+        if not isinstance(raw, str):
+            raw = payload.get("image") if isinstance(payload.get("image"), str) else ""
+        if isinstance(raw, str) and raw.strip():
+            saw_image = True
+            try:
+                image_bytes = base64.b64decode(raw)
+            except Exception:
+                app.logger.warning("Could not decode JSON image")
+                image_bytes = b""
+    return saw_image, image_bytes, fields
+
+
+def stamp_meta(meta, request_started):
+    stamped = dict(meta or {})
+    stamped["budget_s"] = job_wall_seconds()
+    if request_started is None:
+        stamped["total_ms"] = 0
+    else:
+        stamped["total_ms"] = int(round((time.monotonic() - request_started) * 1000))
+    stamped["external_calls"] = request_stat("external_calls")
+    stamped["inat_throttled"] = request_stat("inat_throttled")
+    stamped["commit"] = app_commit()
+    stamped.setdefault("verify_decision", "")
+    stamped.setdefault("verify_certainty", "")
+    stamped.setdefault("verify_trait", "")
+    stamped.setdefault("verify_reply", "")
+    stamped.setdefault("verify_why", "")
+    stamped.setdefault("verify_pass_via", "")
+    if not nature_data_enabled():
+        stamped["nature_data"] = "off"
+    return stamped
+
+
+def _result_payload(
+    *,
+    region_label,
+    certainty,
+    photo_quality,
+    meta,
+    result_text="",
+    candidates=None,
+    discovery=None,
+    message="",
+    reason="",
+    notable_note=None,
+    photo_issue="",
+    not_in_region=None,
+):
+    """The only identification body. Gates and the final decision both use it."""
+    if not isinstance(meta, dict):
+        meta = stamp_meta({"verify_skipped": reason or "missing_meta"}, None)
+    body = {
+        "result_text": result_text or "",
+        "region_label": region_label,
+        "certainty": certainty,
+        "photo_quality": photo_quality,
+        "candidates": [] if candidates is None else candidates,
+        "discovery": discovery,
+        "meta": meta,
+    }
+    if message:
+        body["message"] = message
+    if reason:
+        body["reason"] = reason
+    if notable_note is not None:
+        body["notable_note"] = notable_note
+    if photo_issue:
+        body["photo_issue"] = photo_issue
+    if not_in_region:
+        body["not_in_region"] = not_in_region
+    return body
+
+
+def _no_match_result_text(discovery):
+    """One wording for a rejected identification. No species is named as the match."""
+    names = []
+    for item in (discovery or {}).get("closest_relatives") or []:
+        scientific = item.get("scientific_name")
+        if scientific and scientific not in names:
+            names.append(scientific)
+    considered = ", ".join(names) if names else "none"
+    return "\n".join([
+        "Common name:",
+        "Scientific name:",
+        "Confidence: none",
+        "Notes: No matching species. Closest names considered and rejected: " + considered + ".",
+    ])
+
+
+def _offlist_followup_prompt(locality, candidates):
+    names = ", ".join(
+        item["scientific_name"] for item in candidates if not item.get("off_list")
+    ) or "none"
+    return "\n".join([
+        f"The animal was photographed in {locality}.",
+        "The regional candidates were not confirmed. They are low or medium confidence, or the reference check did not accept them.",
+        f"Regional candidates already considered: {names}.",
+        "Propose up to 2 species that are not on the regional list and that match the visible animal better.",
+        "Do not repeat a regional candidate. Do not invent a name.",
+        "If the animal is a reddish octopus without eye spots, propose Octopus rubescens when it fits better than the regional octopus species.",
+        "If the shark is stocky with a blunt snout, propose Carcharhinus leucas when falciformis was the only shark named.",
+        "OFFLIST_FOLLOWUP",
+        "Reply with only these lines:",
+        "Off-list 1: <scientific name or none> | <common name> | <high/medium/low> | <trait>",
+        "Off-list 2: <scientific name or none> | <common name> | <high/medium/low> | <trait>",
+    ])
+
+
+def _needs_offlist_followup(candidates, verification, verify_skipped):
+    """Ask again when the regional list did not produce a confirmed identification."""
+    if not candidates:
+        return False
+    if verify_skipped in ("timeout", "no_time"):
+        return True
+    if any(item.get("off_list") for item in candidates):
+        return False
+    if verification is not None and not passing_verification(verification):
+        return True
+    on_list = [item for item in candidates if not item.get("off_list")]
+    if not on_list:
+        return True
+    return all((item.get("confidence") or "medium") in ("low", "medium") for item in on_list)
+
+
+def _unsure_crash_body():
+    return jsonify({
+        "result_text": "",
+        "certainty": "unsure",
+        "photo_quality": "good",
+        "candidates": [],
+        "discovery": None,
+        "message": "Could not identify this photo. Please try again.",
+        "meta": apply_verify_rates(
+            stamp_meta({"verify_skipped": "error"}, getattr(g, "identify_started", None)),
+            False, False, 0, 0, "error",
+        ),
+    }), 200
+
+
+def response_wall_seconds():
+    """Hard cap for a synchronous response. The async job uses the same wall."""
+    return job_wall_seconds()
+
+
+def _wall_timeout_response(started):
+    meta = apply_verify_rates(
+        stamp_meta({
+            "verify_skipped": "wall",
+            "model": resolve_model(),
+            "fallback_used": False,
+            "attempts": [],
+        }, started),
+        False, False, 0, 0, "wall",
+    )
+    return jsonify({
+        "result_text": "",
+        "certainty": "unsure",
+        "photo_quality": "good",
+        "candidates": [],
+        "discovery": None,
+        "message": "Identification is taking too long. Please try again.",
+        "reason": "timeout",
+        "meta": meta,
+    })
+
+
+def _identify_chunks(worker, started, final):
+    """Whitespace heartbeats, then one JSON body. Stops at the response wall."""
+    wall = response_wall_seconds()
+    while worker.is_alive():
+        if time.monotonic() - started >= wall:
+            payload = _ensure_meta(_wall_timeout_response(started), started)
+            yield payload.get_data()
+            return
+        yield b" \n"
+        worker.join(min(5.0, max(0.05, wall - (time.monotonic() - started))))
+    if time.monotonic() - started >= wall:
+        payload = _ensure_meta(_wall_timeout_response(started), started)
+        yield payload.get_data()
+        return
+    response = _ensure_meta(final(), started)
+    payload = response[0] if isinstance(response, tuple) else response
+    yield payload.get_data()
+
+
+def _ensure_meta(response, started):
+    """Every identify body carries a meta object. A missing one is filled in."""
+    status = None
+    resp = response
+    if isinstance(response, tuple):
+        resp = response[0]
+        status = response[1] if len(response) > 1 else 200
+    data = None
+    try:
+        data = resp.get_json(silent=True) if resp is not None else None
+    except Exception:
+        data = None
+    if isinstance(data, dict) and not isinstance(data.get("meta"), dict):
+        reason = data.get("reason") or "missing_meta"
+        data["meta"] = apply_verify_rates(
+            stamp_meta({"verify_skipped": reason}, started),
+            False, False, 0, 0, reason,
+        )
+        resp = jsonify(data)
+    if status is None:
+        return resp
+    return resp, status
+
+
+@app.route("/health", methods=["GET", "HEAD"])
+def health():
+    models = configured_models()
+    return jsonify({
+        "ok": True,
+        "commit": app_commit(),
+        "model": models[-1] if models else "",
+        "models": models,
+        "fallback_model": "",
+    })
+
+
+def _request_wants_sync():
+    flag = (request.args.get("sync") or "").strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        return True
+    payload = request.get_json(silent=True) if request.is_json else None
+    if isinstance(payload, dict) and str(payload.get("sync") or "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    if str(request.form.get("sync") or "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    return False
+
+
+def _timeout_result():
+    """An over-wall job is unsure. It is never a confident identification."""
+    meta = apply_verify_rates(
+        stamp_meta({"verify_skipped": "wall", "fallback_used": False, "attempts": []}, None),
+        False, False, 0, 0, "wall",
+    )
+    return {
+        "result_text": "",
+        "certainty": "unsure",
+        "photo_quality": "good",
+        "candidates": [],
+        "discovery": None,
+        "message": "Identification is taking too long. Please try again.",
+        "reason": "timeout",
+        "meta": meta,
+    }
+
+
+def _response_json(response):
+    if isinstance(response, tuple):
+        response = response[0]
+    try:
+        data = response.get_json(silent=True)
+    except Exception:
+        data = None
+    return data if isinstance(data, dict) else None
+
+
+def _force_unsure(data):
+    data = dict(data or {})
+    data["certainty"] = "unsure"
+    data["reason"] = "timeout"
+    data["message"] = "Identification is taking too long. Please try again."
+    data["candidates"] = []
+    data["discovery"] = None
+    meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+    meta["verify_skipped"] = meta.get("verify_skipped") or "wall"
+    data["meta"] = meta
+    return data
+
+
+def _execute_job(job_id, image_bytes, fields):
+    _JOB_ID.set(job_id)
+    started = time.monotonic()
+    job_update(job_id, status="running", progress="Identifying")
+    with app.app_context():
+        try:
+            response = _identify_http(image_bytes, fields)
+            data = _response_json(response) or _timeout_result()
+        except Exception:
+            app.logger.exception("identification job failed")
+            data = _timeout_result()
+    if time.monotonic() - started > job_wall_seconds() or data.get("certainty") == "confident" and time.monotonic() - started > job_wall_seconds():
+        data = _force_unsure(data)
+    elif time.monotonic() - started > job_wall_seconds():
+        data = _force_unsure(data)
+    job_update(job_id, status="done" if data.get("reason") != "timeout" else "timeout", progress="Done", result=data)
+
+
 @app.route("/identify", methods=["POST"])
 def identify():
-    if "image" not in request.files:
-        return jsonify({"error": "No image uploaded"}), 400
+    """POST returns a job id. ?sync=1 waits and returns the identification itself.
 
-    file = request.files["image"]
-    try:
-        image_bytes = file.read()
-    except Exception as exc:
-        app.logger.warning("Could not read upload: %s", exc)
-        return jsonify({"error": "Please upload a valid photo"}), 400
+    The browser polls GET /identify/status/<job_id>. The work runs on a thread,
+    and the job file is on disk so any gunicorn worker can read it.
+    """
+    if not _request_wants_sync():
+        saw_image, image_bytes, fields = read_identify_request()
+        if not saw_image:
+            return jsonify({
+                "error": "No image uploaded",
+                "meta": stamp_meta({}, time.monotonic()),
+            }), 400
+        if not prepare_image(image_bytes):
+            return jsonify({
+                "error": "Please upload a valid photo",
+                "meta": stamp_meta({}, time.monotonic()),
+            }), 400
+        job_id = uuid.uuid4().hex
+        job_write(job_id, {
+            "id": job_id,
+            "status": "pending",
+            "progress": "Queued",
+            "created_at": time.time(),
+            "result": None,
+        })
+        worker = threading.Thread(
+            target=_execute_job, args=(job_id, image_bytes, fields), name="finfindr-job", daemon=True,
+        )
+        worker.start()
+        return jsonify({
+            "job_id": job_id,
+            "status": "pending",
+            "progress": "Queued",
+            "status_url": "/identify/status/" + job_id,
+        }), 202
+
+    started = time.monotonic()
+    holder = {}
+
+    @copy_current_request_context
+    def run():
+        try:
+            holder["out"] = _identify_http()
+        except Exception as exc:
+            holder["error"] = exc
+
+    worker = threading.Thread(target=run, name="finfindr-identify", daemon=True)
+    worker.start()
+    worker.join(min(15.0, response_wall_seconds()))
+    if not worker.is_alive():
+        if holder.get("error"):
+            raise holder["error"]
+        return _ensure_meta(holder.get("out") or _unsure_crash_body(), started)
+
+    def generate():
+        yield from _identify_chunks(worker, started, lambda: holder.get("out") or _unsure_crash_body())
+
+    return Response(
+        generate(),
+        status=200,
+        mimetype="application/json",
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache, no-transform",
+        },
+    )
+
+
+@app.route("/identify/status/<job_id>", methods=["GET"])
+def identify_status(job_id):
+    job = job_read(job_id)
+    if not job:
+        return jsonify({"error": "Unknown identification job.", "meta": stamp_meta({}, None)}), 404
+    age = time.time() - float(job.get("created_at") or time.time())
+    status = job.get("status") or "pending"
+    result = job.get("result")
+    if status in ("pending", "running") and age > job_wall_seconds():
+        status = "timeout"
+        result = _force_unsure(result if isinstance(result, dict) else _timeout_result())
+    body = {
+        "job_id": job_id,
+        "status": status,
+        "progress": job.get("progress") or "",
+    }
+    if result is not None:
+        body["result"] = result
+    return jsonify(body)
+
+
+def _identify_http(image_bytes=None, fields=None):
+    g.identify_started = time.monotonic()
+    begin_request_stats()
+    if image_bytes is None:
+        saw_image, image_bytes, fields = read_identify_request()
+        if not saw_image:
+            return jsonify({
+                "error": "No image uploaded",
+                "meta": stamp_meta({}, g.identify_started),
+            }), 400
 
     prepared = prepare_image(image_bytes)
     if not prepared:
-        return jsonify({"error": "Please upload a valid photo"}), 400
+        return jsonify({
+            "error": "Please upload a valid photo",
+            "meta": stamp_meta({}, g.identify_started),
+        }), 400
     jpeg_bytes, image_w, image_h = prepared
     image_px = f"{image_w}x{image_h}"
 
-    region = resolve_region(request.form.get("region"))
-    lat, lng, coord_source = _choose_coordinates(image_bytes)
+    region = resolve_region(fields.get("region"))
+    lat, lng, coord_source = _choose_coordinates(image_bytes, fields)
     region, location_fallback = apply_location_fallback(region, lat, lng)
     region_label = display_region_label(region, lat, lng, location_fallback)
-    mode = resolve_species_mode(request.form.get("species_list"))
-    debug = (request.form.get("debug") or "").strip() == "1"
-    model = resolve_model(request.form.get("model"), debug=debug)
-    verify = verification_enabled(debug, request.form.get("verify"))
-    discover = discovery_enabled(debug, request.form.get("discovery"))
-    exclude_observation = (request.form.get("exclude_observation_id") or "").strip()
+    mode = resolve_species_mode(fields.get("species_list"))
+    debug = (fields.get("debug") or "").strip() == "1"
+    model = resolve_model(fields.get("model"), debug=debug)
+    verify = verification_enabled(debug, fields.get("verify"))
+    discover = discovery_enabled(debug, fields.get("discovery"))
+    exclude_observation = (fields.get("exclude_observation_id") or "").strip()
+    use_cache = (fields.get("nocache") or "").strip().lower() not in ("1", "true", "yes", "on")
+    nature_off = bool(debug and (fields.get("species_list") or "").strip().lower() == "none")
+    nature_token = _NATURE_DATA.set(False) if nature_off else None
+    if nature_off:
+        mode = "none"
+        verify = False
+        discover = False
+        app.logger.info(
+            "nature_data=off species_list=none; no iNaturalist species list, reference photos, OBIS, or FishBase"
+        )
 
+    try:
+        return _identify_with_nature(
+            image_bytes, fields, jpeg_bytes, image_px, region, lat, lng, coord_source,
+            location_fallback, region_label, mode, debug, model, verify, discover,
+            exclude_observation, use_cache, nature_off,
+        )
+    finally:
+        if nature_token is not None:
+            _NATURE_DATA.reset(nature_token)
+
+
+def _identify_with_nature(
+    image_bytes, fields, jpeg_bytes, image_px, region, lat, lng, coord_source,
+    location_fallback, region_label, mode, debug, model, verify, discover,
+    exclude_observation, use_cache, nature_off,
+):
     xai_key = os.environ.get("XAI_API_KEY")
     if not xai_key:
         app.logger.error("XAI_API_KEY is not set")
         return jsonify({
             "error": "Identification is temporarily unavailable. Please try again later.",
             "region_label": region_label,
+            "meta": stamp_meta({}, g.identify_started),
         }), 500
 
-    request_started = time.monotonic()
-    set_call_deadline(request_started + _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115))
-    started = time.perf_counter()
-    species_payload = load_species_for_request(region, lat, lng, mode, exclude_observation)
-    list_fetch_ms = int(round((time.perf_counter() - started) * 1000))
+    request_started = g.identify_started
+    set_call_deadline(request_started + job_wall_seconds())
+    fg_handle = None
+    fg_decision = None
+    if first_guess_enabled(debug, fields.get("first_guess")) and not nature_off:
+        fg_handle, fg_decision = start_first_guess(
+            jpeg_bytes, xai_key, request_started, use_cache=use_cache,
+        )
+    if nature_off:
+        species_payload, list_fetch_ms, list_wait_s, waited_out = _empty_species(), 0, 0, False
+    else:
+        species_payload, list_fetch_ms, list_wait_s, waited_out = load_species_alongside_model(
+            region, lat, lng, mode, exclude_observation
+        )
     species = species_payload.get("species") or []
     locality = locality_text(region, lat, lng, coord_source)
     if location_fallback:
@@ -3614,67 +6399,150 @@ def identify():
     truncated = prompt_trimmed or (mode == "full" and not species_payload.get("complete"))
     source = species_payload.get("source") or "none"
 
-    result, attempts = _run_model_attempts(
-        jpeg_bytes, prompt, model, xai_key, request_started,
-        extra_reserve=verify_timeout_cap() if verify else 0,
+    models = configured_models(fields.get("model"), debug, fields.get("models"))
+
+    def _warm_fast_references(fast_result):
+        early = parse_model_candidates(_extract_text(fast_result.get("data") or {}))
+
+        def warm():
+            for item in early[:3]:
+                fetch_reference_photos(
+                    item["scientific_name"], lat, lng, exclude_observation or None
+                )
+
+        _start_thread(warm, "finfindr-early-refs")
+
+    result = _run_paired_models(
+        jpeg_bytes, prompt, models, xai_key, request_started,
+        use_cache=use_cache,
+        on_fast=_warm_fast_references if verify else None,
     )
+    attempts = result.get("attempts") or []
     model_ms = sum(item["ms"] for item in attempts)
-    answered = result.get("model") or model
-    fallback_used = any(item["model"] != model for item in attempts)
+    answered = result.get("model") or (models[-1] if models else model)
+    fallback_used = False
     if not result.get("ok"):
         if not result.get("retryable"):
             status = 502
             message = "Could not identify this photo. Please try another one."
-        elif result.get("error") == "timeout":
-            status = 504
-            message = "Identification is taking too long. Please try again."
+            body = {"error": message, "region_label": region_label}
         else:
-            status = 502
-            message = "Could not identify this photo. Please try again."
+            status = 200
+            if result.get("error") == "rate_limited":
+                message = "Could not identify this photo. Please try again."
+                reason = "rate_limited"
+            elif result.get("error") == "timeout":
+                message = "Identification is taking too long. Please try again."
+                reason = "timeout"
+            else:
+                message = "Could not identify this photo. Please try again."
+                reason = ""
+            body = {
+                "result_text": "",
+                "region_label": region_label,
+                "certainty": "unsure",
+                "photo_quality": "good",
+                "candidates": [],
+                "discovery": None,
+                "message": message,
+            }
+            if reason:
+                body["reason"] = reason
         total_ms = int(round((time.monotonic() - request_started) * 1000))
         meta = _identification_meta(
             mode, sent, available, truncated, source, list_fetch_ms, model_ms,
             None, "unavailable", answered, image_px, fallback_used, attempts,
-            False, 0, 0, total_ms, "",
+            False, 0, 0, total_ms, "model_timeout" if result.get("error") == "timeout" else "model_failed",
+            list_wait_s=list_wait_s, waited_out=waited_out,
         )
-        meta["budget_s"] = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
+        apply_verify_rates(meta, False, False, 0, 0, meta["verify_skipped"])
+        _apply_model_bundle(meta, result)
+        meta = stamp_meta(meta, request_started)
+        if fg_decision is not None:
+            abandon_first_guess(fg_handle)
+            fg_decision["reason"] = fg_decision.get("reason") or "model_failed"
+            meta["first_guess"] = fg_decision
+            log_first_guess_decision(fg_decision)
         _log_identification(region["id"], meta)
-        return jsonify({"error": message, "region_label": region_label, "meta": meta}), status
+        body["meta"] = meta
+        return jsonify(body), status
 
-    data = result["data"]
-    tokens, token_source = _prompt_tokens(data, prompt)
-    text = apply_standard_names(_extract_text(data), species)
+    narrative_data = {}
+    for report in result.get("reports") or []:
+        if report.get("model") == answered and report.get("data"):
+            narrative_data = report["data"]
+    tokens, token_source = _prompt_tokens(narrative_data, prompt)
+    text = apply_standard_names(result.get("text") or "", species)
     photo_quality = parse_photo_quality(text)
     photo_issue = _field_value(text, "Photo issue")
-    if photo_quality in ("poor", "invalid"):
-        total_ms = int(round((time.monotonic() - request_started) * 1000))
+    parsed_candidates = result.get("candidates") or parse_model_candidates(text)
+    # Gate 1. A no stops here. A yes does not mark the identification down.
+    if not result.get("photo_usable", photo_is_usable(photo_quality, photo_issue)):
         meta = _identification_meta(
             mode, sent, available, truncated, source, list_fetch_ms, model_ms,
             tokens, token_source, answered, image_px, fallback_used, attempts,
-            False, 0, 0, total_ms, "photo_quality",
+            False, 0, 0, None, "photo_unusable",
+            list_wait_s=list_wait_s, waited_out=waited_out,
         )
         meta["photo_quality"] = photo_quality
-        meta["evidence"] = [f"photo_{photo_quality}"]
+        meta["evidence"] = [f"photo_{photo_quality or 'unusable'}"]
         meta["range_km"] = range_km()
         meta["range_max"] = range_record_limit()
         meta["range_rule"] = range_rule_text()
+        apply_verify_rates(meta, False, False, 0, 0, "photo_unusable")
+        _apply_model_bundle(meta, result, final_source_for(parsed_candidates[0] if parsed_candidates else None))
+        meta = stamp_meta(meta, request_started)
+        if fg_decision is not None:
+            abandon_first_guess(fg_handle)
+            fg_decision["reason"] = "photo_unusable"
+            meta["first_guess"] = fg_decision
+            log_first_guess_decision(fg_decision)
         _log_identification(region["id"], meta)
-        return jsonify({
-            "result_text": text,
-            "region_label": region_label,
-            "certainty": "unsure",
-            "photo_quality": photo_quality,
-            "photo_issue": photo_issue or "The animal is not clear enough to identify.",
-            "message": "Can't identify from this photo.",
-            "candidates": [],
-            "discovery": None,
-            "meta": meta,
-        })
-    parsed_candidates = parse_model_candidates(text)
+        return jsonify(_result_payload(
+            region_label=region_label,
+            certainty="unsure",
+            photo_quality=photo_quality,
+            message="Can't identify from this photo.",
+            photo_issue=photo_issue or "The animal is not clear enough to identify.",
+            meta=meta,
+        ))
     off_list_proposed = sum(1 for item in parsed_candidates if item.get("off_list"))
     candidates = _prepare_off_list_candidates(parsed_candidates, species)
     off_list_kept = sum(1 for item in candidates if item.get("off_list"))
     app.logger.info("off_list_proposed=%s off_list_kept=%s", off_list_proposed, off_list_kept)
+    # Gate 2. Resolved non-marine ancestry stops. Unresolved ancestry does not.
+    named = candidates[0]["scientific_name"] if candidates else ""
+    taxon_status = taxon_in_scope(named) if named else None
+    if taxon_status is False or (taxon_status is None and text_says_not_marine("\n".join([text, photo_issue]))):
+        meta = _identification_meta(
+            mode, sent, available, truncated, source, list_fetch_ms, model_ms,
+            tokens, token_source, answered, image_px, fallback_used, attempts,
+            False, 0, 0, None, "not_marine",
+            list_wait_s=list_wait_s, waited_out=waited_out,
+        )
+        meta["photo_quality"] = photo_quality
+        meta["off_list_proposed"] = off_list_proposed
+        meta["off_list_kept"] = off_list_kept
+        meta["evidence"] = ["not_marine"]
+        apply_verify_rates(meta, False, False, 0, 0, "not_marine")
+        _apply_model_bundle(meta, result, final_source_for(candidates[0] if candidates else None))
+        meta = stamp_meta(meta, request_started)
+        if fg_decision is not None:
+            abandon_first_guess(fg_handle)
+            fg_decision["reason"] = "not_marine"
+            meta["first_guess"] = fg_decision
+            log_first_guess_decision(fg_decision)
+        _log_identification(region["id"], meta)
+        return jsonify(_result_payload(
+            region_label=region_label,
+            certainty="unsure",
+            photo_quality=photo_quality,
+            reason="not_marine",
+            message=NOT_MARINE_MESSAGE,
+            meta=meta,
+        ))
+    # Gate 3. Confidence is decided only from here on.
+    leading_before_verify = candidates[0]["scientific_name"] if candidates else ""
     verify_used = False
     verify_attempted = False
     verify_ms = 0
@@ -3688,19 +6556,28 @@ def identify():
     elif verify_call_budget(request_started) is None:
         verify_skipped = "no_time"
     else:
+        job_progress("Checking reference photos")
         fetch_started = time.perf_counter()
-        fetch_deadline = time.monotonic() + 3.0
-        candidates = _attach_reference_photos(
-            candidates, lat, lng, exclude_observation, fetch_deadline
-        )
-        reference_fetch_ms = int(round((time.perf_counter() - fetch_started) * 1000))
+        fetch_cap = min(20.0, max(0.0, _time_left(request_started) - 8.0))
         reference_urls = []
-        photo_order = [item for item in candidates if item.get("off_list")] + [item for item in candidates if not item.get("off_list")]
-        for candidate in photo_order:
-            reference_urls.extend((candidate.get("_reference_urls") or [])[:1])
-        reference_urls = reference_urls[:4]
+        if fetch_cap < 0.4:
+            verify_skipped = "no_time"
+        else:
+            fetch_deadline = time.monotonic() + fetch_cap
+            candidates = _attach_reference_photos(
+                candidates, lat, lng, exclude_observation, fetch_deadline
+            )
+            pictured = []
+            for candidate in candidates:
+                urls = (candidate.get("_reference_urls") or [])[:1]
+                if urls:
+                    pictured.append(candidate)
+                    reference_urls.append(urls[0])
+        reference_fetch_ms = int(round((time.perf_counter() - fetch_started) * 1000))
         call_timeout = verify_call_budget(request_started)
-        if not reference_urls:
+        if verify_skipped == "no_time":
+            pass
+        elif not reference_urls:
             verify_skipped = "no_photos"
         elif call_timeout is None:
             verify_skipped = "no_time"
@@ -3709,12 +6586,13 @@ def identify():
             verify_started = time.perf_counter()
             verify_result = _call_vision_model(
                 _shrink_jpeg(jpeg_bytes, verify_image_px()),
-                _verification_prompt(candidates),
+                _verification_prompt(pictured, locality),
                 answered,
                 call_timeout,
                 xai_key,
                 reference_urls,
-                extra_detail="low",
+                extra_detail="high",
+                use_cache=use_cache,
             )
             verify_ms = int(round((time.perf_counter() - verify_started) * 1000))
             _record_verification(bool(verify_result.get("ok")))
@@ -3727,7 +6605,18 @@ def identify():
                         "certainty": "unsure",
                         "trait": verification.get("trait") or "",
                         "scientific_name": "",
+                        "raw_certainty": verification.get("raw_certainty") or "",
+                        "raw_reply": verification.get("raw_reply") or "",
+                        "why": verification.get("why") or "",
                     }
+                app.logger.info(
+                    "verify decision=%s certainty=%s trait=%s why=%s reply=%s",
+                    verification.get("decision"),
+                    verification.get("raw_certainty"),
+                    verification.get("trait"),
+                    verification.get("why"),
+                    verification.get("raw_reply"),
+                )
                 if verification.get("trait"):
                     for candidate in candidates:
                         if candidate["scientific_name"].lower() == (verification.get("scientific_name") or "").lower():
@@ -3745,22 +6634,107 @@ def identify():
                 verify_skipped = _verify_skip_reason(verify_result)
     for candidate in candidates:
         candidate.pop("_reference_urls", None)
+    if _needs_offlist_followup(candidates, verification, verify_skipped) and _time_left(request_started) >= 12:
+        follow_timeout = min(16.0, max(5.0, _time_left(request_started) - 4.0))
+        follow = _call_vision_model(
+            jpeg_bytes,
+            _offlist_followup_prompt(locality, candidates),
+            "grok-4" if "grok-4" in (result.get("models_run") or []) else answered,
+            follow_timeout,
+            xai_key,
+            use_cache=use_cache,
+        )
+        attempts.append(_attempt_record(
+            "grok-4" if "grok-4" in (result.get("models_run") or []) else answered,
+            follow.get("ms") or 0,
+            follow.get("ok"),
+            None if follow.get("ok") else follow.get("error"),
+        ))
+        if follow.get("ok"):
+            proposed = [
+                item for item in parse_model_candidates(_extract_text(follow["data"]))
+                if item.get("off_list")
+            ]
+            off_list_proposed += len(proposed)
+            prepared = _prepare_off_list_candidates(proposed, species)
+            prepared = [
+                item for item in prepared
+                if item.get("off_list") and taxon_in_scope(item["scientific_name"]) is not False
+            ]
+            seen_names = {(item.get("scientific_name") or "").lower() for item in candidates}
+            fresh = []
+            for item in prepared:
+                if item["scientific_name"].lower() in seen_names:
+                    continue
+                fresh.append(item)
+                seen_names.add(item["scientific_name"].lower())
+            if fresh and not passing_verification(verification):
+                candidates = fresh + candidates
+            else:
+                candidates.extend(fresh)
+            off_list_kept = sum(1 for item in candidates if item.get("off_list"))
     verification_disagreed = bool(
         verify_used and verification is not None and not passing_verification(verification)
     )
-    certainty = certainty_for(candidates, verification if passing_verification(verification) else None)
+    certainty = certainty_for(candidates, verification)
     if verification_disagreed:
         cap_unconfirmed_confidence(candidates)
         certainty = "unsure"
-    shown = public_candidates(candidates, species)
-    notes_text = _field_value(text, "Notes")
-    color_conflict = bool(shown) and colors_contradict(
-        f"{shown[0].get('trait') or ''} {notes_text}",
-        shown[0].get("common_name") or "",
+    verifier_ordered = bool(
+        verification and verification.get("decision") not in ("", "UNSURE", "NO_MATCH")
     )
+    shown = public_candidates(candidates, species, preserve_order=verifier_ordered)
+    ff28_on = unsure_promote_enabled(debug, fields.get("unsure_promote")) and not nature_off
+    ff28_decision = None
+    ff28_cap = None
+    if ff28_on and certainty == "unsure" and not verification_disagreed:
+        promoted, ff28_decision = ff28_p1_certainty(candidates, shown, certainty, verification, species)
+        if promoted != certainty:
+            certainty = promoted
+            ff28_cap = "likely"
+    la_meta = None
+    la_cap = None
+    if lookalike_enabled(debug, fields.get("lookalike")) and not nature_off:
+        job_progress("Comparing look-alikes")
+        la_meta, _, la_certainty = run_lookalike_pass(
+            jpeg_bytes, shown, certainty, locality, xai_key, request_started, use_cache=use_cache,
+        )
+        if la_meta.get("ms"):
+            attempts.append(_attempt_record(
+                la_meta["model"], la_meta["ms"], not la_meta.get("error"), la_meta.get("error") or None,
+            ))
+        if la_meta["outcome"] in ("switch", "uncertain"):
+            la_cap = la_certainty
+            certainty = cap_certainty(certainty, la_cap)
+        if la_meta["outcome"] == "switch":
+            chosen = la_meta.get("chosen") or ""
+            candidates = _order_candidates(sort_candidates(candidates), chosen)
+            shown = _order_candidates(shown, chosen)
+            verifier_ordered = True
+    notes_text = _field_value(text, "Notes")
+    known_traits = SPECIES_TRAITS.get((shown[0].get("scientific_name") if shown else "").lower(), "") if shown else ""
+    trait_conflict = bool(shown) and traits_contradict(
+        f"{shown[0].get('trait') or ''} {notes_text}",
+        f"{shown[0].get('common_name') or ''} {known_traits}",
+    )
+    ff28_p2_fired = False
+    if ff28_on and trait_conflict:
+        cleared, p2_decision = ff28_p2_clears_clash(
+            shown, candidates, species, photo_quality, f"{shown[0].get('trait') or ''} {notes_text}",
+        )
+        p2_decision["certainty_before"] = "unsure"
+        if cleared:
+            trait_conflict = False
+            ff28_p2_fired = True
+            ff28_cap = "likely"
+        ff28_decision = p2_decision
     discovery = None
     notable_note = ""
     evidence = [f"photo_{photo_quality}"]
+    if ff28_p2_fired:
+        evidence.append("unsure_promoted_common_name_clash")
+    elif ff28_decision and ff28_decision.get("path") == "P1":
+        evidence.append("unsure_promoted_model_rank1")
     if verify_used:
         evidence.append("verification_used")
     if verification and verification.get("decision") == "NO_MATCH":
@@ -3773,18 +6747,69 @@ def identify():
             verification.get("decision") == "NO_MATCH" or verification_mismatch(verification)
         )
     )
-    no_match = color_conflict or rejected_all
+    no_match = trait_conflict or rejected_all
+    color_reject = False
+    if isinstance(verification, dict):
+        trait_line = (verification.get("trait") or "").lower()
+        color_reject = text_has_contradiction(trait_line)
+    contradicts = trait_conflict or color_reject
+    if isinstance(verification, dict) and (verification.get("decision") or "").upper() == "NO_MATCH":
+        trait_line = (verification.get("trait") or "").lower()
+        if text_has_contradiction(trait_line):
+            contradicts = True
+    if no_match and shown and not contradicts:
+        # The top candidate is the closest name we have. Saying "no match"
+        # while still ranking that species first is a false reject.
+        no_match = False
+        rejected_all = False
+    if no_match:
+        certainty = "unsure"
+        cap_unconfirmed_confidence(candidates)
+        shown = public_candidates(candidates, species, preserve_order=verifier_ordered)
     strong_id = (
         not no_match
-        and not fallback_used
-        and photo_quality == "good"
         and certainty == "confident"
         and verify_used
         and passing_verification(verification)
+        and verification_chose_top(verification, candidates)
         and verification.get("scientific_name")
         and focus
         and verification["scientific_name"].lower() == focus.lower()
     )
+    fg_cap = None
+    if fg_decision is not None:
+        guess, fg_decision = collect_first_guess(fg_handle, fg_decision)
+        shown, candidates, certainty, fg_cap = apply_first_guess_to_result(
+            decision=fg_decision,
+            guess=guess,
+            shown=shown,
+            candidates=candidates,
+            species=species,
+            certainty=certainty,
+            no_match=no_match,
+            jpeg_bytes=jpeg_bytes,
+            api_key=xai_key,
+            request_started=request_started,
+            use_cache=use_cache,
+        )
+        if shown:
+            focus = shown[0]["scientific_name"]
+        if fg_decision.get("guess_ms"):
+            attempts.append(_attempt_record(
+                fg_decision.get("model") or first_guess_model(),
+                fg_decision["guess_ms"],
+                fg_decision.get("reason") not in ("timeout", "call_failed"),
+                None if fg_decision.get("reason") not in ("timeout", "call_failed") else fg_decision.get("reason"),
+            ))
+        if fg_decision.get("compare_ms"):
+            attempts.append(_attempt_record(
+                fg_decision.get("model") or first_guess_model(),
+                fg_decision["compare_ms"],
+                fg_decision.get("reason") not in ("timeout", "call_failed", "no_time"),
+                None if fg_decision.get("outcome") != "skip" else fg_decision.get("reason"),
+            ))
+        if fg_cap is not None and certainty == "confident":
+            strong_id = False
     rule = range_rule()
     if discover and no_match and photo_quality == "good":
         relatives = []
@@ -3794,7 +6819,7 @@ def identify():
                 "scientific_name": item["scientific_name"],
                 "common_name": item.get("common_name") or "",
                 "genus": genus,
-                "trait": item.get("trait") or verification.get("trait") or "",
+                "trait": item.get("trait") or (verification or {}).get("trait") or "",
             })
         genus = relatives[0]["genus"] if relatives else ""
         discovery = {
@@ -3807,7 +6832,10 @@ def identify():
         }
         certainty = "unsure"
         evidence.append("no_species_match")
-    elif discover and focus and photo_quality == "good" and lat is not None and lng is not None and _time_left(request_started) >= 3:
+    elif (
+        discover and focus and photo_quality == "good" and lat is not None and lng is not None
+        and _time_left(request_started) >= 3 and not ff28_p2_fired
+    ):
         record_count = count_research_records(
             focus, lat, lng, rule["radius_km"], not_id=exclude_observation or None
         )
@@ -3816,11 +6844,39 @@ def identify():
         if record_count is not None:
             evidence.append(f"records_in_radius={record_count}")
         unrecorded = record_count is not None and record_count <= rule["max_records"]
-        range_status = external_range_status(focus, lat, lng, rule["radius_km"]) if unrecorded and strong_id else ""
+        off_list_focus = False
+        if focus and record_count is not None:
+            listed_names = {(item.get("scientific") or "").lower() for item in species}
+            listed_here = focus.lower() in listed_names
+            for item in shown:
+                name = (item.get("scientific_name") or "").lower()
+                if name in listed_names and name != focus.lower():
+                    item["off_list"] = False
+                if name != focus.lower():
+                    continue
+                if record_count > rule["max_records"] or (listed_here and record_count > 0):
+                    item["off_list"] = False
+                elif (
+                    record_count <= rule["max_records"]
+                    and not listed_here
+                    and ((item.get("confidence") or "medium") in ("low", "medium") or item.get("off_list"))
+                ):
+                    if not item.get("off_list"):
+                        off_list_proposed += 1
+                    item["off_list"] = True
+        off_list_focus = bool(shown and shown[0].get("off_list"))
+        range_ready = strong_id or off_list_focus
+        range_evidence = external_range_evidence(focus, lat, lng, rule["radius_km"]) if unrecorded and range_ready else {"state": "", "source": ""}
+        range_status = range_evidence.get("state") or ""
         if range_status:
             evidence.append(f"external_range={range_status}")
-        if unrecorded and strong_id and range_status == "absent":
-            nearest = nearest_research_records(focus, lat, lng)
+            if range_evidence.get("source"):
+                evidence.append(f"external_range_source={range_evidence['source']}")
+        if unrecorded and range_ready and range_status == "absent":
+            if _time_left(request_started) >= 2:
+                nearest = nearest_research_records(focus, lat, lng)
+            else:
+                nearest = []
             traits = [item.get("trait") for item in shown if item.get("trait")]
             if verification and verification.get("trait"):
                 traits = [verification["trait"]] + [trait for trait in traits if trait != verification["trait"]]
@@ -3835,8 +6891,27 @@ def identify():
                 "nearest_known_record_source": "iNaturalist" if nearest else "",
                 "traits": [trait for trait in traits if trait][:3],
                 "rule": rule,
+                "external_range": range_status or "unknown",
+                "external_range_source": range_evidence.get("source") or "",
             }
-            evidence.append("verification_agreed")
+            evidence.append("verification_agreed" if strong_id else "off_list_range_unverified")
+            if not strong_id and certainty == "confident":
+                certainty = "likely"
+        elif off_list_focus:
+            discovery = {
+                "type": "off_list",
+                "scientific_name": focus,
+                "common_name": shown[0].get("common_name") or "",
+                "records_in_region": record_count,
+                "radius_km": rule["radius_km"],
+                "nearest_records": [],
+                "traits": [item.get("trait") for item in shown if item.get("trait")][:3],
+                "rule": rule,
+                "external_range": range_status or "unknown",
+                "external_range_source": range_evidence.get("source") or "",
+                "note": "This species is not on the regional list.",
+            }
+            evidence.append("off_list_kept")
         elif unrecorded and strong_id and range_status == "unknown":
             certainty = "unsure"
             notable_note = (
@@ -3845,78 +6920,194 @@ def identify():
                 "could not be checked. This is not flagged as a range extension."
             )
             evidence.append("range_evidence_unavailable")
-        elif unrecorded and not strong_id:
-            certainty = "unsure"
+        elif unrecorded and not strong_id and not off_list_focus:
             notable_note = (
                 f"{shown[0].get('common_name') or focus} has {record_count} research-grade "
                 f"iNaturalist records within {rule['radius_km']} km. That would be notable if the identification is confirmed, "
                 "but this photo is not strong enough to flag a range extension."
             )
             evidence.append("notable_if_confirmed")
+    # Any photo that already passed the usable gate can get the note,
+    # including a poor-quality but identifiable frame. Unusable photos
+    # return before this point.
+    inland_off_list = bool(
+        not_in_region_enabled(debug, fields.get("not_in_region"))
+        and not nature_off
+        and not no_match
+        and focus
+        and not species_on_list(focus, species)
+        and taxon_is_freshwater_or_inland(focus)
+    )
     focus_off_list = bool(shown and shown[0].get("off_list"))
     if focus_off_list and not (discovery and discovery.get("type") == "possible_range_extension"):
-        certainty = "unsure"
+        if not inland_off_list:
+            certainty = "unsure"
     total_ms = int(round((time.monotonic() - request_started) * 1000))
     meta = _identification_meta(
         mode, sent, available, truncated, source, list_fetch_ms, model_ms,
         tokens, token_source, answered, image_px, fallback_used, attempts,
         verify_used, verify_ms, reference_fetch_ms, total_ms, verify_skipped,
+        list_wait_s=list_wait_s, waited_out=waited_out,
     )
     meta["photo_quality"] = photo_quality
     meta["discovery_checked"] = discovery_checked
-    if fallback_used and certainty == "confident":
-        certainty = "likely"
-        if discovery and discovery.get("type") == "possible_range_extension":
-            discovery = None
-            evidence.append("fallback_not_confident")
     if not (verify_used and passing_verification(verification)):
         if certainty == "confident":
             certainty = "likely" if shown else "unsure"
-        if discovery and discovery.get("type") == "possible_range_extension":
+        if (
+            discovery
+            and discovery.get("type") == "possible_range_extension"
+            and "off_list_range_unverified" not in evidence
+        ):
             discovery = None
             evidence.append("discovery_blocked_without_verification")
-    if discovery and discovery.get("type") == "no_match" and not (rejected_all or color_conflict):
+    if discovery and discovery.get("type") == "no_match" and not (rejected_all or trait_conflict):
         discovery = None
+    checked = len(candidates) if verify_attempted else 0
+    likely_pass = bool(
+        verify_used and not no_match and likely_names_the_leader(verification, leading_before_verify)
+    )
+    strict_pass = bool(
+        verify_used and passing_verification(verification) and verification_chose_top(verification, candidates)
+        and (verification or {}).get("certainty") == "confident"
+    )
+    passed = 1 if strict_pass or likely_pass else 0
+    verified_id = bool((strict_pass or likely_pass) and not no_match)
+    meta_pass_via = "confident" if strict_pass else ("likely" if likely_pass else "")
+    if verified_id and not no_match:
+        certainty = "confident"
+        for item in shown[:1]:
+            item["confidence"] = "high"
+    elif certainty != "confident":
+        # Unconfirmed identifications are not labeled high. Photo quality is not an input.
+        for item in shown:
+            if item.get("confidence") == "high":
+                item["confidence"] = "medium"
+    if la_cap is not None:
+        # LA-v1: nothing after the look-alike pass may raise certainty above its cap.
+        certainty = cap_certainty(certainty, la_cap)
+        if certainty != "confident":
+            for item in shown:
+                if item.get("confidence") == "high":
+                    item["confidence"] = "medium"
+    if fg_cap is not None:
+        # FF-30: never raise certainty, and never keep confident after a name change.
+        certainty = cap_certainty(certainty, fg_cap)
+        if certainty != "confident":
+            for item in shown:
+                if item.get("confidence") == "high":
+                    item["confidence"] = "medium"
+    if ff28_cap is not None:
+        # FF-28 v2: a promoted answer is never confident.
+        certainty = cap_certainty(certainty, ff28_cap)
+        for item in shown:
+            if item.get("confidence") == "high":
+                item["confidence"] = "medium"
+    if no_match or (discovery and discovery.get("type") == "no_match"):
+        text = _no_match_result_text(discovery)
+        certainty = "unsure"
+    elif shown and text:
+        text = _set_field(text, "Scientific name", shown[0].get("scientific_name") or "")
+        text = _set_field(text, "Common name", shown[0].get("common_name") or "")
+        text = _set_field(text, "Confidence", shown[0].get("confidence") or "medium")
+    off_list_kept = sum(1 for item in shown if item.get("off_list"))
+    if isinstance(verification, dict):
+        meta["verify_decision"] = verification.get("decision") or ""
+        meta["verify_certainty"] = verification.get("raw_certainty") or verification.get("certainty") or ""
+        meta["verify_trait"] = verification.get("trait") or ""
+        meta["verify_reply"] = verification.get("raw_reply") or ""
+        meta["verify_why"] = verification.get("why") or ""
+    if not meta.get("verify_why"):
+        meta["verify_why"] = verify_skipped or "not_run"
     meta["evidence"] = evidence
     meta["range_km"] = rule["radius_km"]
     meta["range_max"] = rule["max_records"]
     meta["range_rule"] = rule["text"]
-    meta["verify_attempted"] = verify_attempted
-    meta["verify_succeeded"] = bool(verify_used and passing_verification(verification))
-    meta["verify_success_rate"] = verification_success_rate()
+    meta["verify_succeeded"] = verified_id
+    meta["verify_pass_via"] = meta_pass_via
+    apply_verify_rates(meta, verify_attempted, verify_used, checked, passed, verify_skipped)
     meta["verify_timeout_s"] = verify_timeout_cap()
-    meta["budget_s"] = _env_seconds("FINFINDR_TIME_BUDGET", 110, 30, 115)
     meta["off_list_proposed"] = off_list_proposed
     meta["off_list_kept"] = off_list_kept
+    if la_meta is not None:
+        la_meta["certainty_final"] = certainty
+        meta["lookalike"] = la_meta
+    if fg_decision is not None:
+        fg_decision["certainty_final"] = certainty
+        meta["first_guess"] = fg_decision
+        log_first_guess_decision(fg_decision)
+    if ff28_on and (certainty == "unsure" or ff28_decision is not None):
+        if ff28_decision is None:
+            ff28_decision = _ff28_decision("none", "not_reached", certainty, certainty,
+                                           top=(shown[0].get("scientific_name") if shown else ""))
+        ff28_decision["certainty_final"] = certainty
+        ff28_decision["photo_quality"] = photo_quality or ""
+        meta["ff28_decision"] = ff28_decision
+        log_ff28_decision(ff28_decision)
+    not_in_region = None
+    if not_in_region_enabled(debug, fields.get("not_in_region")) and not nature_off:
+        # Never raise certainty. Never cap it because the note attaches.
+        # Never attach a discovery / KNOWN_OUT_OF_RANGE badge.
+        decision, not_in_region = evaluate_not_in_region(
+            focus=focus,
+            common=(shown[0].get("common_name") or "") if shown else "",
+            species=species,
+            no_match=no_match,
+            region=region,
+            lat=lat,
+            lng=lng,
+            location_fallback=location_fallback,
+            certainty=certainty,
+            record_count=record_count,
+        )
+        meta["not_in_region_decision"] = decision
+        log_not_in_region_decision(decision, (shown[0].get("scientific_name") if shown else focus) or focus or "")
+        if not_in_region:
+            if discovery and discovery.get("type") in ("possible_range_extension", "off_list"):
+                discovery = None
+            evidence.append("not_in_region")
+            meta["evidence"] = evidence
+    source_candidate = (shown[0] if shown else None) or (candidates[0] if candidates else None)
+    _apply_model_bundle(meta, result, final_source_for(source_candidate))
+    meta = stamp_meta(meta, request_started)
     _log_identification(region["id"], meta)
-    return jsonify({
-        "result_text": text or "No response",
-        "region_label": region_label,
-        "certainty": certainty,
-        "photo_quality": photo_quality,
-        "candidates": [] if no_match else shown,
-        "discovery": discovery,
-        "notable_note": notable_note,
-        "meta": meta,
-    })
+    return jsonify(_result_payload(
+        result_text=text or "No response",
+        region_label=region_label,
+        certainty=certainty,
+        photo_quality=photo_quality,
+        candidates=[] if no_match else shown,
+        discovery=discovery,
+        notable_note=notable_note,
+        meta=meta,
+        not_in_region=not_in_region,
+    ))
+
+
+def _error_body(message):
+    body = {"error": message}
+    if request.path == "/identify":
+        started = getattr(g, "identify_started", None)
+        body["meta"] = stamp_meta({}, started)
+    return body
 
 
 @app.errorhandler(RequestEntityTooLarge)
 def too_large(_exc):
-    return jsonify({"error": "That photo is too large. Please choose a smaller one."}), 413
+    return jsonify(_error_body("That photo is too large. Please choose a smaller one.")), 413
 
 
 @app.errorhandler(HTTPException)
 def http_exception(exc):
-    return jsonify({"error": exc.description or "Request failed"}), exc.code
+    return jsonify(_error_body(exc.description or "Request failed")), exc.code
 
 
 @app.errorhandler(Exception)
 def unhandled(exc):
     app.logger.exception("Unhandled error on %s", request.path)
     if isinstance(exc, HTTPException):
-        return jsonify({"error": exc.description or "Request failed"}), exc.code
-    return jsonify({"error": "Something went wrong. Please try again."}), 500
+        return jsonify(_error_body(exc.description or "Request failed")), exc.code
+    return jsonify(_error_body("Something went wrong. Please try again.")), 500
 
 
 @app.teardown_request
